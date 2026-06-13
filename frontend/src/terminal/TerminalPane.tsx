@@ -9,6 +9,7 @@ export type TerminalPaneProps = {
   terminalId: string;
   initialCursor?: number;
   status?: string;
+  active?: boolean;
 };
 
 type ConnectionState = 'connecting' | 'connected' | 'disconnected' | 'closed' | 'error';
@@ -19,7 +20,12 @@ function terminalWebSocketUrl(terminalId: string, ticket: string, cursor: number
   return `${protocol}//${window.location.host}/ws/terminals/${terminalId}?${params.toString()}`;
 }
 
-export function TerminalPane({ terminalId, initialCursor = 0, status = 'running' }: TerminalPaneProps) {
+export function TerminalPane({
+  terminalId,
+  initialCursor = 0,
+  status = 'running',
+  active = true,
+}: TerminalPaneProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -31,6 +37,7 @@ export function TerminalPane({ terminalId, initialCursor = 0, status = 'running'
   const fitFrameRef = useRef<number | null>(null);
   const connectionGenerationRef = useRef(0);
   const writerRef = useRef<ReturnType<typeof terminalWriter> | null>(null);
+  const wasActiveRef = useRef(active);
   const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
 
   useEffect(() => {
@@ -124,6 +131,31 @@ export function TerminalPane({ terminalId, initialCursor = 0, status = 'running'
       writerRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    const becameActive = active && !wasActiveRef.current;
+    wasActiveRef.current = active;
+    if (!becameActive) {
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      const terminal = terminalRef.current;
+      const fit = fitRef.current;
+      const container = containerRef.current;
+      if (!terminal || !fit || !container) {
+        return;
+      }
+      const { width, height } = container.getBoundingClientRect();
+      if (width <= 0 || height <= 0) {
+        return;
+      }
+      fit.fit();
+      terminal.focus();
+      lastResizeRef.current = { rows: terminal.rows, cols: terminal.cols };
+      void resizeTerminal(terminalId, terminal.rows, terminal.cols);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [active, terminalId]);
 
   useEffect(() => {
     const terminal = terminalRef.current;

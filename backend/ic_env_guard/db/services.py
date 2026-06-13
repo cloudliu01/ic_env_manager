@@ -116,6 +116,13 @@ class ServiceRuntime:
     allowed_operations: list[str] = field(
         default_factory=lambda: ["start", "stop", "restart", "status"]
     )
+    description: str | None = None
+    cwd: str | None = None
+    env: dict[str, str] = field(default_factory=dict)
+    autostart: bool = False
+    restart_policy: str = "never"
+    start_timeout_seconds: int = 30
+    stop_timeout_seconds: int = 30
     status: str = ServiceStatus.CONFIGURED.value
     pid: int | None = None
     health_status: str = "unknown"
@@ -136,7 +143,7 @@ class ServiceRuntime:
         data = self.summary()
         data.update(
             {
-                "restart_policy": "never",
+                "restart_policy": self.restart_policy,
                 "pid": self.pid,
                 "started_at": None,
                 "updated_at": self.updated_at,

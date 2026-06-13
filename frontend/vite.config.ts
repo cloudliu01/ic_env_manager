@@ -19,6 +19,18 @@ export default defineConfig({
         target: backendTarget,
         changeOrigin: true,
       },
+      '/healthz': {
+        target: backendTarget,
+        changeOrigin: true,
+      },
+      '/readyz': {
+        target: backendTarget,
+        changeOrigin: true,
+      },
+      '/metrics': {
+        target: backendTarget,
+        changeOrigin: true,
+      },
       '/ws': {
         target: backendTarget,
         changeOrigin: true,

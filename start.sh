@@ -125,6 +125,7 @@ start_backend() {
   validate_config
 
   export IC_ENV_GUARD_TOKEN_FILE="${TOKEN_FILE}"
+  export IC_ENV_GUARD_CONFIG="${CONFIG_FILE}"
   export IC_ENV_GUARD_HOST="${BACKEND_HOST}"
   export IC_ENV_GUARD_PORT="${BACKEND_PORT}"
 
@@ -138,7 +139,7 @@ import uvicorn
 
 from ic_env_guard.main import create_app
 
-app = create_app(token_file=Path(os.environ["IC_ENV_GUARD_TOKEN_FILE"]))
+app = create_app(config_path=Path(os.environ["IC_ENV_GUARD_CONFIG"]))
 uvicorn.run(
     app,
     host=os.environ.get("IC_ENV_GUARD_HOST", "127.0.0.1"),

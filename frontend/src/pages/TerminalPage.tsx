@@ -2,7 +2,11 @@ import { useEffect, useState } from 'react';
 import { closeTerminal, createTerminal, listTerminals, TerminalSession } from '../api/terminals';
 import { TerminalPane } from '../terminal/TerminalPane';
 
-export function TerminalPage() {
+type TerminalPageProps = {
+  visible?: boolean;
+};
+
+export function TerminalPage({ visible = true }: TerminalPageProps) {
   const [terminals, setTerminals] = useState<TerminalSession[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -90,6 +94,7 @@ export function TerminalPage() {
             terminalId={active.id}
             initialCursor={active.output_cursor}
             status={active.status}
+            active={visible}
           />
         ) : (
           <div className="terminal-empty">

@@ -45,3 +45,36 @@ def test_metrics_accepts_remote_source_inside_allowlist(app):
     response = client.get("/metrics", headers={"X-Forwarded-For": "192.0.2.10"})
 
     assert response.status_code == 200
+
+
+@pytest.mark.integration
+@pytest.mark.security
+def test_metrics_allowlist_can_be_loaded_from_config(tmp_path):
+    token_file = tmp_path / "token"
+    token_file.write_text("secret-token\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"""
+server:
+  bind: 127.0.0.1
+  port: 8765
+auth:
+  mode: bearer_token
+  token_file: {token_file}
+metrics:
+  enabled: true
+  collect_interval_seconds: 10
+  remote_network_allowlist:
+    - 192.0.2.0/24
+services: []
+""",
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(config_path=config_path))
+
+    accepted = client.get("/metrics", headers={"X-Forwarded-For": "192.0.2.10"})
+    rejected = client.get("/metrics", headers={"X-Forwarded-For": "198.51.100.10"})
+
+    assert accepted.status_code == 200
+    assert rejected.status_code == 403

@@ -17,6 +17,50 @@ def test_agent_starts_with_valid_token_file(tmp_path):
 
 
 @pytest.mark.integration
+def test_agent_loads_configured_services_from_config_path(tmp_path):
+    token_file = tmp_path / "token"
+    token_file.write_text("secret-token\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"""
+server:
+  bind: 127.0.0.1
+  port: 8765
+auth:
+  mode: bearer_token
+  token_file: {token_file}
+metrics:
+  enabled: true
+  collect_interval_seconds: 10
+services:
+  - id: demo
+    name: Demo Service
+    command: python -c 'import time; time.sleep(5)'
+    cwd: {tmp_path}
+    env:
+      DEMO_FLAG: enabled
+    allowed_operations: [start, stop, restart, status]
+    restart: on-failure
+    start_timeout_seconds: 7
+    stop_timeout_seconds: 3
+""",
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(config_path=config_path))
+    headers = {"Authorization": "Bearer secret-token"}
+
+    listed = client.get("/api/services", headers=headers)
+    assert listed.status_code == 200
+    assert listed.json()["services"][0]["id"] == "demo"
+    assert listed.json()["services"][0]["name"] == "Demo Service"
+
+    detail = client.get("/api/services/demo", headers=headers)
+    assert detail.status_code == 200
+    assert detail.json()["restart_policy"] == "on-failure"
+
+
+@pytest.mark.integration
 def test_agent_fails_closed_with_insecure_token_file(tmp_path):
     token_file = tmp_path / "token"
     token_file.write_text("secret-token\n", encoding="utf-8")

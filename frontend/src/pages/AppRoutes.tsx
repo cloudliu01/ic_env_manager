@@ -11,6 +11,7 @@ import { TerminalPage } from './TerminalPage';
 export function AppRoutes() {
   const [actor, setActor] = useState<string | null>(null);
   const [page, setPage] = useState<'overview' | 'terminal' | 'services' | 'metrics' | 'audit'>('overview');
+  const [terminalVisited, setTerminalVisited] = useState(false);
 
   useEffect(() => {
     const token = loadSessionToken();
@@ -19,6 +20,12 @@ export function AppRoutes() {
       setActor('local-admin');
     }
   }, []);
+
+  useEffect(() => {
+    if (page === 'terminal') {
+      setTerminalVisited(true);
+    }
+  }, [page]);
 
   if (!actor) {
     return <LoginPage onAuthenticated={setActor} />;
@@ -36,7 +43,11 @@ export function AppRoutes() {
         <button type="button" onClick={() => setPage('audit')}>Audit</button>
       </nav>
       {page === 'overview' ? <HostOverviewPage /> : null}
-      {page === 'terminal' ? <TerminalPage /> : null}
+      {terminalVisited ? (
+        <div hidden={page !== 'terminal'}>
+          <TerminalPage visible={page === 'terminal'} />
+        </div>
+      ) : null}
       {page === 'services' ? <ServiceListPage /> : null}
       {page === 'metrics' ? <MetricsPage /> : null}
       {page === 'audit' ? <AuditStatusPage /> : null}

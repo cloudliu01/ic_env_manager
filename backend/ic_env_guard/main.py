@@ -1,3 +1,7 @@
+import asyncio
+import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -11,7 +15,11 @@ from ic_env_guard.api.audit import router as audit_router
 from ic_env_guard.api.auth import router as auth_router
 from ic_env_guard.api.errors import register_error_handlers
 from ic_env_guard.api.health import router as health_router
-from ic_env_guard.api.metrics import get_metrics_registry
+from ic_env_guard.api.metrics import (
+    MetricsAccessPolicy,
+    get_metrics_access_policy,
+    get_metrics_registry,
+)
 from ic_env_guard.api.metrics import router as metrics_router
 from ic_env_guard.api.monitoring import get_machine_registry
 from ic_env_guard.api.monitoring import router as monitoring_router
@@ -26,8 +34,11 @@ from ic_env_guard.api.terminals import (
     router as terminals_router,
 )
 from ic_env_guard.auth.dependencies import AuthState, get_auth_state
+from ic_env_guard.config.loader import load_config
+from ic_env_guard.config.models import AppConfig, MetricsConfig, ServiceConfig
 from ic_env_guard.db.audit import AuditRepository
 from ic_env_guard.db.audit_queries import AuditQueryRepository
+from ic_env_guard.db.services import ServiceRuntime
 from ic_env_guard.db.session import Base
 from ic_env_guard.metrics.collector import MetricsCollector
 from ic_env_guard.metrics.registry import create_registry
@@ -37,17 +48,78 @@ from ic_env_guard.terminal.manager import TerminalManager
 from ic_env_guard.terminal.tickets import TerminalTicketManager
 
 
-def create_app(token_file: Path | None = None, token: str | None = None) -> FastAPI:
-    app = FastAPI(title="IC Design Environment Guard", version="0.1.0")
-    register_error_handlers(app)
+def _resolve_config(config_path: Path | None, config: AppConfig | None) -> AppConfig | None:
+    if config is not None:
+        return config
+    path = config_path or os.environ.get("IC_ENV_GUARD_CONFIG")
+    if path is None:
+        return None
+    return load_config(Path(path))
 
-    auth_state = AuthState(token_file=token_file, token=token)
+
+def _service_runtime(service: ServiceConfig) -> ServiceRuntime:
+    return ServiceRuntime(
+        id=service.id,
+        name=service.name,
+        command=service.command,
+        systemd_unit=service.systemd_unit,
+        allowed_operations=list(service.allowed_operations),
+        description=service.description,
+        cwd=service.cwd,
+        env=dict(service.env),
+        autostart=service.autostart,
+        restart_policy=service.restart,
+        start_timeout_seconds=service.start_timeout_seconds,
+        stop_timeout_seconds=service.stop_timeout_seconds,
+    )
+
+
+async def _metrics_refresh_loop(collector: MetricsCollector, interval_seconds: int) -> None:
+    while True:
+        await asyncio.sleep(interval_seconds)
+        collector.refresh()
+
+
+def create_app(
+    token_file: Path | None = None,
+    token: str | None = None,
+    config_path: Path | None = None,
+    config: AppConfig | None = None,
+) -> FastAPI:
+    app_config = _resolve_config(config_path, config)
+    metrics_config = app_config.metrics if app_config else MetricsConfig()
+    auth_token_file = token_file or (app_config.auth.token_file if app_config else None)
+
+    auth_state = AuthState(token_file=auth_token_file, token=token)
     terminal_manager = TerminalManager()
-    service_manager = ServiceManager()
+    service_manager = ServiceManager(
+        [_service_runtime(service) for service in app_config.services] if app_config else []
+    )
     machine_registry = MachineRegistry()
     ticket_manager = TerminalTicketManager()
     metrics_registry = create_registry()
-    MetricsCollector(metrics_registry, terminal_manager, service_manager).refresh()
+    metrics_collector = MetricsCollector(metrics_registry, terminal_manager, service_manager)
+    metrics_collector.refresh()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        refresh_task: asyncio.Task[None] | None = None
+        if metrics_config.enabled:
+            refresh_task = asyncio.create_task(
+                _metrics_refresh_loop(metrics_collector, metrics_config.collect_interval_seconds)
+            )
+            app.state.metrics_refresh_task = refresh_task
+        try:
+            yield
+        finally:
+            if refresh_task is not None:
+                refresh_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await refresh_task
+
+    app = FastAPI(title="IC Design Environment Guard", version="0.1.0", lifespan=lifespan)
+    app.state.config = app_config
+    register_error_handlers(app)
 
     audit_engine = create_engine(
         "sqlite://",
@@ -86,6 +158,9 @@ def create_app(token_file: Path | None = None, token: str | None = None) -> Fast
     def configured_metrics_registry():
         return metrics_registry
 
+    def configured_metrics_access_policy() -> MetricsAccessPolicy:
+        return MetricsAccessPolicy(metrics_config.remote_network_allowlist)
+
     def configured_machine_registry() -> MachineRegistry:
         return machine_registry
 
@@ -97,6 +172,7 @@ def create_app(token_file: Path | None = None, token: str | None = None) -> Fast
     app.dependency_overrides[get_ticket_manager] = configured_ticket_manager
     app.dependency_overrides[get_service_manager] = configured_service_manager
     app.dependency_overrides[get_metrics_registry] = configured_metrics_registry
+    app.dependency_overrides[get_metrics_access_policy] = configured_metrics_access_policy
     app.dependency_overrides[get_machine_registry] = configured_machine_registry
     app.dependency_overrides[get_audit_query_repository] = configured_audit_query_repository
     terminal_ws.get_terminal_ws_dependencies = lambda: (terminal_manager, ticket_manager)

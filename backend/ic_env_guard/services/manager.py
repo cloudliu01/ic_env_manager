@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -51,7 +52,9 @@ class ServiceManager:
             return self._result(service, "start", "already_in_state")
         if not service.command:
             return self._result(service, "start", "rejected", "service has no command mapping")
-        handle = self.runner.start(service.command)
+        env = os.environ.copy()
+        env.update(service.env)
+        handle = self.runner.start(service.command, cwd=service.cwd, env=env)
         self.handles[service_id] = handle
         service.pid = handle.pid
         service.status = "running"
@@ -66,7 +69,7 @@ class ServiceManager:
             return self._result(service, "stop", "already_in_state")
         handle = self.handles.pop(service_id, None)
         if handle:
-            self.runner.stop(handle)
+            self.runner.stop(handle, timeout_seconds=service.stop_timeout_seconds)
         service.pid = None
         service.status = "exited"
         service.updated_at = datetime.now(UTC).isoformat()
