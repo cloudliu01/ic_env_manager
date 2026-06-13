@@ -13,6 +13,8 @@ from ic_env_guard.api.errors import register_error_handlers
 from ic_env_guard.api.health import router as health_router
 from ic_env_guard.api.metrics import get_metrics_registry
 from ic_env_guard.api.metrics import router as metrics_router
+from ic_env_guard.api.monitoring import get_machine_registry
+from ic_env_guard.api.monitoring import router as monitoring_router
 from ic_env_guard.api.risk import classify_route
 from ic_env_guard.api.services import get_service_manager
 from ic_env_guard.api.services import router as services_router
@@ -29,6 +31,7 @@ from ic_env_guard.db.audit_queries import AuditQueryRepository
 from ic_env_guard.db.session import Base
 from ic_env_guard.metrics.collector import MetricsCollector
 from ic_env_guard.metrics.registry import create_registry
+from ic_env_guard.monitoring.machines import MachineRegistry
 from ic_env_guard.services.manager import ServiceManager
 from ic_env_guard.terminal.manager import TerminalManager
 from ic_env_guard.terminal.tickets import TerminalTicketManager
@@ -41,6 +44,7 @@ def create_app(token_file: Path | None = None, token: str | None = None) -> Fast
     auth_state = AuthState(token_file=token_file, token=token)
     terminal_manager = TerminalManager()
     service_manager = ServiceManager()
+    machine_registry = MachineRegistry()
     ticket_manager = TerminalTicketManager()
     metrics_registry = create_registry()
     MetricsCollector(metrics_registry, terminal_manager, service_manager).refresh()
@@ -82,6 +86,9 @@ def create_app(token_file: Path | None = None, token: str | None = None) -> Fast
     def configured_metrics_registry():
         return metrics_registry
 
+    def configured_machine_registry() -> MachineRegistry:
+        return machine_registry
+
     def configured_audit_query_repository() -> AuditQueryRepository:
         return audit_query_repository
 
@@ -90,6 +97,7 @@ def create_app(token_file: Path | None = None, token: str | None = None) -> Fast
     app.dependency_overrides[get_ticket_manager] = configured_ticket_manager
     app.dependency_overrides[get_service_manager] = configured_service_manager
     app.dependency_overrides[get_metrics_registry] = configured_metrics_registry
+    app.dependency_overrides[get_machine_registry] = configured_machine_registry
     app.dependency_overrides[get_audit_query_repository] = configured_audit_query_repository
     terminal_ws.get_terminal_ws_dependencies = lambda: (terminal_manager, ticket_manager)
 
@@ -98,6 +106,7 @@ def create_app(token_file: Path | None = None, token: str | None = None) -> Fast
     app.include_router(terminals_router)
     app.include_router(services_router)
     app.include_router(metrics_router)
+    app.include_router(monitoring_router)
     app.include_router(audit_router)
     app.include_router(terminal_ws.router)
 

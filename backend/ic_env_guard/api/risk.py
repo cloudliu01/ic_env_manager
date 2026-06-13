@@ -22,6 +22,7 @@ ROUTE_RISK_BY_PREFIX: tuple[tuple[str, RouteRisk], ...] = (
     ("/readyz", RouteRisk.PUBLIC_HEALTH),
     ("/metrics", RouteRisk.METRICS),
     ("/assets/", RouteRisk.STATIC_ASSET),
+    ("/api/monitoring", RouteRisk.AUTHENTICATED_UI),
     ("/api/audit", RouteRisk.AUTHENTICATED_UI),
     ("/api/terminals", RouteRisk.PRIVILEGED_TERMINAL),
     ("/ws/terminals", RouteRisk.PRIVILEGED_TERMINAL),
