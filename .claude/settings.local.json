@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "Bash(command -v uv)",
+      "Bash(uv --version)",
+      "Bash(command -v specify)",
+      "Bash(specify --version)"
+    ]
+  }
+}

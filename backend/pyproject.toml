@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ic-env-guard"
+version = "0.1.0"
+description = "Linux host agent for secure browser terminal, configured service control, and Prometheus-compatible metrics"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "ptyprocess>=0.7",
+    "psutil>=5.9",
+    "prometheus-client>=0.20",
+    "pydantic>=2.7",
+    "SQLAlchemy>=2.0",
+    "alembic>=1.13",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+ic-env-guard = "ic_env_guard.main:main"
+ic-env-guard-config = "ic_env_guard.systemd.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ic_env_guard*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "contract: contract tests for externally visible interfaces",
+    "integration: integration tests for realistic Linux behavior",
+    "unit: unit tests for isolated logic",
+    "security: security and failure-path tests",
+    "systemd: systemd/package lifecycle tests",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

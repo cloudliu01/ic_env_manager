@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ic-env-guard.local/contracts/service-config.schema.json",
+  "title": "IC Design Environment Guard Configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["server", "auth", "metrics", "services"],
+  "properties": {
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bind", "port"],
+      "properties": {
+        "bind": {
+          "type": "string",
+          "description": "Default is 127.0.0.1. Remote bind requires remote_bind_enabled=true and valid auth settings.",
+          "minLength": 1
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "remote_bind_enabled": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "token_file"],
+      "properties": {
+        "mode": {
+          "const": "bearer_token"
+        },
+        "token_file": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "collect_interval_seconds"],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "collect_interval_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "remote_network_allowlist": {
+          "type": "array",
+          "description": "Required when /metrics is exposed beyond localhost.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "default": []
+        }
+      }
+    },
+    "terminal": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "idle_timeout_minutes": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 120,
+          "default": 60
+        },
+        "replay_buffer_bytes": {
+          "type": "integer",
+          "minimum": 1048576,
+          "maximum": 10485760,
+          "default": 2097152
+        },
+        "exited_retention_minutes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120,
+          "default": 30
+        }
+      }
+    },
+    "services": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "$ref": "#/$defs/service"
+      }
+    }
+  },
+  "$defs": {
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "allowed_operations", "restart", "start_timeout_seconds", "stop_timeout_seconds", "logs"],
+      "oneOf": [
+        { "required": ["command"] },
+        { "required": ["systemd_unit"] }
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_.-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Configured command. Never accepted from API payloads. Mutually exclusive with systemd_unit."
+        },
+        "systemd_unit": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_.@-]+\\.service$",
+          "description": "Configured host-service mapping. Mutually exclusive with command."
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "allowed_operations": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["start", "stop", "restart", "status", "healthcheck"]
+          }
+        },
+        "autostart": {
+          "type": "boolean",
+          "default": false
+        },
+        "restart": {
+          "enum": ["never", "on-failure", "always"]
+        },
+        "start_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "stop_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "healthcheck": {
+          "$ref": "#/$defs/healthcheck"
+        },
+        "logs": {
+          "$ref": "#/$defs/logs"
+        }
+      }
+    },
+    "healthcheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "interval_seconds", "timeout_seconds"],
+      "properties": {
+        "type": {
+          "enum": ["none", "http", "tcp", "process"]
+        },
+        "target": {
+          "type": "string"
+        },
+        "interval_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "failure_threshold": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 3
+        }
+      }
+    },
+    "logs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capture", "max_tail_lines"],
+      "properties": {
+        "capture": {
+          "type": "boolean"
+        },
+        "path": {
+          "type": "string"
+        },
+        "max_tail_lines": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        },
+        "rotate": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_bytes": {
+              "type": "integer",
+              "minimum": 1024
+            },
+            "backup_count": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    }
+  }
+}

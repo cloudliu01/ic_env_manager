@@ -1,0 +1,611 @@
+openapi: 3.1.0
+info:
+  title: IC Design Environment Guard API
+  version: 0.1.0-mvp
+  description: >
+    Contract for the MVP local host agent HTTP API. All privileged routes require
+    the generated local bearer token. Metrics remote access is governed by
+    network allowlist rather than user login credentials.
+servers:
+  - url: http://127.0.0.1:8765
+    description: Default local-only agent endpoint
+security:
+  - bearerAuth: []
+paths:
+  /healthz:
+    get:
+      summary: Agent liveness
+      security: []
+      responses:
+        '200':
+          description: Agent process is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /readyz:
+    get:
+      summary: Agent readiness
+      security: []
+      responses:
+        '200':
+          description: Agent is ready to serve configured operations
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessResponse'
+        '503':
+          description: Agent is not ready or failed closed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/auth/login:
+    post:
+      summary: Exchange generated local bearer token for an authenticated session context
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token:
+                  type: string
+                  minLength: 1
+                  description: Generated local bearer token; never logged or echoed.
+      responses:
+        '200':
+          description: Login accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401':
+          description: Invalid token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/auth/logout:
+    post:
+      summary: End the current authenticated session context
+      responses:
+        '204':
+          description: Logout accepted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/services:
+    get:
+      summary: List configured services
+      responses:
+        '200':
+          description: Configured services only
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [services]
+                properties:
+                  services:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ServiceSummary'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/services/{service_id}:
+    get:
+      summary: Get configured service detail
+      parameters:
+        - $ref: '#/components/parameters/ServiceId'
+      responses:
+        '200':
+          description: Service detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/services/{service_id}/start:
+    post:
+      summary: Start a configured service if allowed
+      parameters:
+        - $ref: '#/components/parameters/ServiceId'
+      responses:
+        '202':
+          description: Operation accepted or already satisfied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceOperationResponse'
+        '400':
+          description: Operation not allowed for configured service
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/services/{service_id}/stop:
+    post:
+      summary: Stop a configured service if allowed
+      parameters:
+        - $ref: '#/components/parameters/ServiceId'
+      responses:
+        '202':
+          description: Operation accepted or already satisfied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceOperationResponse'
+        '400':
+          description: Operation not allowed for configured service
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/services/{service_id}/restart:
+    post:
+      summary: Restart a configured service if allowed
+      parameters:
+        - $ref: '#/components/parameters/ServiceId'
+      responses:
+        '202':
+          description: Operation accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceOperationResponse'
+        '400':
+          description: Operation not allowed for configured service
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/services/{service_id}/events:
+    get:
+      summary: List recent service events
+      parameters:
+        - $ref: '#/components/parameters/ServiceId'
+      responses:
+        '200':
+          description: Recent service events
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events]
+                properties:
+                  events:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ServiceEvent'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/services/{service_id}/logs:
+    get:
+      summary: Get recent bounded service log status or tail
+      parameters:
+        - $ref: '#/components/parameters/ServiceId'
+      responses:
+        '200':
+          description: Recent service logs according to configured log rules
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceLogsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/terminals:
+    get:
+      summary: List terminal sessions owned by the local administrator
+      responses:
+        '200':
+          description: Terminal sessions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [terminals]
+                properties:
+                  terminals:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TerminalSession'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      summary: Create a new terminal session
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTerminalRequest'
+      responses:
+        '201':
+          description: Terminal session created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TerminalSession'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/terminals/{terminal_id}:
+    get:
+      summary: Get terminal session metadata
+      parameters:
+        - $ref: '#/components/parameters/TerminalId'
+      responses:
+        '200':
+          description: Terminal metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TerminalSession'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      summary: Close a terminal session and terminate/reap its process
+      parameters:
+        - $ref: '#/components/parameters/TerminalId'
+      responses:
+        '202':
+          description: Close requested
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TerminalSession'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/terminals/{terminal_id}/history:
+    get:
+      summary: Retrieve bounded retained terminal output for reconnect
+      parameters:
+        - $ref: '#/components/parameters/TerminalId'
+        - name: cursor
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+          required: true
+      responses:
+        '200':
+          description: Retained output tail and truncation metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TerminalHistoryResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/terminals/{terminal_id}/connect-token:
+    post:
+      summary: Create a short-lived one-use WebSocket ticket
+      parameters:
+        - $ref: '#/components/parameters/TerminalId'
+      responses:
+        '201':
+          description: One-use connection ticket
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectTokenResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/terminals/{terminal_id}/resize:
+    post:
+      summary: Resize terminal PTY
+      parameters:
+        - $ref: '#/components/parameters/TerminalId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResizeTerminalRequest'
+      responses:
+        '204':
+          description: Resize accepted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /metrics:
+    get:
+      summary: Prometheus-compatible metrics endpoint
+      description: Local requests are allowed by default; remote requests require configured network allowlist.
+      security: []
+      responses:
+        '200':
+          description: Prometheus-compatible text exposition
+          content:
+            text/plain; version=0.0.4:
+              schema:
+                type: string
+        '403':
+          description: Source not allowed by metrics network allowlist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: generated-local-token
+  parameters:
+    ServiceId:
+      name: service_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[a-zA-Z0-9_.-]+$'
+    TerminalId:
+      name: terminal_id
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+  responses:
+    Unauthorized:
+      description: Missing or invalid generated local bearer token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: Resource not found or not configured
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          const: ok
+    ReadinessResponse:
+      type: object
+      required: [status, config_loaded, security_valid]
+      properties:
+        status:
+          enum: [ready, degraded]
+        config_loaded:
+          type: boolean
+        security_valid:
+          type: boolean
+    ErrorResponse:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+        correlation_id:
+          type: string
+    LoginResponse:
+      type: object
+      required: [actor, token_type]
+      properties:
+        actor:
+          type: string
+        token_type:
+          const: bearer
+    ServiceSummary:
+      type: object
+      required: [id, name, status, health_status, allowed_operations]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        status:
+          $ref: '#/components/schemas/ServiceStatus'
+        health_status:
+          $ref: '#/components/schemas/HealthStatus'
+        allowed_operations:
+          type: array
+          items:
+            enum: [start, stop, restart, status, healthcheck]
+    ServiceDetail:
+      allOf:
+        - $ref: '#/components/schemas/ServiceSummary'
+        - type: object
+          required: [restart_policy, updated_at]
+          properties:
+            restart_policy:
+              enum: [never, on-failure, always]
+            pid:
+              type: integer
+              nullable: true
+            started_at:
+              type: string
+              format: date-time
+              nullable: true
+            updated_at:
+              type: string
+              format: date-time
+            last_error:
+              type: string
+              nullable: true
+    ServiceStatus:
+      enum: [configured, starting, running, stopping, exited, failed, unknown]
+    HealthStatus:
+      enum: [unknown, healthy, unhealthy, disabled]
+    ServiceOperationResponse:
+      type: object
+      required: [operation_id, service_id, operation, result]
+      properties:
+        operation_id:
+          type: string
+        service_id:
+          type: string
+        operation:
+          enum: [start, stop, restart, status, healthcheck]
+        result:
+          enum: [success, already_in_state, rejected, timeout, failed]
+        failure_reason:
+          type: string
+          nullable: true
+    ServiceEvent:
+      type: object
+      required: [id, service_id, event_type, created_at]
+      properties:
+        id:
+          type: string
+        service_id:
+          type: string
+        event_type:
+          type: string
+        message:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    ServiceLogsResponse:
+      type: object
+      required: [service_id, truncated, lines]
+      properties:
+        service_id:
+          type: string
+        truncated:
+          type: boolean
+        lines:
+          type: array
+          items:
+            type: string
+    CreateTerminalRequest:
+      type: object
+      properties:
+        title:
+          type: string
+          maxLength: 80
+        rows:
+          type: integer
+          minimum: 1
+        cols:
+          type: integer
+          minimum: 1
+        cwd:
+          type: string
+    TerminalSession:
+      type: object
+      required: [id, owner, title, status, output_cursor, replay_buffer_start_cursor, created_at, last_active_at, idle_timeout_minutes]
+      properties:
+        id:
+          type: string
+        owner:
+          type: string
+        title:
+          type: string
+        pid:
+          type: integer
+          nullable: true
+        rows:
+          type: integer
+        cols:
+          type: integer
+        status:
+          enum: [creating, running, exited, closed, timed_out, failed, unknown]
+        output_cursor:
+          type: integer
+          minimum: 0
+        replay_buffer_start_cursor:
+          type: integer
+          minimum: 0
+        idle_timeout_minutes:
+          type: integer
+          minimum: 30
+          maximum: 120
+          default: 60
+        created_at:
+          type: string
+          format: date-time
+        last_active_at:
+          type: string
+          format: date-time
+        exited_at:
+          type: string
+          format: date-time
+          nullable: true
+        closed_at:
+          type: string
+          format: date-time
+          nullable: true
+        close_reason:
+          type: string
+          nullable: true
+    TerminalHistoryResponse:
+      type: object
+      required: [terminal_id, from_cursor, to_cursor, buffer_start_cursor, truncated, status, output]
+      properties:
+        terminal_id:
+          type: string
+        from_cursor:
+          type: integer
+          minimum: 0
+        to_cursor:
+          type: integer
+          minimum: 0
+        buffer_start_cursor:
+          type: integer
+          minimum: 0
+        truncated:
+          type: boolean
+        status:
+          type: string
+        output:
+          type: string
+    ConnectTokenResponse:
+      type: object
+      required: [ticket, expires_in_seconds]
+      properties:
+        ticket:
+          type: string
+          description: One-use WebSocket ticket; never logged or persisted after consumption.
+        expires_in_seconds:
+          type: integer
+          maximum: 60
+    ResizeTerminalRequest:
+      type: object
+      required: [rows, cols]
+      properties:
+        rows:
+          type: integer
+          minimum: 1
+        cols:
+          type: integer
+          minimum: 1
