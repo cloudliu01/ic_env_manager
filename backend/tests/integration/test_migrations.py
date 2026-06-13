@@ -20,7 +20,9 @@ def test_initial_migration_creates_required_tables(tmp_path):
 
     tables = {
         row[0]
-        for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
     }
     assert {
         "schema_versions",
@@ -56,9 +58,7 @@ def test_initial_migration_is_idempotent_for_current_schema(tmp_path):
 def test_initial_migration_records_failed_schema_state(tmp_path):
     connection = sqlite3.connect(tmp_path / "state.db")
     connection.execute("CREATE TABLE schema_versions (version text primary key)")
-    connection.execute(
-        "INSERT INTO schema_versions(version) VALUES (?)", ("failed-version",)
-    )
+    connection.execute("INSERT INTO schema_versions(version) VALUES (?)", ("failed-version",))
 
     initial_migration.upgrade(connection)
 

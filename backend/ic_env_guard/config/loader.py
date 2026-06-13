@@ -33,7 +33,9 @@ def load_config(path: Path) -> AppConfig:
 def sanitize_config_for_audit(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            key: "<redacted>" if key.lower() in {"token", "password", "secret", "private_key"} else sanitize_config_for_audit(item)
+            key: "<redacted>"
+            if key.lower() in {"token", "password", "secret", "private_key"}
+            else sanitize_config_for_audit(item)
             for key, item in value.items()
         }
     if isinstance(value, list):

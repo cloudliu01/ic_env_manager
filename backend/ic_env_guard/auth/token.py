@@ -25,7 +25,9 @@ def load_bearer_token(path: Path) -> str:
 def validate_token_file_permissions(path: Path) -> None:
     mode = path.stat().st_mode
     if mode & (stat.S_IRWXG | stat.S_IRWXO):
-        raise ValueError("bearer token file must not be readable, writable, or executable by group/other")
+        raise ValueError(
+            "bearer token file must not be readable, writable, or executable by group/other"
+        )
 
 
 def generate_bearer_token() -> str:

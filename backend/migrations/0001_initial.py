@@ -180,8 +180,7 @@ TABLE_STATEMENTS = [
 
 def _ensure_schema_versions_columns(connection: sqlite3.Connection) -> None:
     columns = {
-        row[1]
-        for row in connection.execute("PRAGMA table_info(schema_versions)").fetchall()
+        row[1] for row in connection.execute("PRAGMA table_info(schema_versions)").fetchall()
     }
     additions = {
         "applied_at": "TEXT",

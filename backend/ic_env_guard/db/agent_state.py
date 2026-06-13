@@ -32,7 +32,9 @@ class AgentStateRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    def add_lifecycle_event(self, event_type: str, status: str, message: str | None = None) -> AgentLifecycleEvent:
+    def add_lifecycle_event(
+        self, event_type: str, status: str, message: str | None = None
+    ) -> AgentLifecycleEvent:
         row = AgentLifecycleEvent(
             event_type=bounded_text(event_type, 255) or event_type,
             status=bounded_text(status, 64) or status,

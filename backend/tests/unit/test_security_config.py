@@ -10,7 +10,9 @@ from ic_env_guard.config.models import AppConfig, AuthConfig, ServerConfig
 def test_route_risk_classifies_privileged_terminal_and_service_control():
     assert classify_route("/api/terminals", "POST") == RouteRisk.PRIVILEGED_TERMINAL
     assert classify_route("/ws/terminals/abc", "GET") == RouteRisk.PRIVILEGED_TERMINAL
-    assert classify_route("/api/services/demo/start", "POST") == RouteRisk.PRIVILEGED_SERVICE_CONTROL
+    assert (
+        classify_route("/api/services/demo/start", "POST") == RouteRisk.PRIVILEGED_SERVICE_CONTROL
+    )
     assert classify_route("/metrics", "GET") == RouteRisk.METRICS
 
 

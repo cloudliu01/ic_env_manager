@@ -1,10 +1,16 @@
 import { useEffect, useState } from 'react';
 import { apiClient } from '../api/client';
 import { loadSessionToken } from '../auth/session';
+import { AuditStatusPage } from './AuditStatusPage';
+import { HostOverviewPage } from './HostOverviewPage';
 import { LoginPage } from './LoginPage';
+import { MetricsPage } from './MetricsPage';
+import { ServiceListPage } from './ServiceListPage';
+import { TerminalPage } from './TerminalPage';
 
 export function AppRoutes() {
   const [actor, setActor] = useState<string | null>(null);
+  const [page, setPage] = useState<'overview' | 'terminal' | 'services' | 'metrics' | 'audit'>('overview');
 
   useEffect(() => {
     const token = loadSessionToken();
@@ -23,11 +29,17 @@ export function AppRoutes() {
       <h1>IC Design Environment Guard</h1>
       <p>Signed in as {actor}</p>
       <nav aria-label="Primary">
-        <a href="#terminal">Terminal</a>
-        <a href="#services">Services</a>
-        <a href="#metrics">Metrics</a>
-        <a href="#audit">Audit</a>
+        <button type="button" onClick={() => setPage('overview')}>Overview</button>
+        <button type="button" onClick={() => setPage('terminal')}>Terminal</button>
+        <button type="button" onClick={() => setPage('services')}>Services</button>
+        <button type="button" onClick={() => setPage('metrics')}>Metrics</button>
+        <button type="button" onClick={() => setPage('audit')}>Audit</button>
       </nav>
+      {page === 'overview' ? <HostOverviewPage /> : null}
+      {page === 'terminal' ? <TerminalPage /> : null}
+      {page === 'services' ? <ServiceListPage /> : null}
+      {page === 'metrics' ? <MetricsPage /> : null}
+      {page === 'audit' ? <AuditStatusPage /> : null}
     </main>
   );
 }

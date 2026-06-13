@@ -51,3 +51,9 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"ic_env_guard/api/*.py" = ["B008"]
+"ic_env_guard/auth/dependencies.py" = ["B008"]
+"ic_env_guard/main.py" = ["B008"]
+"tests/contract/test_terminal_websocket_contract.py" = ["B017"]

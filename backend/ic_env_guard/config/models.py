@@ -77,10 +77,10 @@ class ServiceConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_execution_mapping(self) -> "ServiceConfig":
-        if bool(self.command) == bool(self.systemd_unit):
-            raise ValueError("service must define exactly one of command or systemd_unit")
         if not self.allowed_operations:
             raise ValueError("service allowed_operations must not be empty")
+        if bool(self.command) == bool(self.systemd_unit):
+            raise ValueError("service must define exactly one of command or systemd_unit")
         return self
 
 

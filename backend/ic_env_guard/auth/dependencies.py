@@ -4,7 +4,11 @@ from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from ic_env_guard.api.errors import ApiError
-from ic_env_guard.auth.token import BearerTokenValidator, load_bearer_token, validate_token_file_permissions
+from ic_env_guard.auth.token import (
+    BearerTokenValidator,
+    load_bearer_token,
+    validate_token_file_permissions,
+)
 
 _AUTH_SCHEME = HTTPBearer(auto_error=False)
 
