@@ -17,7 +17,8 @@
 
 - [x] Browser and agent authentication boundaries are separate.
 - [x] All `/api/` routes require browser authentication and explicit authorization,
-      except `/healthz` and `/readyz`; this explicitly covers `/api/control-plane/audit`.
+      except `/healthz`, `/readyz`, and `/api/auth/login`; this explicitly covers
+      `/api/control-plane/audit`.
 - [x] Non-loopback agent transport requires verified TLS.
 - [x] Agent credentials and upstream terminal tickets remain server-side.
 - [x] Agent targets cannot be supplied by browser requests.

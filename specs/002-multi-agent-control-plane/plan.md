@@ -148,7 +148,7 @@ The installer-generated config file and `README` example must show
   a description error in the previous plan version)
 - Modify: `backend/ic_env_guard/main.py`
 - Modify: `backend/ic_env_guard/config/models.py` (add `state_database` field)
-- Modify: `backend/tests/conftest.py` (add autouse env-var fixture)
+- Create: `backend/tests/conftest.py` (add autouse env-var fixture)
 - Modify: `backend/tests/integration/test_migrations.py`
   (fix hardcoded `parents[2] / "migrations"` path)
 - Modify: `backend/tests/integration/test_terminal_secret_exclusion.py`
@@ -202,19 +202,12 @@ The installer-generated config file and `README` example must show
   4. use request-scoped sessions via a FastAPI dependency that `yield`s a session
      from the factory, commits on normal exit, rolls back on any exception, and
      closes in `finally`; this replaces the current single shared session that
-     is never closed. **Audit exception**: gateway audit records must survive
-     business-logic failures — the audit repository uses its own independent
-     session with explicit `commit()` calls (intent committed before upstream
-     dispatch; outcome updated and committed again in `finally`) and MUST NOT
-     share a session with the request business logic. Additional failure rules:
-     (a) if the **intent commit** fails, the handler MUST fail closed and MUST
-     NOT dispatch the upstream request — no dispatch without an audit trail;
-     (b) an **outcome commit** failure must not erase the already-committed
-     intent — the intent survives as a partially-recorded event;
-     (c) audit exceptions MUST be caught, logged in sanitized form, and
-     re-raised without overwriting the original business exception and without
-     leaking raw SQLite error text to the caller. Add tests covering each of
-     these three failure modes;
+     is never closed. The audit repository uses its own independent session with
+     explicit `commit()` calls and MUST NOT share a session with request business
+     logic, so audit records survive business-logic rollbacks. (Detailed
+     gateway-audit failure-mode rules — intent-commit fail-closed, outcome-commit
+     semantics when upstream succeeds, exception suppression — are specified in
+     Task 2 where gateway audit is introduced.);
   5. close the engine in the lifespan shutdown hook;
   6. do NOT call `Base.metadata.create_all()`.
 - [ ] In `config/audit.py`, replace `Base.metadata.create_all(engine)` in
@@ -287,11 +280,14 @@ The installer-generated config file and `README` example must show
   and run agent migrations only when `mode == "agent"`; in `control-plane` mode,
   skip `state_database` resolution and engine creation entirely (the gateway audit
   database is opened separately in Task 2). Add a test: call
-  `create_app(state_database=tmp_path / "must-not-exist.db", mode="control-plane",
-  token_file=...)` and assert that the file was NOT created; this guards FR-005
-  ("control-plane mode MUST NOT imply management of the control-plane host"). The
-  complementary check — that the control-plane database contains no agent tables —
-  belongs in Task 2's isolation test, where the control-plane DB is first created.
+  `create_app(config=AppConfig(mode="control-plane", ...),
+  state_database=tmp_path / "must-not-exist.db")` and assert that the file was
+  NOT created; do NOT add `mode` as a separate keyword argument to `create_app()`
+  — mode comes from `AppConfig` to avoid a second configuration override path.
+  This guards FR-005 ("control-plane mode MUST NOT imply management of the
+  control-plane host"). The complementary check — that the control-plane database
+  contains no agent tables — belongs in Task 2's isolation test, where the
+  control-plane DB is first created.
 - [ ] Add a regression test asserting the `agent`-mode router set and dependency
   overrides are unchanged from `001` before refactoring anything else.
 - [ ] Re-run the focused tests and then:
@@ -362,7 +358,19 @@ The installer-generated config file and `README` example must show
   the METADATA assertions are added in Task 4 and Task 9 once those deps are
   declared. The migration file assertions apply now.)
 - [ ] Add a repository method that creates intent before dispatch and finalizes
-  the same record after success or failure.
+  the same record after success or failure. Specify and test the following
+  failure-mode rules explicitly:
+  (a) **Intent commit fails**: the handler MUST fail closed and MUST NOT dispatch
+  the upstream request — no audit trail means no dispatch; return an error to
+  the caller;
+  (b) **Outcome commit fails, upstream succeeded**: MUST return the successful
+  business response to the caller — returning an error could induce a duplicate
+  mutation on retry. Log a sanitized warning and mark gateway readiness as failed
+  (`/readyz` returns 503 until the next successful audit write);
+  (c) **Business exception present**: suppress the audit exception (if any),
+  preserve and re-raise the original business exception; audit exceptions MUST
+  NOT overwrite the original error or leak raw SQLite text to the caller.
+  Add a test for each of these three cases.
 - [ ] Add bounded authenticated query routes under `/api/control-plane/audit`.
 - [ ] Run:
 
@@ -525,9 +533,11 @@ The installer-generated config file and `README` example must show
   `/api/agents/{agent_id}/monitoring/snapshot`.
 - [ ] Remove browser forms that submit agent addresses and bearer keys.
 - [ ] Mark `/api/monitoring/machines` mutation routes deprecated for one
-  compatibility release; prevent new frontend use.
-- [ ] Remove `MachineRegistry` after the compatibility window and keep
-  `local_host_snapshot()` as the host-agent implementation.
+  compatibility release; prevent new frontend use. Do NOT remove the routes or
+  `MachineRegistry` in this task — deletion is a separate step that requires the
+  compatibility window to have elapsed (documented in Task 10 and the operations
+  guide). Removing in the same task as deprecating contradicts the one-release
+  window.
 - [ ] Verify the UI has exactly one agent selector.
 - [ ] Run existing monitoring and secret-exclusion tests.
 
