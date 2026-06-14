@@ -22,9 +22,11 @@ WS /ws/agents/{agent_id}/terminals/{terminal_id}?ticket={gateway_ticket}&cursor=
    rejected with `4429` before the ticket is consumed, so a valid ticket is
    not wasted. The slot is released on every failure path.
 
-The gateway ticket is bound to actor, agent ID, terminal ID, and expiry.
-Missing, expired, reused, or mismatched tickets are rejected before either
-WebSocket is attached.
+The gateway ticket is bound to actor, agent ID, terminal ID, intended WebSocket
+path, and expiry. The browser WebSocket attach must authenticate as the same
+actor bound to the ticket; actor mismatch is rejected with `4403`. Missing,
+expired, reused, or mismatched tickets are rejected before either WebSocket is
+attached.
 
 ## Connection Establishment
 
@@ -46,6 +48,10 @@ The control plane:
 
 If upstream establishment fails the browser connection closes with the mapped
 gateway close code; the proxy slot is freed and no consumed ticket is reusable.
+The gateway generates the correlation ID before auth and ticket validation,
+records it in gateway audit, and includes it in sanitized close reason text when
+the WebSocket protocol permits a reason. Close reasons never include tokens,
+terminal content, upstream URLs, or raw exceptions.
 
 ## Data Frames
 
@@ -110,4 +116,3 @@ paths, or raw exceptions.
 The gateway records attach intent and final outcome with actor, source address,
 agent ID, terminal ID, correlation ID, and close category. It does not record
 terminal input, output, titles containing secrets, or upstream tickets.
-

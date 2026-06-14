@@ -134,9 +134,10 @@ validate that each agent's `/metrics` endpoint remains Prometheus compatible.
   their target through one authoritative agent registry.
 - **FR-008**: Agent IDs MUST be unique, stable, URL-safe identifiers matching
   `^[a-z0-9][a-z0-9_-]{0,63}$`.
-- **FR-009**: Enabled agents MUST have an HTTPS base URL and a readable,
-  permission-checked credential source unless explicit development-only insecure
-  transport is enabled for a loopback target.
+- **FR-009**: Enabled agents MUST have a readable, permission-checked credential
+  source. Enabled agents MUST use an HTTPS base URL unless explicit
+  development-only insecure transport is enabled for a loopback target; the
+  development transport exception does not waive the credential requirement.
 - **FR-010**: Production configuration MUST reject non-loopback HTTP agent URLs,
   disabled TLS verification, unreadable credential files, duplicate IDs,
   unsupported URL paths, fragments, and embedded credentials.
@@ -200,6 +201,26 @@ validate that each agent's `/metrics` endpoint remains Prometheus compatible.
   single-agent operation, mixed-version behavior, and recovery when the control
   plane is unavailable.
 
+## Authorization Policy
+
+The first release uses the existing `local-admin` role, but each privileged route
+still performs an explicit authorization check before resolving or contacting an
+agent.
+
+| Operation | Required actor | Unauthorized result | Upstream contacted? |
+|---|---|---|---|
+| Agent inventory and detail | authenticated `local-admin` | `403 agent_operation_forbidden` | No |
+| Agent probe, health, readiness, and monitoring snapshot | authenticated `local-admin` | `403 agent_operation_forbidden` | No |
+| Service list, detail, events, and logs | authenticated `local-admin` | `403 agent_operation_forbidden` | No |
+| Service start, stop, and restart | authenticated `local-admin` | `403 agent_operation_forbidden` | No |
+| Terminal list, create, detail, history, resize, connect-token, and close | authenticated `local-admin` | `403 agent_operation_forbidden` | No |
+| Terminal WebSocket attach | authenticated `local-admin` matching the gateway ticket actor | `4403` | No |
+| Agent audit and gateway audit queries | authenticated `local-admin` | `403 agent_operation_forbidden` | No |
+
+Missing browser authentication returns `401 unauthorized` and never contacts an
+agent. Disabled or unknown agents are rejected before authorization-approved
+requests can fall back to another target.
+
 ## Agent Availability Model
 
 | State | Meaning |
@@ -214,6 +235,19 @@ Each status response includes `observed_at` and `stale_after`. A cached status
 becomes `unknown` when it exceeds `stale_after`; a request may still perform an
 on-demand attempt.
 
+| Event | Next state |
+|---|---|
+| Agent is disabled in startup configuration | `disabled` |
+| No completed probe exists or last observation is stale | `unknown` |
+| Probe succeeds, API version is supported, and required capabilities are present | `ready` |
+| Probe succeeds but readiness reports not-ready or optional UI capabilities are absent | `degraded` |
+| Capability endpoint is missing, API version is unsupported, TLS/auth fails, or transport fails | `unavailable` |
+
+Missing the capability endpoint is a protocol failure for routing purposes and
+surfaces as `agent_protocol_error`; it is not a partial-operation mode. Missing
+optional capabilities may set inventory status to `degraded`, but the
+corresponding UI feature remains disabled and the route is not called.
+
 ## Error Model
 
 | HTTP | Code | Meaning |
@@ -224,6 +258,7 @@ on-demand attempt.
 | `404` | `agent_not_found` | The configured agent does not exist. |
 | `409` | `agent_disabled` | The agent exists but routing is disabled. |
 | `424` | `agent_operation_indeterminate` | A mutation may have reached the agent, but no authoritative result was received. |
+| `429` | `gateway_capacity_exceeded` | Ticket or terminal proxy capacity is exhausted before dispatch. |
 | `502` | `agent_protocol_error` | The agent returned an invalid or incompatible response. |
 | `503` | `agent_unavailable` | A connection, TLS, or upstream authentication failure occurred. |
 | `504` | `agent_timeout` | The configured upstream deadline expired before dispatch was confirmed. |
@@ -252,8 +287,10 @@ upstream tickets, or unsanitized exception strings.
   the UI or gateway readiness.
 - **SC-002**: 100% of browser-visible payloads and logs inspected during security
   validation contain no agent credential or upstream terminal ticket.
-- **SC-003**: Every service mutation produces a durable gateway audit record with
-  actor, source, agent, operation, result, correlation ID, and upstream outcome.
+- **SC-003**: Every service mutation, terminal HTTP mutation, terminal WebSocket
+  attach, authorization denial, and pre-dispatch upstream failure produces a
+  durable gateway audit record with actor, source, agent, operation, result,
+  correlation ID, and upstream outcome where available.
 - **SC-004**: A timed-out mutation is never automatically retried and is reported
   as indeterminate when dispatch cannot be ruled out.
 - **SC-005**: Fast agent switching during delayed responses never displays data
@@ -264,7 +301,9 @@ upstream tickets, or unsanitized exception strings.
   terminal lifecycle ownership with the agent and allows a new attach within
   the original terminal retention window.
 - **SC-008**: Non-loopback HTTP agent configuration and disabled TLS verification
-  fail validation unless an explicit development-only exception applies.
+  for non-loopback agents always fail validation; only loopback HTTP may be
+  allowed by explicit development-only configuration while the control plane is
+  local-only.
 - **SC-009**: Agent and gateway versions can differ within the documented
   compatibility window; unsupported capabilities are disabled rather than
   invoked.
@@ -280,11 +319,14 @@ upstream tickets, or unsanitized exception strings.
 - **SC-013**: A config file with `mode: combined` fails Pydantic validation with
   a clear unknown-value error, since `combined` is not in the enum for this
   feature; it does not reach application startup at all.
+- **SC-014**: Operator documentation covers configuration migration, rollback to
+  `agent` mode, mixed-version behavior, deprecated machine-registry removal, and
+  control-plane outage recovery, and the documented validation commands pass.
 
 ## Related Documents
 
 - [Architecture](architecture.md)
 - [HTTP API Contract](contracts/http-api.md)
+- [Control-Plane Configuration Contract](contracts/control-plane-config.md)
 - [Terminal WebSocket Contract](contracts/terminal-websocket.md)
 - [Implementation Plan](plan.md)
-

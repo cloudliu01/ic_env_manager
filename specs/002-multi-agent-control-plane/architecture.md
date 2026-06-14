@@ -74,7 +74,9 @@ It is the only registry used by overview, monitoring, services, terminals, and
 audit.
 
 The existing dynamic `MachineRegistry` and browser-side machine credential flow
-are removed after migration.
+are deprecated during the documented compatibility release and removed only after
+that window has elapsed. The new frontend stops using the mutation routes in this
+feature.
 
 ### Agent HTTP Client
 
@@ -137,6 +139,14 @@ resolved incorrectly after wheel install.
 Every privileged routing attempt is recorded even when DNS, TLS, authentication,
 or connection setup fails.
 
+If the gateway audit intent cannot be durably committed, the handler fails
+closed and does not dispatch upstream. If the outcome write fails after the
+upstream operation succeeds, the handler returns the successful business response
+to avoid inducing duplicate mutations, logs only a sanitized warning, and marks
+gateway readiness failed until a subsequent audit write succeeds. Audit write
+exceptions never replace the original business exception returned by routing
+logic.
+
 Gateway events include:
 
 - actor ID and source address;
@@ -160,11 +170,14 @@ separate gateway ticket to the browser. Any failure releases the reservation.
 The mapping is bound to:
 
 ```text
-(gateway_ticket, actor_id, agent_id, terminal_id, upstream_ticket, expires_at)
+(gateway_ticket, actor_id, agent_id, terminal_id, intended_ws_path, upstream_ticket, expires_at)
 ```
 
-It is consumed once. Restart invalidates gateway tickets but does not alter
-upstream terminal ownership.
+`intended_ws_path` is the exact control-plane WebSocket route for the selected
+agent and terminal. On attach, the browser must be authenticated as the actor
+bound to the ticket; actor mismatch is rejected before opening the upstream
+socket. The ticket is consumed once. Restart invalidates gateway tickets but does
+not alter upstream terminal ownership.
 
 The WebSocket attach calls `try_acquire_proxy_slot()` — an atomic operation that
 either reserves a slot under the global cap or fails immediately. If it fails,
@@ -177,12 +190,15 @@ tickets and concurrent sockets so a flood of terminal connections cannot exhaust
 gateway memory. The upstream socket is opened with the `websockets` client and
 verified TLS.
 
+Each accepted proxy enforces a maximum frame size, bounded per-direction queues,
+paired task cancellation, sanitized close-code mapping, reconnect cursor
+handling, and shutdown cleanup. A single accepted socket therefore cannot bypass
+the global cap by buffering unbounded terminal output.
+
 ## Configuration
 
 ```yaml
 mode: control-plane          # valid values: agent | control-plane (combined = feature 003)
-
-state_database: /var/lib/ic-env-guard/state.db   # agent-mode durable audit; default shown
 
 server:
   bind: 127.0.0.1
@@ -225,6 +241,8 @@ Validation rules:
 - Token files must be regular files owned by the service user and not readable
   by group or other.
 - Agent IDs and names are never derived from remote response content.
+- `state_database` is an agent-mode setting. In `control-plane` mode, startup
+  does not resolve, create, or migrate the agent state database.
 
 ## Security Boundaries
 
@@ -252,6 +270,17 @@ client headers are never forwarded.
 Agent targets come only from validated startup configuration. The browser cannot
 submit URLs, hosts, ports, or arbitrary paths. Redirect following is disabled.
 
+Configured hostnames are resolved before connection. The control plane rejects
+metadata/link-local, multicast, unspecified, and self-target addresses, including
+the control-plane listener itself. RFC1918/private agent networks are allowed
+only when they come from startup configuration and still satisfy TLS and
+credential validation rules.
+
+Each gateway route owns an explicit allowlist for method, upstream path,
+accepted query fields, forwarded headers, and response content type. Unknown
+query fields are rejected for mutating routes and ignored only where the
+documented inherited host-agent contract already permits optional read filters.
+
 ## Compatibility
 
 The agent exposes a version/capabilities endpoint:
@@ -270,8 +299,10 @@ The agent exposes a version/capabilities endpoint:
 ```
 
 The control plane enables UI features only when the corresponding capability is
-present. An unsupported API version produces `agent_protocol_error`; optional
-capability gaps produce `degraded`.
+present. Missing capability endpoint or unsupported API version produces
+`agent_protocol_error` and enables no features for that agent. Missing optional
+capabilities may show inventory status `degraded`, but the corresponding feature
+is disabled and its route is not called.
 
 The first compatibility window supports the current `001` contract plus the new
 capability endpoint. Existing local routes remain authoritative on each agent.
@@ -324,4 +355,3 @@ Prometheus should scrape agents directly.
 
 Rollback is configuration-only: run the backend in `agent` mode and use the
 existing single-host frontend/API paths.
-

@@ -14,6 +14,18 @@
 - Redirects from agents are protocol errors.
 - Response bodies above the configured limit are rejected as protocol errors.
 
+The gateway inherits the feature `001` host-agent service, terminal, audit, and
+monitoring contracts and adds only the overlays documented here: `agent_id`,
+`correlation_id`, normalized gateway errors, explicit authorization, and the
+server-side agent registry. It does not introduce a generic reverse proxy.
+
+## Retry Policy
+
+Read-only requests may be retried at most once, within the caller's total
+deadline, only when the failure is known to have occurred before upstream
+dispatch. POST, DELETE, WebSocket attach, and terminal input are never retried by
+the gateway.
+
 ## Agent Inventory
 
 ### `GET /api/agents`
@@ -156,7 +168,8 @@ It returns:
 The control plane does not call a resource route unless the corresponding
 capability is present. An agent that does not expose `GET /api/capabilities` is
 below the minimum supported version: it is reported as `agent_protocol_error`
-and no resource features are enabled for it.
+and no resource features are enabled for it. Missing optional capabilities may
+make the inventory status `degraded`, but the missing feature remains disabled.
 
 ## Normalized Errors
 
@@ -184,4 +197,3 @@ Allowed gateway codes:
 
 Upstream application errors such as `not_found` or `operation_not_allowed` retain
 their original status and safe body, with `agent_id` and `correlation_id` added.
-

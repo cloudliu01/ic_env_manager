@@ -16,6 +16,38 @@ Both migration directories live **inside** the `ic_env_guard` package — `ic_en
 - The `001` audit store is built in `create_app()` against an in-memory `sqlite://` engine (`StaticPool`); both audit writes and the query API use it, so audit is lost on restart. This already violates `001` FR-021/FR-026 ("migration-managed local durable state"). Task 0 fixes it as a prerequisite, because the MVP 3 agent-audit view cannot meet the original contract on top of an ephemeral store.
 - Gateway audit (FR-021) lives in a separate, durable `control-plane.db`. Its schema's single source of truth is the control-plane migration; the ORM model maps the table and does not `create_all` it.
 
+## Constitution Check
+
+- **Security Gate**: Satisfied. The feature exposes service control, terminals,
+  host data, logs, metrics snapshots, and configuration-derived inventory only
+  behind browser authentication and explicit route authorization. Secrets,
+  upstream tickets, terminal content, raw upstream URLs, and unsanitized
+  exceptions are excluded from UI, logs, audit, metrics, and diagnostics.
+- **Linux Operations Gate**: Satisfied. Runtime remains Python 3.11+ FastAPI on
+  the existing Linux/systemd packaging model; `agent` mode is the default and
+  preserves feature `001` lifecycle behavior.
+- **Service Management Gate**: Satisfied. Service actions remain limited to
+  configured services exposed by the selected agent, are routed through explicit
+  allowlisted handlers, preserve existing idempotent host-agent semantics, and
+  are gateway-audited.
+- **Observability Gate**: Satisfied. Prometheus `/metrics` remains agent-local
+  and allowlisted; the control plane provides authenticated JSON snapshots only
+  and does not add raw metrics aggregation, alerting, or long-term time-series
+  storage.
+- **Terminal Safety Gate**: Satisfied. PTY ownership stays with the agent;
+  gateway tickets are one-use and bounded; WebSocket proxying defines capacity,
+  frame, backpressure, cancellation, reconnect, and shutdown behavior.
+- **Persistence and Audit Gate**: Satisfied. Agent audit durability is fixed as a
+  prerequisite; gateway audit uses a separate migration-managed SQLite database;
+  both audit paths exclude secrets and terminal content.
+- **Simplicity Gate**: Satisfied. `combined` mode, discovery, HA, bulk commands,
+  custom TSDB, and generic reverse proxying remain out of scope. The feature adds
+  no transport abstraction until feature `003` needs it.
+- **Testing Gate**: Satisfied by planned contract, integration, security,
+  packaging, migration, frontend, and full-suite verification tasks.
+
+No constitutional exception is requested.
+
 ---
 
 ## Delivery Slices
@@ -395,11 +427,15 @@ The installer-generated config file and `README` example must show
 - Create: `backend/ic_env_guard/api/agents.py`
 - Modify: `backend/ic_env_guard/main.py`
 - Modify: `backend/ic_env_guard/api/risk.py`
+- Modify: `specs/002-multi-agent-control-plane/contracts/control-plane-config.md`
 - Test: `backend/tests/contract/test_agents_api.py`
 - Test: `backend/tests/unit/test_agent_registry.py`
 
 - [ ] Write failing tests for immutable lookup, disabled targets, safe inventory
   responses, and unknown targets.
+- [ ] Add config-contract coverage for the documented mode-specific fields,
+  credential rules, TLS exceptions, database path semantics, and exact agent ID
+  regex in `specs/002-multi-agent-control-plane/contracts/control-plane-config.md`.
 - [ ] Implement one registry instance from validated startup configuration.
 - [ ] Ensure safe summaries omit URLs, token paths, CA paths, and raw transport
   errors.
@@ -437,6 +473,9 @@ The installer-generated config file and `README` example must show
 - [ ] Write tests proving redirects are not followed, browser authorization and
   forwarding headers are not propagated, TLS settings are applied, response
   size/content type are bounded, and error categories map to the HTTP contract.
+- [ ] Add availability transition tests for `unknown`, `ready`, `degraded`,
+  `unavailable`, `disabled`, timestamp updates, stale-to-`unknown`, missing
+  capability endpoint, missing optional capability, and recovery.
 - [ ] Implement the constrained client as one application-lifetime
   `httpx.AsyncClient` with per-target credentials and verified TLS. Routers call
   this client directly (no transport-interface seam; that arrives only with the
@@ -445,6 +484,8 @@ The installer-generated config file and `README` example must show
   from the same per-target TLS settings; httpx is HTTP-only.
 - [ ] Generate or preserve one correlation ID per gateway request and send it as
   `X-Correlation-ID`.
+- [ ] Add contract tests proving successful inventory/service/monitoring/audit
+  responses and normalized error responses include `X-Correlation-ID`.
 - [ ] Permit a single read-only retry only when failure is known to occur before
   dispatch. Never retry POST or DELETE.
 - [ ] Add bounded-concurrency periodic probes with jitter, `observed_at`, and
@@ -539,7 +580,14 @@ The installer-generated config file and `README` example must show
   guide). Removing in the same task as deprecating contradicts the one-release
   window.
 - [ ] Verify the UI has exactly one agent selector.
-- [ ] Run existing monitoring and secret-exclusion tests.
+- [ ] Run:
+
+  ```bash
+  cd backend
+  conda run -n venv312 pytest -q tests/contract/test_monitoring_api_contract.py tests/integration/test_terminal_secret_exclusion.py
+  cd ../frontend
+  npm test -- --run tests/metrics-page.test.tsx
+  ```
 
 ## Task 8: Agent-Scoped Terminal HTTP and Gateway Tickets
 
@@ -555,13 +603,16 @@ The installer-generated config file and `README` example must show
   `DELETE` close with duplicate terminal IDs on different agents, plus a
   capacity test: connect-token returns HTTP `429 gateway_capacity_exceeded` when
   the ticket store is full, and no upstream ticket is requested in that case.
+- [ ] Add gateway audit tests for terminal create, resize, connect-token, close,
+  authorization denial, and pre-dispatch upstream failures.
 - [ ] Implement explicit terminal routes preserving current methods and status
   codes.
 - [ ] On connect-token, reserve ticket-store capacity **before** requesting the
   upstream ticket; if full, return `429` without contacting the agent. Only
   after reserving, obtain the upstream ticket server-side and issue a distinct
-  gateway ticket bound to actor, agent, terminal, and expiry. Release the
-  reservation on any failure (upstream error, timeout, validation).
+  gateway ticket bound to actor, agent, terminal, intended WebSocket path, and
+  expiry. Release the reservation on any failure (upstream error, timeout,
+  validation).
 - [ ] Enforce bounded storage, one-use consumption, expiry, and complete
   redaction of both ticket values.
 - [ ] Run:
@@ -593,6 +644,9 @@ The installer-generated config file and `README` example must show
 - [ ] Write backend tests for ticket mismatch, frame limits, backpressure,
   upstream failure, paired-task cancellation, reconnect cursor, gateway
   shutdown, and rejection past the global active-proxy cap (close code `4429`).
+- [ ] Add WebSocket attach audit tests for successful attach, actor mismatch,
+  invalid ticket, proxy-cap rejection, upstream establishment failure, and
+  sanitized close categories.
 - [ ] Open the upstream WebSocket with the `websockets` client and an
   `ssl.SSLContext` derived from the target's TLS config.
 - [ ] On attach, atomically acquire a proxy slot and then consume the gateway
@@ -635,14 +689,17 @@ The installer-generated config file and `README` example must show
 - [ ] Add agent-scoped audit queries and a separate gateway audit view; do not
   merge or sort multiple remote histories in the first release.
 - [ ] Add tests for correlation IDs across gateway and agent events and for
-  secret exclusion in all failures.
+  secret exclusion in browser payloads, gateway logs, agent logs, audit rows,
+  metrics, WebSocket close reasons, and frontend state snapshots.
 - [ ] Add mixed-version tests that disable missing capabilities and reject
   unsupported API versions.
 - [ ] Extend `start.sh` with explicit `agent` and `control-plane` development
   commands that honor configured bind and port values. (`combined` is deferred
   to feature `003`.)
 - [ ] Document TLS provisioning, per-agent token files, migration from the old
-  machine registry, rollback to `agent` mode, and gateway outage recovery.
+  machine registry, rollback to `agent` mode, gateway outage recovery, and the
+  post-compatibility-release follow-up that removes deprecated
+  `/api/monitoring/machines` mutation routes.
 - [ ] Run full verification:
 
   ```bash
@@ -677,4 +734,3 @@ The installer-generated config file and `README` example must show
   wasting a valid ticket or growing memory unboundedly.
 - [ ] A config with `mode: combined` fails Pydantic validation; `combined` is not
   in the enum and never reaches application startup.
-
