@@ -110,15 +110,30 @@ defect is purely that `main.py` constructs an in-memory engine and calls
 database path and running the existing migration runner.
 
 **`state_database` resolution rules (must be explicit before any code is written):**
-- Production default: `/var/lib/ic-env-guard/state.db` (consistent with the
-  existing `audit_database` default shown in the architecture config example).
-- Resolution order: explicit `AppConfig.state_database` field → env var
-  `IC_ENV_GUARD_STATE_DB` → production default.
-- `create_app()` gains a `state_database: Path | None = None` keyword argument.
-  When provided it overrides the config value. This keeps all existing call sites
-  (`create_app(token_file=...)`) unchanged; tests pass `tmp_path / "state.db"`.
-- The installer-generated config file and `README` example must show
-  `state_database:` so operators know the path is configurable.
+
+Model field: `state_database: Path | None = None` (explicitly optional so a
+missing config value is distinguishable from the production default).
+
+Resolution order, evaluated in `_resolve_state_db(arg, config)`:
+1. `create_app(state_database=...)` argument, if not `None`
+2. `AppConfig.state_database`, if not `None`
+3. env var `IC_ENV_GUARD_STATE_DB`, if set
+4. hardcoded fallback `/var/lib/ic-env-guard/state.db`
+
+The field must be `Path | None = None` — **not** `Path = Path("...")` — so that
+steps 3 and 4 are reachable when no explicit value is given.
+
+**Existing 17 `create_app()` call sites all need updating.** They currently call
+`create_app(token_file=...)` with no `state_database`, so after this change they
+would fall through to `/var/lib/ic-env-guard/state.db`, which a test user cannot
+write. Fix via a session-scoped `state_db` autouse fixture in
+`tests/conftest.py` that provides a `tmp_path`-backed database path and passes
+it to every `create_app()` call. All 17 fixtures/helpers that call `create_app()`
+must accept and forward this path; do not update them one-by-one without also
+verifying the full test suite with a non-root user.
+
+The installer-generated config file and `README` example must show
+`state_database:` so operators know the path is configurable.
 
 **Files:**
 
@@ -148,27 +163,38 @@ database path and running the existing migration runner.
   `Path(__file__).resolve().parents[2] / "migrations"` to load `0001_initial.py`
   directly. Replace with `from ic_env_guard.db.migrations import MIGRATIONS_DIR`
   and load the migration file via `MIGRATIONS_DIR / "0001_initial.py"`.
-- [ ] Add `state_database: Path = Path("/var/lib/ic-env-guard/state.db")` to
-  `AppConfig` and a `state_database: Path | None = None` argument to
-  `create_app()`. When this argument is set it overrides the config field, so
-  tests can pass `tmp_path / "state.db"` without constructing a full `AppConfig`.
-- [ ] Write a failing test: pass `state_database=tmp_path/"state.db"` to
-  `create_app(token_file=...)`, record audit events, call `create_app()` again
-  with the same path, and assert the events are still queryable.
+- [ ] Add `state_database: Path | None = None` to `AppConfig` and a
+  `state_database: Path | None = None` argument to `create_app()`. Add
+  `_resolve_state_db(arg, config)` that evaluates the four-step resolution order
+  defined above.
+- [ ] Add a session-scoped `state_db` autouse fixture to `tests/conftest.py`
+  that creates a `tmp_path`-scoped database file and passes it to `create_app()`
+  via the new argument. Update all 17 existing `create_app()` call sites (in
+  conftest fixtures / helpers) to forward this path. Run the full test suite as a
+  non-root user to confirm no test touches `/var/lib/...`.
+- [ ] Write a failing test: call `create_app(token_file=..., state_database=db)`
+  with a tmp_path db, record audit events, call `create_app()` again with the
+  same db, and assert events are still queryable.
 - [ ] In `create_app()`, replace the in-memory engine + `create_all()` with:
-  1. resolve `db_path` from the `state_database` argument or `AppConfig`;
-  2. call `run_migrations(db_path)` (applies `0001`/`0002`, creates `audit_events`);
-  3. open a SQLAlchemy engine against `db_path`;
-  4. do NOT call `Base.metadata.create_all()`.
+  1. resolve `db_path` via `_resolve_state_db()`;
+  2. call `run_migrations(db_path)`;
+  3. open a SQLAlchemy engine against `db_path` (use `check_same_thread=False`
+     for SQLite);
+  4. use request-scoped sessions (a `sessionmaker` factory; create a new session
+     per request, close it when the request completes) rather than the current
+     single shared session that is never closed;
+  5. close the engine in the lifespan shutdown hook;
+  6. do NOT call `Base.metadata.create_all()`.
 - [ ] In `config/audit.py`, replace `Base.metadata.create_all(engine)` in
   `audit_config_load_to_db()` with `run_migrations(db_path)` before opening
   the engine, for the same reason — the migration is the schema source of truth.
 - [ ] Update installer-generated config template and `README` to show the
   `state_database:` field with the production default path.
 - [ ] Extend `tests/integration/test_packaging_runtime.py`:
-  - assert `ic_env_guard.migrations` is importable;
-  - assert `MIGRATIONS_DIR` contains `0001_initial.py`;
-  - assert `import httpx` and `import websockets` succeed (without test extras).
+  - assert `ic_env_guard.migrations` is importable as a package;
+  - assert `MIGRATIONS_DIR` resolves to an existing path containing `0001_initial.py`.
+  (`httpx` and `websockets` import checks belong in Task 4 and Task 9 respectively,
+  when those dependencies are added.)
 - [ ] Run:
 
   ```bash
@@ -269,13 +295,21 @@ database path and running the existing migration runner.
   (default `/var/lib/ic-env-guard/control-plane.db`), created only in
   `control-plane` mode. This is separate from the agent audit database fixed in
   Task 0.
-- [ ] Extend `tests/integration/test_packaging_runtime.py`:
-  - assert `ic_env_guard.control_plane_migrations` is importable;
-  - assert `CONTROL_PLANE_MIGRATIONS_DIR` contains `0001_control_plane_audit.py`;
-  - assert the built wheel archive (via `python -m build --wheel` and inspection
-    of the resulting `.whl` zip) contains both migration directories and at least
-    `0001_initial.py` / `0001_control_plane_audit.py` — this proves wheel
-    completeness rather than only testing the source tree.
+- [ ] Extend `tests/integration/test_packaging_runtime.py` with a wheel-content
+  test. Add `build>=1.2` to the `test` extra in `pyproject.toml` first (it is
+  not currently declared). The test should:
+  - run `python -m build --wheel --outdir <tmp_dir>` against the backend package;
+  - open the resulting `.whl` (a zip archive) and assert it contains entries
+    matching `ic_env_guard/migrations/0001_initial.py` and
+    `ic_env_guard/control_plane_migrations/0001_control_plane_audit.py` — these
+    are files that must be physically present in the wheel;
+  - read the wheel `METADATA` file inside the archive and assert its
+    `Requires-Dist` lines include `httpx` and `websockets` — runtime deps are
+    declared in metadata, not as packaged files, so the ZIP content check is the
+    wrong assertion for them.
+  (`httpx` and `websockets` will not yet appear in `Requires-Dist` at this task;
+  the METADATA assertions are added in Task 4 and Task 9 once those deps are
+  declared. The migration file assertions apply now.)
 - [ ] Add a repository method that creates intent before dispatch and finalizes
   the same record after success or failure.
 - [ ] Add bounded authenticated query routes under `/api/control-plane/audit`.
@@ -332,9 +366,10 @@ database path and running the existing migration runner.
 - Test: `backend/tests/integration/test_agent_availability.py`
 
 - [ ] Promote `httpx` from the `test` extra to a runtime dependency in
-  `pyproject.toml`; do not rely on a transitive dependency. Extend
-  `tests/integration/test_packaging_runtime.py` to assert `import httpx`
-  succeeds without the test extras installed.
+  `pyproject.toml`; do not rely on a transitive dependency. Extend the wheel
+  METADATA assertion in `tests/integration/test_packaging_runtime.py` to verify
+  that `Requires-Dist` in the built wheel includes `httpx` (runtime deps appear
+  in wheel METADATA, not as packaged files).
 - [ ] Write tests proving redirects are not followed, browser authorization and
   forwarding headers are not propagated, TLS settings are applied, response
   size/content type are bounded, and error categories map to the HTTP contract.
@@ -482,8 +517,9 @@ database path and running the existing migration runner.
 
 - [ ] Add `websockets` as a runtime dependency in `pyproject.toml` (it is not
   declared today and must not be assumed transitively from `uvicorn[standard]`).
-  Extend `tests/integration/test_packaging_runtime.py` to assert `import websockets`
-  succeeds without test extras installed.
+  Extend the wheel METADATA assertion in `tests/integration/test_packaging_runtime.py`
+  to verify that `Requires-Dist` in the built wheel includes `websockets` (runtime
+  deps appear in wheel METADATA, not as packaged files).
 - [ ] Write backend tests for ticket mismatch, frame limits, backpressure,
   upstream failure, paired-task cancellation, reconnect cursor, gateway
   shutdown, and rejection past the global active-proxy cap (close code `4429`).
