@@ -104,7 +104,9 @@ POST   /api/agents/{agent_id}/terminals/{terminal_id}/resize
 ```
 
 The upstream ticket is stored only in the control plane and consumed by the
-WebSocket proxy.
+WebSocket proxy. When the bounded ticket store is already full, `connect-token`
+returns `429 gateway_capacity_exceeded` and does not request an upstream ticket
+from the agent.
 
 ## Audit
 
@@ -170,6 +172,7 @@ Allowed gateway codes:
 - `agent_operation_forbidden`
 - `agent_not_found`
 - `agent_disabled`
+- `gateway_capacity_exceeded` — `429`; ticket store full at `connect-token` time
 - `agent_operation_indeterminate`
 - `agent_protocol_error`
 - `agent_unavailable`

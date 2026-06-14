@@ -6,9 +6,13 @@
 
 **Architecture:** The browser connects only to the control plane. Explicit resource routers resolve targets through one static agent registry and use a constrained HTTPS client; the host agent remains the owner of local services, PTYs, metrics, and local audit. Gateway audit is durable from the first slice, and terminal proxying is a separate second slice.
 
-**Tech Stack:** Python 3.11+, FastAPI, httpx (upstream HTTP), `websockets` (upstream WebSocket client; httpx cannot act as a WS client), Pydantic, SQLAlchemy ORM, raw-`sqlite3` `.py` migrations applied by the existing `db/migrations.py` runner (the `001` convention — not Alembic), pytest, React, TypeScript, Vitest, xterm.js.
+**Tech Stack:** Python 3.11+, FastAPI, httpx (upstream HTTP; promoted to a runtime dependency — it is test-only today), `websockets` (upstream WebSocket client, a new runtime dependency; httpx cannot act as a WS client), Pydantic, SQLAlchemy ORM, raw-`sqlite3` `.py` migrations (the `001` convention — not Alembic, despite the unused `alembic` pin in `pyproject.toml`), pytest, React, TypeScript, Vitest, xterm.js.
 
-**Persistence note:** The existing `001` audit query store is built in `create_app()` against an in-memory `sqlite://` engine (`StaticPool`), so it does not survive restart today. This feature does NOT repurpose that engine. It introduces a separate, durable `control-plane.db` for gateway audit (FR-021) with a single source of truth for its schema: the `0003` migration creates the table, and the ORM model only maps it (no `create_all` for control-plane tables). The `001` in-memory audit behavior is left unchanged so `agent` mode stays byte-for-byte compatible.
+**Migration isolation:** The existing `db/migrations.py` runner globs every `migrations/[0-9][0-9][0-9][0-9]_*.py` and applies all of them to whatever `db_path` it is handed ([migrations.py:45](../../backend/ic_env_guard/db/migrations.py#L45)). A `0003` file in that shared directory would therefore create control-plane tables in the agent DB and agent tables in the control-plane DB. The control plane uses its own migration directory and runner — `backend/control_plane_migrations/` with `run_control_plane_migrations()` — so the two databases never receive each other's schema.
+
+**Audit persistence:** Two distinct problems, two distinct fixes.
+- The `001` audit store is built in `create_app()` against an in-memory `sqlite://` engine (`StaticPool`); both audit writes and the query API use it, so audit is lost on restart. This already violates `001` FR-021/FR-026 ("migration-managed local durable state"). Task 0 fixes it as a prerequisite, because the MVP 3 agent-audit view cannot meet the original contract on top of an ephemeral store.
+- Gateway audit (FR-021) lives in a separate, durable `control-plane.db`. Its schema's single source of truth is the control-plane migration; the ORM model maps the table and does not `create_all` it.
 
 ---
 
@@ -28,25 +32,30 @@ Delivers agent-scoped terminal HTTP routes, gateway ticket exchange, bounded
 WebSocket proxying (upstream WS via the `websockets` client with a verified TLS
 context), agent-scoped frontend terminal state, and reconnect behavior.
 
-### MVP 3 - Combined Mode, Agent Audit Views, and Operational Hardening
+### MVP 3 - Agent Audit Views and Operational Hardening
 
-Delivers the `AgentTransport` abstraction and the in-process transport that
-backs `combined` mode, agent-scoped audit views, gateway audit UI, mixed-version
-tests, packaging docs, compatibility cleanup, and deprecation of old
-machine-registry mutation routes.
+Delivers agent-scoped audit views, gateway audit UI, mixed-version tests,
+packaging docs, compatibility cleanup, and deprecation of old machine-registry
+mutation routes.
 
-### Why `combined` is deferred
+### `combined` mode is out of scope for this feature
 
-`combined` mode must NOT HTTP self-proxy (FR-006), so it requires every resource
-router to run against a transport abstraction with two implementations — an HTTP
-client and an in-process adapter that calls the local managers directly,
-including the terminal WebSocket path. That abstraction is the highest-risk,
-lowest-value piece for the first deployments, which only need a separate
-control plane talking to separate agents. We land the `AgentTransport` interface
-and `agent`/`control-plane` modes first, then add `combined` on top in MVP 3
-once the interface is proven. The two-implementation design means routers are
-written against the interface from Task 5 onward, so adding `combined` later is
-additive, not a rewrite.
+`combined` mode must NOT HTTP self-proxy (FR-006), which forces every resource
+router to run against a transport abstraction with two implementations: an HTTP
+client and an in-process adapter calling the local managers directly, including
+the terminal WebSocket path. Baking that seam into MVP 1 routing would make the
+deferred mode shape every route now, for the lowest-value, highest-risk
+deployment. First deployments only need a separate control plane talking to
+separate agents.
+
+Therefore this feature ships `agent` and `control-plane` modes only, and the
+resource routers call the constrained HTTP client directly — no transport
+interface. `combined` becomes a separate follow-up feature (`003`) that
+introduces a domain-typed transport seam (e.g. `ServiceTarget`,
+`TerminalTarget`, `MonitoringTarget`) so the in-process implementation calls
+local managers naturally instead of simulating HTTP responses. The `mode` enum
+still accepts `combined` (Task 1) but startup rejects it with a clear pointer to
+feature `003`, keeping the configuration schema stable.
 
 ## Planned Source Structure
 
@@ -55,9 +64,7 @@ backend/ic_env_guard/
 ├── agents/
 │   ├── models.py          # validated runtime target and capability/status models
 │   ├── registry.py        # immutable configured target lookup
-│   ├── transport.py       # AgentTransport interface (HTTP + in-process impls)
-│   ├── client.py          # constrained HTTP transport and normalized failures
-│   ├── local_transport.py # in-process transport for combined mode (MVP 3)
+│   ├── client.py          # constrained HTTP client and normalized failures
 │   ├── availability.py    # periodic probes and latest observation cache
 │   └── terminal_proxy.py  # gateway tickets and bounded WS proxy (websockets client)
 ├── api/
@@ -68,7 +75,11 @@ backend/ic_env_guard/
 │   ├── agent_terminal_ws.py
 │   └── control_plane_audit.py
 └── db/
-    └── control_plane_audit.py
+    ├── control_plane_audit.py
+    └── control_plane_migrations.py   # dedicated runner, separate from db/migrations.py
+
+backend/control_plane_migrations/     # control-plane-only migrations (isolated from migrations/)
+└── 0001_control_plane_audit.py
 
 frontend/src/
 ├── agents/
@@ -80,6 +91,37 @@ frontend/src/
 
 Existing resource modules remain the local host-agent implementation. Gateway
 modules call those contracts rather than duplicating host process logic.
+
+## Task 0: Fix Agent Durable Audit (Prerequisite)
+
+`001` requires audit to persist in migration-managed durable state (FR-021,
+FR-026), but `create_app()` currently wires both audit writes and the query API
+to an in-memory `sqlite://` engine, so audit is lost on restart. This must be
+fixed before the MVP 3 agent-audit view can meet the original contract; it is a
+correctness fix to `001`, not a `002` feature.
+
+**Files:**
+
+- Modify: `backend/ic_env_guard/main.py`
+- Create: `backend/migrations/0003_audit_events.py`
+- Test: `backend/tests/integration/test_agent_audit_durability.py`
+
+- [ ] Write a failing test that records audit events, restarts the app against
+  the same database path, and asserts the events are still queryable.
+- [ ] Add a `0003` agent migration creating `audit_events` (the table is ORM-only
+  today) so it is migration-managed; the ORM model maps it without `create_all`.
+- [ ] Point the `create_app()` audit engine at the configured durable database
+  path instead of `sqlite://`/`StaticPool`. Update any `001` test fixtures that
+  assumed a fresh in-memory store to use a temp-file database.
+- [ ] Run:
+
+  ```bash
+  cd backend
+  conda run -n venv312 pytest -q tests/integration/test_agent_audit_durability.py
+  conda run -n venv312 pytest -q tests/contract
+  ```
+
+  Expected: audit survives restart and all `001` contracts still pass.
 
 ## Task 1: Runtime Modes and Configuration
 
@@ -114,9 +156,10 @@ modules call those contracts rather than duplicating host process logic.
   `development.allow_insecure_http` is true and the server itself is local-only.
 - [ ] Refactor `create_app()` to mount routers by mode. **Risk:** `create_app()`
   currently builds all dependencies and mounts all routers unconditionally;
-  factor the mode-independent agent wiring into a helper invoked by both `agent`
-  and `combined` so the `agent`-mode app is identical. Validate `combined` is
-  rejected with a clear "not yet supported" error until MVP 3.
+  factor the mode-independent agent wiring into a helper so the `agent`-mode app
+  is identical to `001`. The `mode` enum accepts `combined`, but startup rejects
+  it with a clear error pointing to follow-up feature `003`; only `agent` and
+  `control-plane` are wired in this feature.
 - [ ] Add a regression test asserting the `agent`-mode router set and dependency
   overrides are unchanged from `001` before refactoring anything else.
 - [ ] Re-run the focused tests and then:
@@ -133,8 +176,9 @@ modules call those contracts rather than duplicating host process logic.
 **Files:**
 
 - Create: `backend/ic_env_guard/db/control_plane_audit.py`
+- Create: `backend/ic_env_guard/db/control_plane_migrations.py`
 - Create: `backend/ic_env_guard/api/control_plane_audit.py`
-- Create: `backend/migrations/0003_control_plane_audit.py`
+- Create: `backend/control_plane_migrations/0001_control_plane_audit.py`
 - Modify: `backend/ic_env_guard/main.py`
 - Test: `backend/tests/integration/test_control_plane_audit.py`
 - Test: `backend/tests/contract/test_migration_contract.py`
@@ -143,16 +187,23 @@ modules call those contracts rather than duplicating host process logic.
   routing intent/outcome records survive, including failures that occur before
   upstream dispatch. Until Task 4/5 exist, the test exercises the repository
   through a small dispatch stub rather than a real upstream call.
-- [ ] Add the table via the `0003` raw-`sqlite3` migration (the `001`
-  convention) with actor, source address, agent ID, operation, target, result,
-  dispatch state, upstream status, correlation ID, failure category, and
-  timestamp. The migration is the **single source of truth** for the schema; the
-  ORM model maps the existing table and MUST NOT `create_all` it, to avoid drift.
+- [ ] Add a dedicated migration directory `backend/control_plane_migrations/`
+  and a `run_control_plane_migrations(db_path)` runner. Do NOT add the
+  control-plane migration to `backend/migrations/`: the shared `db/migrations.py`
+  runner applies every file to whatever database it is given, so a shared `0003`
+  would cross-contaminate the agent and control-plane schemas.
+- [ ] Add `0001_control_plane_audit.py` (raw `sqlite3`, the `001` convention)
+  with actor, source address, agent ID, operation, target, result, dispatch
+  state, upstream status, correlation ID, failure category, and timestamp. The
+  migration is the **single source of truth**; the ORM model maps the table and
+  MUST NOT `create_all` it.
+- [ ] Add a test asserting database isolation: the agent DB contains no
+  control-plane table and the control-plane DB contains no agent table after
+  both runners have applied their migrations.
 - [ ] Open a dedicated durable engine against `control_plane.audit_database`
-  (default `/var/lib/ic-env-guard/control-plane.db`). Do NOT reuse or "fix" the
-  in-memory `sqlite://` engine in `create_app()` — that is the `001` audit store
-  and stays as-is so `agent` mode is unchanged. This database exists only in
-  `control-plane`/`combined` modes.
+  (default `/var/lib/ic-env-guard/control-plane.db`), created only in
+  `control-plane` mode. This is separate from the agent audit database fixed in
+  Task 0.
 - [ ] Add a repository method that creates intent before dispatch and finalizes
   the same record after success or failure.
 - [ ] Add bounded authenticated query routes under `/api/control-plane/audit`.
@@ -179,8 +230,7 @@ modules call those contracts rather than duplicating host process logic.
 - Test: `backend/tests/unit/test_agent_registry.py`
 
 - [ ] Write failing tests for immutable lookup, disabled targets, safe inventory
-  responses, and unknown targets. (`combined` mode's internal target is covered
-  in Task 11.)
+  responses, and unknown targets.
 - [ ] Implement one registry instance from validated startup configuration.
 - [ ] Ensure safe summaries omit URLs, token paths, CA paths, and raw transport
   errors.
@@ -205,22 +255,22 @@ modules call those contracts rather than duplicating host process logic.
 - Create: `backend/ic_env_guard/agents/client.py`
 - Create: `backend/ic_env_guard/agents/availability.py`
 - Modify: `backend/ic_env_guard/main.py`
+- Modify: `backend/pyproject.toml`
 - Test: `backend/tests/unit/test_agent_client.py`
 - Test: `backend/tests/integration/test_agent_availability.py`
 
-- [ ] Define the `AgentTransport` interface in `agents/transport.py`: a minimal
-  surface for one allowlisted upstream request and for opening an upstream
-  terminal WebSocket. Resource routers (Task 5 onward) depend only on this
-  interface so `combined` mode (Task 11) can substitute an in-process
-  implementation without router changes.
+- [ ] Promote `httpx` from the `test` extra to a runtime dependency in
+  `pyproject.toml`; do not rely on a transitive dependency. Update the packaging
+  runtime test to assert it imports without the test extras installed.
 - [ ] Write tests proving redirects are not followed, browser authorization and
   forwarding headers are not propagated, TLS settings are applied, response
   size/content type are bounded, and error categories map to the HTTP contract.
-- [ ] Implement the HTTP transport as one application-lifetime
-  `httpx.AsyncClient` with per-target credentials and verified TLS. Note that
-  the upstream terminal WebSocket (Task 9) is opened with the `websockets`
-  client using an `ssl.SSLContext` built from the same per-target TLS settings;
-  httpx is HTTP-only.
+- [ ] Implement the constrained client as one application-lifetime
+  `httpx.AsyncClient` with per-target credentials and verified TLS. Routers call
+  this client directly (no transport-interface seam; that arrives only with the
+  `combined` follow-up feature). The upstream terminal WebSocket (Task 9) is
+  opened separately with the `websockets` client using an `ssl.SSLContext` built
+  from the same per-target TLS settings; httpx is HTTP-only.
 - [ ] Generate or preserve one correlation ID per gateway request and send it as
   `X-Correlation-ID`.
 - [ ] Permit a single read-only retry only when failure is known to occur before
@@ -248,8 +298,8 @@ modules call those contracts rather than duplicating host process logic.
 - [ ] Write contract tests for every service route and the JSON monitoring
   snapshot route using two fake agents with overlapping service IDs.
 - [ ] Implement explicit allowlisted route handlers that dispatch through the
-  `AgentTransport` interface (Task 4), not the concrete HTTP client; do not add a
-  catch-all `{path:path}` reverse proxy.
+  constrained HTTP client (Task 4); do not add a catch-all `{path:path}` reverse
+  proxy.
 - [ ] Preserve safe upstream application errors and status codes.
 - [ ] Map connection/TLS/auth failures to `503`, protocol failures to `502`,
   pre-dispatch timeouts to `504`, and uncertain mutation outcomes to `424`.
@@ -325,11 +375,16 @@ modules call those contracts rather than duplicating host process logic.
 - Test: `backend/tests/unit/test_gateway_terminal_tickets.py`
 
 - [ ] Write tests for list, create, detail, history, resize, connect-token, and
-  `DELETE` close with duplicate terminal IDs on different agents.
+  `DELETE` close with duplicate terminal IDs on different agents, plus a
+  capacity test: connect-token returns HTTP `429 gateway_capacity_exceeded` when
+  the ticket store is full, and no upstream ticket is requested in that case.
 - [ ] Implement explicit terminal routes preserving current methods and status
   codes.
-- [ ] On connect-token, obtain the upstream ticket server-side and issue a
-  distinct gateway ticket bound to actor, agent, terminal, and expiry.
+- [ ] On connect-token, reserve ticket-store capacity **before** requesting the
+  upstream ticket; if full, return `429` without contacting the agent. Only
+  after reserving, obtain the upstream ticket server-side and issue a distinct
+  gateway ticket bound to actor, agent, terminal, and expiry. Release the
+  reservation on any failure (upstream error, timeout, validation).
 - [ ] Enforce bounded storage, one-use consumption, expiry, and complete
   redaction of both ticket values.
 - [ ] Run:
@@ -345,21 +400,28 @@ modules call those contracts rather than duplicating host process logic.
 
 - Create: `backend/ic_env_guard/api/agent_terminal_ws.py`
 - Modify: `backend/ic_env_guard/agents/terminal_proxy.py`
+- Modify: `backend/pyproject.toml`
 - Modify: `frontend/src/api/terminals.ts`
 - Modify: `frontend/src/pages/TerminalPage.tsx`
 - Modify: `frontend/src/terminal/TerminalPane.tsx`
 - Test: `backend/tests/integration/test_agent_terminal_websocket.py`
 - Test: `frontend/tests/terminal-agent-routing.test.tsx`
 
+- [ ] Add `websockets` as a runtime dependency in `pyproject.toml` (it is not
+  declared today and must not be assumed transitively from `uvicorn[standard]`);
+  cover it in the packaging runtime test.
 - [ ] Write backend tests for ticket mismatch, frame limits, backpressure,
   upstream failure, paired-task cancellation, reconnect cursor, gateway
-  shutdown, and rejection past the global active-proxy cap.
+  shutdown, and rejection past the global active-proxy cap (close code `4429`).
 - [ ] Open the upstream WebSocket with the `websockets` client and an
   `ssl.SSLContext` derived from the target's TLS config.
-- [ ] Implement the WebSocket contract with bounded per-direction queues, a
-  global cap on concurrent proxied sockets and outstanding gateway tickets
-  (configurable; reject new attaches with the overload close code when
-  exceeded), and sanitized close codes.
+- [ ] On attach, atomically acquire a proxy slot and then consume the gateway
+  ticket; if the global active-proxy cap is reached, reject with `4429` before
+  consuming the ticket so a valid ticket is not wasted. Release the slot on any
+  failure path.
+- [ ] Implement the WebSocket contract with bounded per-direction queues, the
+  configurable global cap on concurrent proxied sockets and outstanding tickets,
+  and sanitized close codes.
 - [ ] Add `agentId` to every frontend terminal API and WebSocket URL.
 - [ ] Key frontend terminal state by `(agentId, terminalId)` and remount panes
   when the active agent changes.
@@ -394,8 +456,9 @@ modules call those contracts rather than duplicating host process logic.
   secret exclusion in all failures.
 - [ ] Add mixed-version tests that disable missing capabilities and reject
   unsupported API versions.
-- [ ] Extend `start.sh` with explicit `agent`, `control-plane`, and `combined`
-  development commands that honor configured bind and port values.
+- [ ] Extend `start.sh` with explicit `agent` and `control-plane` development
+  commands that honor configured bind and port values. (`combined` is deferred
+  to feature `003`.)
 - [ ] Document TLS provisioning, per-agent token files, migration from the old
   machine registry, rollback to `agent` mode, and gateway outage recovery.
 - [ ] Run full verification:
@@ -410,33 +473,8 @@ modules call those contracts rather than duplicating host process logic.
   ```
 
   Expected: all backend, frontend, original `001`, and new `002` checks pass.
-
-## Task 11: Combined Mode via In-Process Transport
-
-**Files:**
-
-- Create: `backend/ic_env_guard/agents/local_transport.py`
-- Modify: `backend/ic_env_guard/agents/registry.py`
-- Modify: `backend/ic_env_guard/main.py`
-- Test: `backend/tests/integration/test_combined_mode.py`
-
-- [ ] Write tests proving `combined` mode never opens an HTTP or WebSocket
-  connection to its own listener, that the synthetic local target appears in the
-  registry, and that services/terminals/monitoring/audit resolve through the
-  in-process transport.
-- [ ] Implement `LocalTransport` against the `AgentTransport` interface from
-  Task 4, calling the local `ServiceManager`, `TerminalManager`, snapshot, and
-  audit components directly. Handle the terminal WebSocket in-process without a
-  loopback socket.
-- [ ] Register one synthetic local target whose transport is `LocalTransport`;
-  never set its `base_url` to the process's own host/port.
-- [ ] Remove the temporary "combined not yet supported" guard from Task 1.
-- [ ] Run:
-
-  ```bash
-  cd backend
-  conda run -n venv312 pytest -q tests/integration/test_combined_mode.py
-  ```
+  This is the final verification step; `combined` mode is delivered separately
+  in feature `003`.
 
 ## Completion Gate
 
@@ -448,8 +486,10 @@ modules call those contracts rather than duplicating host process logic.
 - [ ] Service mutations are never automatically retried.
 - [ ] Duplicate terminal IDs across agents remain isolated end to end.
 - [ ] Rollback to single-agent operation is documented and tested.
-- [ ] `combined` mode resolves all local resources through the in-process
-  transport and never connects to its own listener.
-- [ ] The global active-proxy/ticket cap rejects excess WebSocket attaches
-  without unbounded memory growth.
+- [ ] Agent audit survives restart (Task 0), satisfying `001` FR-021/FR-026.
+- [ ] Agent and control-plane databases never contain each other's tables.
+- [ ] Connect-token returns `429` when the ticket store is full without
+  contacting the agent; the WS attach rejects past the cap with `4429` without
+  wasting a valid ticket or growing memory unboundedly.
+- [ ] `combined` mode is rejected at startup with a pointer to feature `003`.
 

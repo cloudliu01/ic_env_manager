@@ -125,9 +125,10 @@ validate that each agent's `/metrics` endpoint remains Prometheus compatible.
   expose control-plane routing APIs.
 - **FR-005**: `control-plane` mode MUST expose gateway APIs and MUST NOT imply
   management of the control-plane host.
-- **FR-006**: `combined` mode MAY manage the local host, but local requests MUST
-  resolve through an in-process transport implementation of the same interface
-  used for remote agents, never through HTTP or WebSocket self-proxying.
+- **FR-006**: `combined` mode (deferred to feature `003`) MAY manage the local
+  host, but local requests MUST resolve through an in-process transport, never
+  through HTTP or WebSocket self-proxying. This feature rejects `combined` at
+  startup with a pointer to `003`.
 - **FR-007**: All service, terminal, audit, and monitoring requests MUST resolve
   their target through one authoritative agent registry.
 - **FR-008**: Agent IDs MUST be unique, stable, URL-safe identifiers matching
@@ -162,8 +163,10 @@ validate that each agent's `/metrics` endpoint remains Prometheus compatible.
   audit record, including requests that fail before reaching an agent.
 - **FR-020**: The control plane MUST propagate a correlation ID to the target
   agent so gateway and agent audit records can be associated.
-- **FR-021**: Control-plane audit records MUST be stored in migration-managed
-  durable state and MUST survive restart.
+- **FR-021**: Both agent audit records (inherited from `001` FR-026) and
+  control-plane gateway audit records MUST be stored in migration-managed durable
+  state and MUST survive restart. Agent audit durability is a prerequisite fix
+  addressed before any `002` routes are added.
 - **FR-022**: Agent API compatibility MUST be verified through an explicit API
   version and capability response before unsupported resources are enabled in
   the UI. An agent that does not expose the capability endpoint is below the
@@ -179,18 +182,20 @@ validate that each agent's `/metrics` endpoint remains Prometheus compatible.
 - **FR-026**: WebSocket proxy behavior MUST define backpressure, frame limits,
   close-code mapping, bidirectional cancellation, reconnect, and shutdown
   behavior.
-- **FR-031**: The control plane MUST enforce a configurable global cap on
-  outstanding gateway tickets and concurrently proxied terminal sockets, and
-  MUST reject attaches beyond the cap so terminal load cannot exhaust gateway
-  memory.
-- **FR-027**: Frontend request state and terminal state MUST be scoped by agent
+- **FR-027**: The control plane MUST enforce a configurable global cap on
+  outstanding gateway tickets and concurrently proxied terminal sockets. The
+  `connect-token` endpoint MUST reserve capacity before requesting an upstream
+  ticket and MUST return `429 gateway_capacity_exceeded` when full. The WebSocket
+  attach MUST acquire a proxy slot before consuming the gateway ticket and MUST
+  reject with `4429` when the cap is reached, so no valid ticket is wasted.
+- **FR-028**: Frontend request state and terminal state MUST be scoped by agent
   and MUST discard responses from an inactive selection generation.
-- **FR-028**: Raw `/metrics` federation, aggregation, long-term storage, alerting,
+- **FR-029**: Raw `/metrics` federation, aggregation, long-term storage, alerting,
   and dashboarding MUST NOT be introduced by this feature.
-- **FR-029**: Logs and error responses MUST not disclose credentials, terminal
+- **FR-030**: Logs and error responses MUST not disclose credentials, terminal
   contents, private network details beyond the configured agent display
   identity, or raw upstream exception text.
-- **FR-030**: The system MUST document configuration migration, rollback to
+- **FR-031**: The system MUST document configuration migration, rollback to
   single-agent operation, mixed-version behavior, and recovery when the control
   plane is unavailable.
 
@@ -236,6 +241,8 @@ upstream tickets, or unsanitized exception strings.
 - Generic reverse proxying of arbitrary agent paths
 - Raw Prometheus aggregation or a custom metrics store
 - Preserving live xterm buffers across agent switches in the first release
+- `combined` mode (deferred to follow-up feature `003`; the mode is
+  recognized but rejected at startup in this feature)
 
 ## Success Criteria
 
@@ -262,12 +269,15 @@ upstream tickets, or unsanitized exception strings.
   invoked.
 - **SC-010**: The existing host-agent contract tests from feature `001` continue
   to pass unchanged in `agent` mode, which is the default mode.
-- **SC-011**: Under more terminal-attach requests than the configured cap, the
-  control plane rejects the excess with the overload close code and gateway
+- **SC-011**: When the ticket store is full, `connect-token` returns `429`
+  without contacting the agent; when the proxy cap is reached, WebSocket attach
+  returns `4429` without consuming the gateway ticket; in both cases gateway
   memory remains bounded.
-- **SC-012**: In `combined` mode, all local service, terminal, monitoring, and
-  audit operations succeed without the process opening any connection to its own
-  HTTP listener or WebSocket endpoint.
+- **SC-012**: Agent audit events survive process restart (prerequisite fix to
+  `001`); control-plane gateway audit events survive restart independently in the
+  dedicated control-plane database; the two databases do not share tables.
+- **SC-013**: Attempting to start in `combined` mode produces a clear startup
+  error pointing to follow-up feature `003` rather than partially initializing.
 
 ## Related Documents
 

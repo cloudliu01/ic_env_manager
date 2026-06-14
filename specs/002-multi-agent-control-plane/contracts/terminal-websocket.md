@@ -10,32 +10,41 @@ WS /ws/agents/{agent_id}/terminals/{terminal_id}?ticket={gateway_ticket}&cursor=
 
 1. The authenticated browser calls the agent-scoped HTTP `connect-token`
    endpoint.
-2. The control plane requests a one-use ticket from the target agent.
-3. The control plane stores a bounded, expiring mapping from a new gateway ticket
-   to the upstream ticket.
-4. The browser receives only the gateway ticket.
-5. The WebSocket attach atomically consumes the gateway ticket.
+2. The control plane reserves a slot in the bounded ticket store; if full it
+   returns `429 gateway_capacity_exceeded` without contacting the agent.
+3. The control plane requests a one-use ticket from the target agent; on any
+   failure it releases the reservation and returns the appropriate error.
+4. The control plane stores a bounded, expiring mapping from a new gateway
+   ticket to the upstream ticket.
+5. The browser receives only the gateway ticket.
+6. On WebSocket attach the control plane atomically acquires a proxy slot and
+   then consumes the gateway ticket; if the proxy cap is reached the attach is
+   rejected with `4429` before the ticket is consumed, so a valid ticket is
+   not wasted. The slot is released on every failure path.
 
-The ticket is bound to actor, agent ID, terminal ID, and expiry. Missing,
-expired, reused, or mismatched tickets are rejected before either WebSocket is
-attached.
+The gateway ticket is bound to actor, agent ID, terminal ID, and expiry.
+Missing, expired, reused, or mismatched tickets are rejected before either
+WebSocket is attached.
 
 ## Connection Establishment
 
 The control plane:
 
-1. validates and consumes the gateway ticket;
-2. rejects the attach with `4429` if the global active-proxy cap is already
-   reached, before opening any upstream connection;
+1. checks the global active-proxy cap; if reached, rejects with `4429` before
+   touching the ticket store;
+2. atomically acquires a proxy slot and consumes the gateway ticket; rejects
+   with `4401` if the ticket is missing, expired, reused, or mismatched — the
+   slot is released immediately on rejection;
 3. resolves the same configured agent;
 4. opens the upstream WebSocket using the `websockets` client with an
    `ssl.SSLContext` built from the target's TLS settings (the HTTP client cannot
    open WebSockets);
 5. passes the upstream ticket and cursor;
-6. accepts the browser WebSocket only after the upstream handshake succeeds.
+6. accepts the browser WebSocket only after the upstream handshake succeeds;
+   releases the slot on any upstream establishment failure.
 
-If upstream establishment fails, the browser connection closes with the mapped
-gateway close code and no ticket is reusable.
+If upstream establishment fails the browser connection closes with the mapped
+gateway close code; no consumed ticket is reusable and the proxy slot is freed.
 
 ## Data Frames
 

@@ -45,18 +45,17 @@ and WebSocket handling in the browser.
   tickets, and gateway audit.
 - Does not implicitly manage services or terminals on its own host.
 
-### `combined`
+### `combined` (out of scope — feature `003`)
 
-- Includes both roles in one process for small deployments.
-- Registers a synthetic local target backed by an in-process `AgentTransport`
-  implementation (see Component Boundaries).
-- Never routes a local target through its own HTTP listener or WebSocket
-  endpoint.
-
-`combined` is the highest-complexity mode because it must satisfy FR-006
-(no HTTP self-proxy). It is therefore delivered last, after the `AgentTransport`
-abstraction and the `agent`/`control-plane` modes are proven. See the
-implementation plan's delivery slices.
+`combined` would run both roles in one process for small deployments, with a
+synthetic local target. To satisfy FR-006 (no HTTP self-proxy) it must call the
+local managers directly rather than loop back through its own listener — which
+requires a transport abstraction underneath every resource router. Forcing that
+seam into this feature's routing for the lowest-value deployment is not
+worthwhile, so `combined` is split into a follow-up feature `003` that
+introduces a domain-typed transport (`ServiceTarget`, `TerminalTarget`,
+`MonitoringTarget`). The `mode` enum still accepts `combined`, but this feature
+rejects it at startup with a pointer to `003`.
 
 Mode is explicit and defaults to `agent`, so existing single-host
 configurations and contracts are unchanged. An empty `agents` list in
@@ -74,22 +73,20 @@ audit.
 The existing dynamic `MachineRegistry` and browser-side machine credential flow
 are removed after migration.
 
-### Agent Transport
+### Agent HTTP Client
 
-Resource routers depend on one `AgentTransport` interface, never on a concrete
-client. It exposes a minimal surface: dispatch one allowlisted upstream request,
-and open one upstream terminal WebSocket. Two implementations exist:
+Resource routers call one constrained HTTP client directly; this feature does
+not introduce a transport-interface seam (that arrives with the `combined`
+follow-up feature `003`). The client owns connection pooling, TLS verification,
+deadlines, correlation headers, response-size limits, content-type checks, and
+normalized transport errors.
 
-- **HTTP transport** — owns connection pooling, TLS verification, deadlines,
-  correlation headers, response-size limits, content-type checks, and normalized
-  transport errors. The terminal WebSocket is opened with a dedicated WS client
-  (`websockets`) using an `ssl.SSLContext` built from the same per-target TLS
-  settings, because the HTTP client (`httpx`) cannot act as a WebSocket client.
-- **In-process transport** — used only by `combined` mode; calls the local
-  managers directly instead of crossing the network, so the process never proxies
-  to its own listener.
+The terminal WebSocket is a separate path: it is opened with a dedicated WS
+client (`websockets`) using an `ssl.SSLContext` built from the same per-target
+TLS settings, because the HTTP client (`httpx`) cannot act as a WebSocket
+client. Both `httpx` and `websockets` are declared as runtime dependencies.
 
-Neither implementation decides authorization or exposes generic arbitrary-path
+The client does not decide authorization or expose generic arbitrary-path
 proxying.
 
 ### Resource Routers
@@ -117,13 +114,20 @@ On-demand API calls are not blocked by stale cached status.
 ### Gateway Audit
 
 Uses a dedicated migration-managed SQLite database at
-`control_plane.audit_database`, created and durable from MVP 1. The schema's
-single source of truth is the `0003` migration; the ORM model maps the table and
-does not `create_all` it. This database is deliberately separate from the `001`
-in-memory audit query engine in `create_app()` — that engine is left unchanged
-so `agent` mode stays byte-for-byte compatible, and the gateway never depends on
-it. Every privileged routing attempt is recorded even when DNS, TLS,
-authentication, or connection setup fails.
+`control_plane.audit_database`, created and durable from MVP 1. Its schema's
+single source of truth is the control-plane migration; the ORM model maps the
+table and does not `create_all` it.
+
+Because the shared `db/migrations.py` runner applies every migration file to any
+database it is handed, the control plane uses its own migration directory and
+`run_control_plane_migrations()` runner. The two databases never receive each
+other's tables. This is separate from the `001` agent audit database, whose
+own durability defect (it was in-memory) is fixed as a prerequisite so the
+agent-audit view can meet the original `001` contract; see the implementation
+plan's Task 0.
+
+Every privileged routing attempt is recorded even when DNS, TLS, authentication,
+or connection setup fails.
 
 Gateway events include:
 
@@ -139,9 +143,11 @@ correlation ID associates the two records.
 
 ### Terminal Gateway
 
-The HTTP connect-token endpoint obtains an upstream one-use ticket, stores it in
-a bounded in-memory mapping, and returns a separate gateway ticket to the
-browser.
+The HTTP connect-token endpoint first reserves capacity in the bounded ticket
+store; if the store is full it returns HTTP `429 gateway_capacity_exceeded`
+without contacting the agent, so a full gateway never wastes an upstream ticket.
+Only after reserving does it obtain the upstream one-use ticket and return a
+separate gateway ticket to the browser. Any failure releases the reservation.
 
 The mapping is bound to:
 
@@ -152,11 +158,13 @@ The mapping is bound to:
 It is consumed once. Restart invalidates gateway tickets but does not alter
 upstream terminal ownership.
 
-The gateway enforces a global, configurable cap on outstanding gateway tickets
-and concurrently proxied terminal sockets. Attaches beyond the cap are rejected
-with the overload close code so a flood of terminals cannot exhaust gateway
-memory. The upstream socket is opened with the `websockets` client and verified
-TLS via the Agent Transport.
+The WebSocket attach atomically acquires a proxy slot and then consumes the
+gateway ticket. If the global active-proxy cap is reached, the attach is
+rejected with close code `4429` before the ticket is consumed, so a valid ticket
+is not burned; the slot is released on every failure path. Together with the
+connect-token `429`, this bounds both outstanding tickets and concurrent sockets
+so a flood of terminals cannot exhaust gateway memory. The upstream socket is
+opened with the `websockets` client and verified TLS.
 
 ## Configuration
 
@@ -289,8 +297,11 @@ Prometheus should scrape agents directly.
 
 ## Migration
 
-1. Add runtime modes and the static agent registry without changing `agent`
-   mode.
+0. Make the existing agent audit store durable and migration-managed (it is
+   in-memory today), as a prerequisite that brings `agent` mode into line with
+   `001` FR-021/FR-026.
+1. Add runtime modes and the static agent registry without otherwise changing
+   `agent` mode.
 2. Add control-plane services/readiness routes and frontend global selector.
 3. Replace the monitoring-specific machine registry with the global registry.
 4. Add terminal HTTP and WebSocket gateway support.
