@@ -180,7 +180,9 @@ verified TLS.
 ## Configuration
 
 ```yaml
-mode: control-plane
+mode: control-plane          # valid values: agent | control-plane (combined = feature 003)
+
+state_database: /var/lib/ic-env-guard/state.db   # agent-mode durable audit; default shown
 
 server:
   bind: 127.0.0.1
@@ -195,7 +197,7 @@ control_plane:
   poll_interval_seconds: 10
   status_stale_after_seconds: 30
   max_parallel_probes: 8
-  audit_database: /var/lib/ic-env-guard/control-plane.db
+  audit_database: /var/lib/ic-env-guard/control-plane.db   # gateway audit; separate from state_database
   max_active_terminal_proxies: 64
   max_outstanding_tickets: 128
 

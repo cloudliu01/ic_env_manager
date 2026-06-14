@@ -55,9 +55,9 @@ resource routers call the constrained HTTP client directly — no transport
 interface. `combined` becomes a separate follow-up feature (`003`) that
 introduces a domain-typed transport seam (e.g. `ServiceTarget`,
 `TerminalTarget`, `MonitoringTarget`) so the in-process implementation calls
-local managers naturally instead of simulating HTTP responses. The `mode` enum
-still accepts `combined` (Task 1) but startup rejects it with a clear pointer to
-feature `003`, keeping the configuration schema stable.
+local managers naturally instead of simulating HTTP responses. `combined` is
+NOT in the `mode` enum for this feature; a config with `mode: combined` fails
+Pydantic validation at load time and never reaches application startup.
 
 ## Planned Source Structure
 
@@ -109,34 +109,66 @@ defect is purely that `main.py` constructs an in-memory engine and calls
 `Base.metadata.create_all()` instead of pointing to the configured durable
 database path and running the existing migration runner.
 
+**`state_database` resolution rules (must be explicit before any code is written):**
+- Production default: `/var/lib/ic-env-guard/state.db` (consistent with the
+  existing `audit_database` default shown in the architecture config example).
+- Resolution order: explicit `AppConfig.state_database` field → env var
+  `IC_ENV_GUARD_STATE_DB` → production default.
+- `create_app()` gains a `state_database: Path | None = None` keyword argument.
+  When provided it overrides the config value. This keeps all existing call sites
+  (`create_app(token_file=...)`) unchanged; tests pass `tmp_path / "state.db"`.
+- The installer-generated config file and `README` example must show
+  `state_database:` so operators know the path is configurable.
+
 **Files:**
 
 - Move: `backend/migrations/` → `backend/ic_env_guard/migrations/`
+- Create: `backend/ic_env_guard/migrations/__init__.py`
 - Modify: `backend/ic_env_guard/db/migrations.py` (update `MIGRATIONS_DIR`)
-- Modify: `backend/ic_env_guard/config/audit.py` (update `MIGRATIONS_DIR` ref)
+- Modify: `backend/ic_env_guard/config/audit.py`
+  (replace `Base.metadata.create_all()` with `run_migrations(db_path)` in
+  `audit_config_load_to_db()`; it has no `MIGRATIONS_DIR` reference — that was
+  a description error in the previous plan version)
 - Modify: `backend/ic_env_guard/main.py`
-- Modify: `backend/ic_env_guard/config/models.py` (expose `state_database` path)
+- Modify: `backend/ic_env_guard/config/models.py` (add `state_database` field)
+- Modify: `backend/tests/integration/test_migrations.py`
+  (fix hardcoded `parents[2] / "migrations"` path)
+- Modify: `backend/tests/integration/test_terminal_secret_exclusion.py`
+  (fix hardcoded `parents[2] / "migrations"` path)
 - Modify: `backend/tests/integration/test_packaging_runtime.py`
 - Test: `backend/tests/integration/test_agent_audit_durability.py`
 
-- [ ] Move `backend/migrations/` to `backend/ic_env_guard/migrations/` so it is
-  included in the wheel by the `include = ["ic_env_guard*"]` rule. Update
-  `MIGRATIONS_DIR` in `db/migrations.py` from `parents[2] / "migrations"` to
-  `Path(__file__).parent.parent / "migrations"` (i.e. sibling of `db/` inside
-  the package). Verify the existing `0001`/`0002` migrations still apply cleanly.
-- [ ] Write a failing test that records audit events, restarts the app against
-  the same database path, and asserts the events are still queryable.
+- [ ] Move `backend/migrations/` to `backend/ic_env_guard/migrations/` and add
+  `__init__.py` so the directory is both a Python package (importable) and
+  included in the wheel by `include = ["ic_env_guard*"]`. Update `MIGRATIONS_DIR`
+  in `db/migrations.py` from `parents[2] / "migrations"` to
+  `Path(__file__).parent.parent / "migrations"`. Verify `0001`/`0002` apply cleanly.
+- [ ] Fix `tests/integration/test_migrations.py` and
+  `tests/integration/test_terminal_secret_exclusion.py`: both hardcode
+  `Path(__file__).resolve().parents[2] / "migrations"` to load `0001_initial.py`
+  directly. Replace with `from ic_env_guard.db.migrations import MIGRATIONS_DIR`
+  and load the migration file via `MIGRATIONS_DIR / "0001_initial.py"`.
+- [ ] Add `state_database: Path = Path("/var/lib/ic-env-guard/state.db")` to
+  `AppConfig` and a `state_database: Path | None = None` argument to
+  `create_app()`. When this argument is set it overrides the config field, so
+  tests can pass `tmp_path / "state.db"` without constructing a full `AppConfig`.
+- [ ] Write a failing test: pass `state_database=tmp_path/"state.db"` to
+  `create_app(token_file=...)`, record audit events, call `create_app()` again
+  with the same path, and assert the events are still queryable.
 - [ ] In `create_app()`, replace the in-memory engine + `create_all()` with:
-  1. call `run_migrations(db_path)` on the configured agent state database path
-     (which applies `0001` and `0002`, including `audit_events`);
-  2. open a SQLAlchemy engine against that same `db_path`;
-  3. do NOT call `Base.metadata.create_all()` — the migration is the schema
-     source of truth.
-- [ ] Update any `001` test fixtures that provided a fresh in-memory audit store
-  to pass a `tmp_path`-scoped database file instead.
-- [ ] Extend `tests/integration/test_packaging_runtime.py` to assert that
-  `ic_env_guard.migrations` is importable and that `MIGRATIONS_DIR` points to
-  an existing directory containing at least `0001_initial.py`.
+  1. resolve `db_path` from the `state_database` argument or `AppConfig`;
+  2. call `run_migrations(db_path)` (applies `0001`/`0002`, creates `audit_events`);
+  3. open a SQLAlchemy engine against `db_path`;
+  4. do NOT call `Base.metadata.create_all()`.
+- [ ] In `config/audit.py`, replace `Base.metadata.create_all(engine)` in
+  `audit_config_load_to_db()` with `run_migrations(db_path)` before opening
+  the engine, for the same reason — the migration is the schema source of truth.
+- [ ] Update installer-generated config template and `README` to show the
+  `state_database:` field with the production default path.
+- [ ] Extend `tests/integration/test_packaging_runtime.py`:
+  - assert `ic_env_guard.migrations` is importable;
+  - assert `MIGRATIONS_DIR` contains `0001_initial.py`;
+  - assert `import httpx` and `import websockets` succeed (without test extras).
 - [ ] Run:
 
   ```bash
@@ -159,7 +191,8 @@ database path and running the existing migration runner.
 
 - [ ] Add failing tests for unique agent IDs, URL shape, credential exclusivity,
   token-file permissions, verified TLS, loopback-only development HTTP, and the
-  three runtime modes.
+  two runtime modes (`agent` and `control-plane`). Include a test asserting that
+  `mode: combined` produces a Pydantic validation error at config load time.
 - [ ] Run:
 
   ```bash
@@ -203,6 +236,7 @@ database path and running the existing migration runner.
 - Create: `backend/ic_env_guard/db/control_plane_audit.py`
 - Create: `backend/ic_env_guard/db/control_plane_migrations.py`
 - Create: `backend/ic_env_guard/api/control_plane_audit.py`
+- Create: `backend/ic_env_guard/control_plane_migrations/__init__.py`
 - Create: `backend/ic_env_guard/control_plane_migrations/0001_control_plane_audit.py`
 - Modify: `backend/ic_env_guard/main.py`
 - Modify: `backend/tests/integration/test_packaging_runtime.py`
@@ -213,12 +247,16 @@ database path and running the existing migration runner.
   routing intent/outcome records survive, including failures that occur before
   upstream dispatch. Until Task 4/5 exist, the test exercises the repository
   through a small dispatch stub rather than a real upstream call.
-- [ ] Create `backend/ic_env_guard/control_plane_migrations/` (inside the
-  package, picked up by `include = ["ic_env_guard*"]`) and a
-  `run_control_plane_migrations(db_path)` runner in `db/control_plane_migrations.py`.
-  Its `CONTROL_PLANE_MIGRATIONS_DIR` must resolve relative to `__file__` inside
-  the package (e.g. `Path(__file__).parent.parent / "control_plane_migrations"`),
-  not relative to the repo root, so it works after wheel install.
+- [ ] Create `backend/ic_env_guard/control_plane_migrations/` with an
+  `__init__.py` (makes it an importable Python package, and ensures
+  `include = ["ic_env_guard*"]` picks up the directory and its contents in the
+  wheel). Create `run_control_plane_migrations(db_path)` in
+  `db/control_plane_migrations.py`. Its `CONTROL_PLANE_MIGRATIONS_DIR` must
+  resolve relative to `__file__` inside the package so it works after wheel
+  install. The runner MUST follow the same contract as the existing agent runner:
+  maintain `schema_versions`, be idempotent on repeated calls, and raise
+  `MigrationError` if any prior migration has a `failed` result — add
+  runner idempotency and failure-state tests alongside the audit tests.
 - [ ] Add `0001_control_plane_audit.py` (raw `sqlite3`, the `001` convention)
   with actor, source address, agent ID, operation, target, result, dispatch
   state, upstream status, correlation ID, failure category, and timestamp. The
@@ -231,10 +269,13 @@ database path and running the existing migration runner.
   (default `/var/lib/ic-env-guard/control-plane.db`), created only in
   `control-plane` mode. This is separate from the agent audit database fixed in
   Task 0.
-- [ ] Extend `tests/integration/test_packaging_runtime.py` to assert that
-  `ic_env_guard.control_plane_migrations` is importable and that
-  `CONTROL_PLANE_MIGRATIONS_DIR` points to an existing directory containing
-  `0001_control_plane_audit.py`.
+- [ ] Extend `tests/integration/test_packaging_runtime.py`:
+  - assert `ic_env_guard.control_plane_migrations` is importable;
+  - assert `CONTROL_PLANE_MIGRATIONS_DIR` contains `0001_control_plane_audit.py`;
+  - assert the built wheel archive (via `python -m build --wheel` and inspection
+    of the resulting `.whl` zip) contains both migration directories and at least
+    `0001_initial.py` / `0001_control_plane_audit.py` — this proves wheel
+    completeness rather than only testing the source tree.
 - [ ] Add a repository method that creates intent before dispatch and finalizes
   the same record after success or failure.
 - [ ] Add bounded authenticated query routes under `/api/control-plane/audit`.
@@ -524,5 +565,6 @@ database path and running the existing migration runner.
 - [ ] Connect-token returns `429` when the ticket store is full without
   contacting the agent; the WS attach rejects past the cap with `4429` without
   wasting a valid ticket or growing memory unboundedly.
-- [ ] `combined` mode is rejected at startup with a pointer to feature `003`.
+- [ ] A config with `mode: combined` fails Pydantic validation; `combined` is not
+  in the enum and never reaches application startup.
 

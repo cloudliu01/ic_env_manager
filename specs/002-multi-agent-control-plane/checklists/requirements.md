@@ -7,8 +7,9 @@
 ## Scope
 
 - [x] The feature is explicitly post-MVP and does not rewrite feature `001`.
-- [x] This feature ships `agent` and `control-plane` modes only; `combined` is
-      not in the config enum and fails validation, never reaching startup.
+- [x] This feature ships `agent` and `control-plane` modes only. `combined` is
+      not in the enum; a config file with `mode: combined` fails Pydantic
+      validation at load time and never reaches application startup.
 - [x] Non-goals exclude discovery, bulk orchestration, HA, generic proxying, and
       `combined` mode.
 
@@ -34,20 +35,29 @@
 
 ## Audit and Compatibility
 
-- [x] Agent audit durability (a `001` FR-026 defect) is fixed as a prerequisite
-      before any `002` routes are added: `create_app()` is pointed at the
-      configured durable database path and calls `run_migrations()` instead of
-      using an in-memory engine with `create_all()`. No new migration is needed;
-      `audit_events` already exists in `0001_initial.py`.
+- [x] Agent audit durability (a `001` FR-026 defect) is fixed as a prerequisite:
+      `create_app()` uses the configured `state_database` path (default
+      `/var/lib/ic-env-guard/state.db`; overridable via `create_app(state_database=...)`
+      for tests) and calls `run_migrations()`. No new migration needed —
+      `audit_events` already exists in `0001_initial.py`. `config/audit.py`'s
+      `audit_config_load_to_db()` also replaces its `create_all()` with
+      `run_migrations()`. The `state_database` field and default are shown in the
+      architecture config example and the installer-generated template.
 - [x] Gateway audit is durable in a dedicated control-plane database, separate
       from the agent database, and required from MVP 1.
 - [x] Both migration directories live inside the `ic_env_guard` package
-      (`ic_env_guard/migrations/` and `ic_env_guard/control_plane_migrations/`)
-      so the wheel includes them without additional packaging config. The
-      pre-existing top-level `backend/migrations/` is moved in Task 0, fixing
-      the `MIGRATIONS_DIR` resolution bug after wheel install.
+      (`ic_env_guard/migrations/` and `ic_env_guard/control_plane_migrations/`),
+      each with an `__init__.py`, so the wheel includes them via
+      `include = ["ic_env_guard*"]`. The pre-existing top-level `backend/migrations/`
+      and its hardcoded references in `test_migrations.py` and
+      `test_terminal_secret_exclusion.py` are fixed in Task 0.
 - [x] Each database uses its own runner; neither database ever receives the
-      other's tables; database isolation is verified by a test.
+      other's tables; isolation is verified by a test.
+- [x] The control-plane migration runner follows the same contract as the agent
+      runner: `schema_versions` table, idempotent on repeated calls, raises
+      `MigrationError` on any prior `failed` result; covered by dedicated tests.
+- [x] Packaging tests verify wheel archive contents (not just source-tree imports)
+      for both migration directories and `httpx`/`websockets` runtime deps.
 - [x] Correlation IDs associate gateway and agent events.
 - [x] API versions and capabilities support mixed-version deployments, with a
       documented minimum agent version that exposes the capability endpoint; an
