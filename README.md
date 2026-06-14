@@ -2,11 +2,17 @@
 
 IC Design Environment Guard is a Linux host agent for secure browser terminal access, configured local service management, Prometheus-compatible metrics, and durable local audit/state records.
 
-## Current Spec Kit Plan
+## Current Specifications
 
-Read the active implementation plan before development:
+The single-host agent baseline is:
 
 - [specs/001-linux-host-agent/plan.md](specs/001-linux-host-agent/plan.md)
+
+The post-MVP multi-agent control-plane design is:
+
+- [specs/002-multi-agent-control-plane/spec.md](specs/002-multi-agent-control-plane/spec.md)
+- [specs/002-multi-agent-control-plane/architecture.md](specs/002-multi-agent-control-plane/architecture.md)
+- [specs/002-multi-agent-control-plane/plan.md](specs/002-multi-agent-control-plane/plan.md)
 
 Operational docs live in [docs/operations/](docs/operations/), including lifecycle, recovery, service configuration, Prometheus, terminal safety, and validation notes.
 
@@ -18,6 +24,7 @@ frontend/                Vite + React + TypeScript browser UI
 packaging/               systemd unit, installer, upgrade, uninstall, runtime notes
 docs/operations/         Operator and validation documentation
 specs/001-linux-host-agent/  Spec Kit plan, contracts, tasks, and quickstart
+specs/002-multi-agent-control-plane/  Multi-agent spec, architecture, contracts, and plan
 ```
 
 ## Prerequisites
