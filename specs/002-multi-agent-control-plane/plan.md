@@ -123,14 +123,15 @@ Resolution order, evaluated in `_resolve_state_db(arg, config)`:
 The field must be `Path | None = None` — **not** `Path = Path("...")` — so that
 steps 3 and 4 are reachable when no explicit value is given.
 
-**Existing 17 `create_app()` call sites all need updating.** They currently call
+**Existing 17 `create_app()` call sites need no code changes.** They call
 `create_app(token_file=...)` with no `state_database`, so after this change they
-would fall through to `/var/lib/ic-env-guard/state.db`, which a test user cannot
-write. Fix via a session-scoped `state_db` autouse fixture in
-`tests/conftest.py` that provides a `tmp_path`-backed database path and passes
-it to every `create_app()` call. All 17 fixtures/helpers that call `create_app()`
-must accept and forward this path; do not update them one-by-one without also
-verifying the full test suite with a non-root user.
+fall through to the env var `IC_ENV_GUARD_STATE_DB` (step 3 of
+`_resolve_state_db()`). Intercept that resolution in a **function-scoped**
+autouse fixture in `tests/conftest.py` that calls
+`monkeypatch.setenv("IC_ENV_GUARD_STATE_DB", str(tmp_path / "state.db"))`.
+Because `tmp_path` is function-scoped, every test gets an isolated database with
+no cross-test pollution. Do NOT use a session-scoped fixture here — `tmp_path`
+is function-scoped and pytest will raise a scope mismatch error.
 
 The installer-generated config file and `README` example must show
 `state_database:` so operators know the path is configurable.
@@ -167,11 +168,11 @@ The installer-generated config file and `README` example must show
   `state_database: Path | None = None` argument to `create_app()`. Add
   `_resolve_state_db(arg, config)` that evaluates the four-step resolution order
   defined above.
-- [ ] Add a session-scoped `state_db` autouse fixture to `tests/conftest.py`
-  that creates a `tmp_path`-scoped database file and passes it to `create_app()`
-  via the new argument. Update all 17 existing `create_app()` call sites (in
-  conftest fixtures / helpers) to forward this path. Run the full test suite as a
-  non-root user to confirm no test touches `/var/lib/...`.
+- [ ] Add a **function-scoped** autouse fixture to `tests/conftest.py` that
+  calls `monkeypatch.setenv("IC_ENV_GUARD_STATE_DB", str(tmp_path / "state.db"))`.
+  This isolates each test's database through the env-var resolution step without
+  modifying any of the 17 existing `create_app()` call sites. Run the full test
+  suite as a non-root user to confirm no test touches `/var/lib/...`.
 - [ ] Write a failing test: call `create_app(token_file=..., state_database=db)`
   with a tmp_path db, record audit events, call `create_app()` again with the
   same db, and assert events are still queryable.
@@ -180,9 +181,14 @@ The installer-generated config file and `README` example must show
   2. call `run_migrations(db_path)`;
   3. open a SQLAlchemy engine against `db_path` (use `check_same_thread=False`
      for SQLite);
-  4. use request-scoped sessions (a `sessionmaker` factory; create a new session
-     per request, close it when the request completes) rather than the current
-     single shared session that is never closed;
+  4. use request-scoped sessions via a FastAPI dependency that `yield`s a session
+     from a `sessionmaker` factory, commits on normal exit, rolls back on any
+     exception, and closes in `finally`; this replaces the current single shared
+     session that is never closed. **Audit exception**: gateway audit records
+     must survive business-logic failures — the audit repository writes each
+     record in its own `commit()` (intent committed before upstream dispatch;
+     outcome updated and committed again in `finally`) and MUST NOT share a
+     session with the request business logic;
   5. close the engine in the lifespan shutdown hook;
   6. do NOT call `Base.metadata.create_all()`.
 - [ ] In `config/audit.py`, replace `Base.metadata.create_all(engine)` in
@@ -199,11 +205,16 @@ The installer-generated config file and `README` example must show
 
   ```bash
   cd backend
-  conda run -n venv312 pytest -q tests/integration/test_agent_audit_durability.py
+  conda run -n venv312 pytest -q \
+    tests/integration/test_agent_audit_durability.py \
+    tests/integration/test_migrations.py \
+    tests/integration/test_terminal_secret_exclusion.py \
+    tests/integration/test_packaging_runtime.py
   conda run -n venv312 pytest -q tests/contract
   ```
 
-  Expected: audit survives restart and all `001` contracts still pass.
+  Expected: audit survives restart; modified migration, secret-exclusion, and
+  packaging tests pass; all `001` contracts still pass.
 
 ## Task 1: Runtime Modes and Configuration
 
@@ -244,6 +255,13 @@ The installer-generated config file and `README` example must show
   currently builds all dependencies and mounts all routers unconditionally;
   factor the mode-independent agent wiring into a helper so the `agent`-mode app
   is identical to `001`.
+- [ ] Make agent-database initialization conditional on mode: open `state_database`
+  and run agent migrations only when `mode == "agent"`; in `control-plane` mode,
+  skip `state_database` resolution and engine creation entirely (the gateway audit
+  database is opened separately in Task 2). Add a test asserting that starting in
+  `control-plane` mode creates no file at the default `state_database` path and
+  that no agent migration tables exist in the control-plane database; this guards
+  FR-005 ("control-plane mode MUST NOT imply management of the control-plane host").
 - [ ] Add a regression test asserting the `agent`-mode router set and dependency
   overrides are unchanged from `001` before refactoring anything else.
 - [ ] Re-run the focused tests and then:
@@ -317,10 +335,14 @@ The installer-generated config file and `README` example must show
 
   ```bash
   cd backend
-  conda run -n venv312 pytest -q tests/integration/test_control_plane_audit.py tests/contract/test_migration_contract.py
+  conda run -n venv312 pytest -q \
+    tests/integration/test_control_plane_audit.py \
+    tests/contract/test_migration_contract.py \
+    tests/integration/test_packaging_runtime.py
   ```
 
-  Expected: persistence, migration, filtering, and secret-exclusion tests pass.
+  Expected: persistence, migration, filtering, secret-exclusion, and wheel-content
+  tests pass.
 
 ## Task 3: Agent Registry and Capability Negotiation
 
@@ -390,7 +412,10 @@ The installer-generated config file and `README` example must show
 
   ```bash
   cd backend
-  conda run -n venv312 pytest -q tests/unit/test_agent_client.py tests/integration/test_agent_availability.py
+  conda run -n venv312 pytest -q \
+    tests/unit/test_agent_client.py \
+    tests/integration/test_agent_availability.py \
+    tests/integration/test_packaging_runtime.py
   ```
 
 ## Task 5: Explicit Service and Monitoring Routes
@@ -541,7 +566,9 @@ The installer-generated config file and `README` example must show
 
   ```bash
   cd backend
-  conda run -n venv312 pytest -q tests/integration/test_agent_terminal_websocket.py
+  conda run -n venv312 pytest -q \
+    tests/integration/test_agent_terminal_websocket.py \
+    tests/integration/test_packaging_runtime.py
   cd ../frontend
   npm test -- --run tests/terminal-agent-routing.test.tsx
   ```
@@ -589,7 +616,9 @@ The installer-generated config file and `README` example must show
 ## Completion Gate
 
 - [ ] The [requirements checklist](checklists/requirements.md) remains satisfied.
-- [ ] All feature `001` contract tests pass unchanged in `agent` mode.
+- [ ] All feature `001` contract tests pass in `agent` mode; original assertions
+  and external behavior are preserved (test infrastructure such as fixtures may
+  be adjusted as needed by Task 0).
 - [ ] Security review finds no browser-visible agent token or upstream ticket.
 - [ ] Gateway audit survives restart and covers pre-dispatch failures.
 - [ ] One unavailable agent does not affect another agent or gateway readiness.
