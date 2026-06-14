@@ -141,18 +141,23 @@ The installer-generated config file and `README` example must show
 - Move: `backend/migrations/` → `backend/ic_env_guard/migrations/`
 - Create: `backend/ic_env_guard/migrations/__init__.py`
 - Modify: `backend/ic_env_guard/db/migrations.py` (update `MIGRATIONS_DIR`)
+- Modify: `backend/ic_env_guard/db/session.py` (add `check_same_thread=False`)
 - Modify: `backend/ic_env_guard/config/audit.py`
   (replace `Base.metadata.create_all()` with `run_migrations(db_path)` in
   `audit_config_load_to_db()`; it has no `MIGRATIONS_DIR` reference — that was
   a description error in the previous plan version)
 - Modify: `backend/ic_env_guard/main.py`
 - Modify: `backend/ic_env_guard/config/models.py` (add `state_database` field)
+- Modify: `backend/tests/conftest.py` (add autouse env-var fixture)
 - Modify: `backend/tests/integration/test_migrations.py`
   (fix hardcoded `parents[2] / "migrations"` path)
 - Modify: `backend/tests/integration/test_terminal_secret_exclusion.py`
   (fix hardcoded `parents[2] / "migrations"` path)
 - Modify: `backend/tests/integration/test_packaging_runtime.py`
+- Modify: `packaging/install/install.sh` (add `state_database:` to generated config)
+- Modify: `README.md` (add `state_database:` to example config)
 - Test: `backend/tests/integration/test_agent_audit_durability.py`
+- Test: `backend/tests/unit/test_state_db_resolution.py`
 
 - [ ] Move `backend/migrations/` to `backend/ic_env_guard/migrations/` and add
   `__init__.py` so the directory is both a Python package (importable) and
@@ -173,22 +178,43 @@ The installer-generated config file and `README` example must show
   This isolates each test's database through the env-var resolution step without
   modifying any of the 17 existing `create_app()` call sites. Run the full test
   suite as a non-root user to confirm no test touches `/var/lib/...`.
+- [ ] Add unit tests for all four `_resolve_state_db()` resolution branches in
+  `tests/unit/test_state_db_resolution.py`: (1) explicit `create_app` argument
+  wins over everything; (2) `AppConfig.state_database` wins when arg is `None`;
+  (3) `IC_ENV_GUARD_STATE_DB` env var wins when config field is also `None`;
+  (4) hardcoded fallback `/var/lib/ic-env-guard/state.db` is returned when none
+  of the above are set. The fallback test MUST call
+  `monkeypatch.delenv("IC_ENV_GUARD_STATE_DB", raising=False)` to override the
+  autouse fixture; otherwise the env-var branch shadows the fallback and the
+  test always passes vacuously.
 - [ ] Write a failing test: call `create_app(token_file=..., state_database=db)`
   with a tmp_path db, record audit events, call `create_app()` again with the
   same db, and assert events are still queryable.
 - [ ] In `create_app()`, replace the in-memory engine + `create_all()` with:
   1. resolve `db_path` via `_resolve_state_db()`;
   2. call `run_migrations(db_path)`;
-  3. open a SQLAlchemy engine against `db_path` (use `check_same_thread=False`
-     for SQLite);
+  3. open a SQLAlchemy engine using `create_sqlite_engine(db_path)` from
+     `db/session.py` (already sets WAL and foreign-key PRAGMAs via event
+     listeners); first extend that function to pass
+     `connect_args={"check_same_thread": False}` so it is safe in async
+     contexts. Create the session factory with the existing
+     `create_session_factory(engine)`;
   4. use request-scoped sessions via a FastAPI dependency that `yield`s a session
-     from a `sessionmaker` factory, commits on normal exit, rolls back on any
-     exception, and closes in `finally`; this replaces the current single shared
-     session that is never closed. **Audit exception**: gateway audit records
-     must survive business-logic failures — the audit repository writes each
-     record in its own `commit()` (intent committed before upstream dispatch;
-     outcome updated and committed again in `finally`) and MUST NOT share a
-     session with the request business logic;
+     from the factory, commits on normal exit, rolls back on any exception, and
+     closes in `finally`; this replaces the current single shared session that
+     is never closed. **Audit exception**: gateway audit records must survive
+     business-logic failures — the audit repository uses its own independent
+     session with explicit `commit()` calls (intent committed before upstream
+     dispatch; outcome updated and committed again in `finally`) and MUST NOT
+     share a session with the request business logic. Additional failure rules:
+     (a) if the **intent commit** fails, the handler MUST fail closed and MUST
+     NOT dispatch the upstream request — no dispatch without an audit trail;
+     (b) an **outcome commit** failure must not erase the already-committed
+     intent — the intent survives as a partially-recorded event;
+     (c) audit exceptions MUST be caught, logged in sanitized form, and
+     re-raised without overwriting the original business exception and without
+     leaking raw SQLite error text to the caller. Add tests covering each of
+     these three failure modes;
   5. close the engine in the lifespan shutdown hook;
   6. do NOT call `Base.metadata.create_all()`.
 - [ ] In `config/audit.py`, replace `Base.metadata.create_all(engine)` in
@@ -211,10 +237,12 @@ The installer-generated config file and `README` example must show
     tests/integration/test_terminal_secret_exclusion.py \
     tests/integration/test_packaging_runtime.py
   conda run -n venv312 pytest -q tests/contract
+  conda run -n venv312 pytest -q
   ```
 
   Expected: audit survives restart; modified migration, secret-exclusion, and
-  packaging tests pass; all `001` contracts still pass.
+  packaging tests pass; all `001` contracts still pass; full suite passes as a
+  non-root user with no test touching `/var/lib/...`.
 
 ## Task 1: Runtime Modes and Configuration
 
@@ -258,10 +286,12 @@ The installer-generated config file and `README` example must show
 - [ ] Make agent-database initialization conditional on mode: open `state_database`
   and run agent migrations only when `mode == "agent"`; in `control-plane` mode,
   skip `state_database` resolution and engine creation entirely (the gateway audit
-  database is opened separately in Task 2). Add a test asserting that starting in
-  `control-plane` mode creates no file at the default `state_database` path and
-  that no agent migration tables exist in the control-plane database; this guards
-  FR-005 ("control-plane mode MUST NOT imply management of the control-plane host").
+  database is opened separately in Task 2). Add a test: call
+  `create_app(state_database=tmp_path / "must-not-exist.db", mode="control-plane",
+  token_file=...)` and assert that the file was NOT created; this guards FR-005
+  ("control-plane mode MUST NOT imply management of the control-plane host"). The
+  complementary check — that the control-plane database contains no agent tables —
+  belongs in Task 2's isolation test, where the control-plane DB is first created.
 - [ ] Add a regression test asserting the `agent`-mode router set and dependency
   overrides are unchanged from `001` before refactoring anything else.
 - [ ] Re-run the focused tests and then:
@@ -283,6 +313,7 @@ The installer-generated config file and `README` example must show
 - Create: `backend/ic_env_guard/control_plane_migrations/__init__.py`
 - Create: `backend/ic_env_guard/control_plane_migrations/0001_control_plane_audit.py`
 - Modify: `backend/ic_env_guard/main.py`
+- Modify: `backend/pyproject.toml` (add `build>=1.2` to `test` extra)
 - Modify: `backend/tests/integration/test_packaging_runtime.py`
 - Test: `backend/tests/integration/test_control_plane_audit.py`
 - Test: `backend/tests/contract/test_migration_contract.py`
@@ -316,7 +347,9 @@ The installer-generated config file and `README` example must show
 - [ ] Extend `tests/integration/test_packaging_runtime.py` with a wheel-content
   test. Add `build>=1.2` to the `test` extra in `pyproject.toml` first (it is
   not currently declared). The test should:
-  - run `python -m build --wheel --outdir <tmp_dir>` against the backend package;
+  - run `python -m build --wheel --no-isolation --outdir <tmp_dir>` against the
+    backend package (`--no-isolation` avoids network access to download build
+    deps during tests; the test environment already has `build>=1.2` installed);
   - open the resulting `.whl` (a zip archive) and assert it contains entries
     matching `ic_env_guard/migrations/0001_initial.py` and
     `ic_env_guard/control_plane_migrations/0001_control_plane_audit.py` — these
@@ -384,6 +417,7 @@ The installer-generated config file and `README` example must show
 - Create: `backend/ic_env_guard/agents/availability.py`
 - Modify: `backend/ic_env_guard/main.py`
 - Modify: `backend/pyproject.toml`
+- Modify: `backend/tests/integration/test_packaging_runtime.py`
 - Test: `backend/tests/unit/test_agent_client.py`
 - Test: `backend/tests/integration/test_agent_availability.py`
 
@@ -534,6 +568,7 @@ The installer-generated config file and `README` example must show
 - Create: `backend/ic_env_guard/api/agent_terminal_ws.py`
 - Modify: `backend/ic_env_guard/agents/terminal_proxy.py`
 - Modify: `backend/pyproject.toml`
+- Modify: `backend/tests/integration/test_packaging_runtime.py`
 - Modify: `frontend/src/api/terminals.ts`
 - Modify: `frontend/src/pages/TerminalPage.tsx`
 - Modify: `frontend/src/terminal/TerminalPane.tsx`
