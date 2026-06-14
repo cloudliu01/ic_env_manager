@@ -10,7 +10,9 @@ class Base(DeclarativeBase):
 
 
 def create_sqlite_engine(db_path: Path | str) -> Engine:
-    engine = create_engine(f"sqlite:///{db_path}", future=True)
+    engine = create_engine(
+        f"sqlite:///{db_path}", connect_args={"check_same_thread": False}, future=True
+    )
 
     @event.listens_for(engine, "connect")
     def set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:  # type: ignore[no-untyped-def]

@@ -191,26 +191,26 @@ The installer-generated config file and `README` example must show
 - Test: `backend/tests/integration/test_agent_audit_durability.py`
 - Test: `backend/tests/unit/test_state_db_resolution.py`
 
-- [ ] Move `backend/migrations/` to `backend/ic_env_guard/migrations/` and add
+- [x] Move `backend/migrations/` to `backend/ic_env_guard/migrations/` and add
   `__init__.py` so the directory is both a Python package (importable) and
   included in the wheel by `include = ["ic_env_guard*"]`. Update `MIGRATIONS_DIR`
   in `db/migrations.py` from `parents[2] / "migrations"` to
   `Path(__file__).parent.parent / "migrations"`. Verify `0001`/`0002` apply cleanly.
-- [ ] Fix `tests/integration/test_migrations.py` and
+- [x] Fix `tests/integration/test_migrations.py` and
   `tests/integration/test_terminal_secret_exclusion.py`: both hardcode
   `Path(__file__).resolve().parents[2] / "migrations"` to load `0001_initial.py`
   directly. Replace with `from ic_env_guard.db.migrations import MIGRATIONS_DIR`
   and load the migration file via `MIGRATIONS_DIR / "0001_initial.py"`.
-- [ ] Add `state_database: Path | None = None` to `AppConfig` and a
+- [x] Add `state_database: Path | None = None` to `AppConfig` and a
   `state_database: Path | None = None` argument to `create_app()`. Add
   `_resolve_state_db(arg, config)` that evaluates the four-step resolution order
   defined above.
-- [ ] Add a **function-scoped** autouse fixture to `tests/conftest.py` that
+- [x] Add a **function-scoped** autouse fixture to `tests/conftest.py` that
   calls `monkeypatch.setenv("IC_ENV_GUARD_STATE_DB", str(tmp_path / "state.db"))`.
   This isolates each test's database through the env-var resolution step without
   modifying any of the 17 existing `create_app()` call sites. Run the full test
   suite as a non-root user to confirm no test touches `/var/lib/...`.
-- [ ] Add unit tests for all four `_resolve_state_db()` resolution branches in
+- [x] Add unit tests for all four `_resolve_state_db()` resolution branches in
   `tests/unit/test_state_db_resolution.py`: (1) explicit `create_app` argument
   wins over everything; (2) `AppConfig.state_database` wins when arg is `None`;
   (3) `IC_ENV_GUARD_STATE_DB` env var wins when config field is also `None`;
@@ -219,10 +219,10 @@ The installer-generated config file and `README` example must show
   `monkeypatch.delenv("IC_ENV_GUARD_STATE_DB", raising=False)` to override the
   autouse fixture; otherwise the env-var branch shadows the fallback and the
   test always passes vacuously.
-- [ ] Write a failing test: call `create_app(token_file=..., state_database=db)`
+- [x] Write a failing test: call `create_app(token_file=..., state_database=db)`
   with a tmp_path db, record audit events, call `create_app()` again with the
   same db, and assert events are still queryable.
-- [ ] In `create_app()`, replace the in-memory engine + `create_all()` with:
+- [x] In `create_app()`, replace the in-memory engine + `create_all()` with:
   1. resolve `db_path` via `_resolve_state_db()`;
   2. call `run_migrations(db_path)`;
   3. open a SQLAlchemy engine using `create_sqlite_engine(db_path)` from
@@ -242,17 +242,17 @@ The installer-generated config file and `README` example must show
      Task 2 where gateway audit is introduced.);
   5. close the engine in the lifespan shutdown hook;
   6. do NOT call `Base.metadata.create_all()`.
-- [ ] In `config/audit.py`, replace `Base.metadata.create_all(engine)` in
+- [x] In `config/audit.py`, replace `Base.metadata.create_all(engine)` in
   `audit_config_load_to_db()` with `run_migrations(db_path)` before opening
   the engine, for the same reason — the migration is the schema source of truth.
-- [ ] Update installer-generated config template and `README` to show the
+- [x] Update installer-generated config template and `README` to show the
   `state_database:` field with the production default path.
-- [ ] Extend `tests/integration/test_packaging_runtime.py`:
+- [x] Extend `tests/integration/test_packaging_runtime.py`:
   - assert `ic_env_guard.migrations` is importable as a package;
   - assert `MIGRATIONS_DIR` resolves to an existing path containing `0001_initial.py`.
   (`httpx` and `websockets` import checks belong in Task 4 and Task 9 respectively,
   when those dependencies are added.)
-- [ ] Run:
+- [x] Run:
 
   ```bash
   cd backend
@@ -279,11 +279,11 @@ The installer-generated config file and `README` example must show
 - Test: `backend/tests/contract/test_control_plane_config.py`
 - Test: `backend/tests/unit/test_security_config.py`
 
-- [ ] Add failing tests for unique agent IDs, URL shape, credential exclusivity,
+- [x] Add failing tests for unique agent IDs, URL shape, credential exclusivity,
   token-file permissions, verified TLS, loopback-only development HTTP, and the
   two runtime modes (`agent` and `control-plane`). Include a test asserting that
   `mode: combined` produces a Pydantic validation error at config load time.
-- [ ] Run:
+- [x] Run:
 
   ```bash
   cd backend
@@ -293,22 +293,22 @@ The installer-generated config file and `README` example must show
   Expected: failures because `AgentConfig`, `ControlPlaneConfig`, and runtime
   modes do not exist.
 
-- [ ] Add `AgentTlsConfig`, `AgentConfig`, `ControlPlaneConfig`, and
+- [x] Add `AgentTlsConfig`, `AgentConfig`, `ControlPlaneConfig`, and
   `mode: Literal["agent", "control-plane"]` to `AppConfig`. `combined` is NOT
   in the enum — an unknown value fails Pydantic validation with a clear message
   rather than passing validation only to be rejected later. `mode` MUST default
   to `agent` so existing configs and every test fixture that calls `create_app()`
   keep producing the current single-host app unchanged. When feature `003` adds
   `combined`, it adds it to the enum then.
-- [ ] Validate `base_url` as scheme, host, and optional port only; reject URL
+- [x] Validate `base_url` as scheme, host, and optional port only; reject URL
   credentials, query, fragments, and non-root paths.
-- [ ] Permit insecure HTTP only for loopback when
+- [x] Permit insecure HTTP only for loopback when
   `development.allow_insecure_http` is true and the server itself is local-only.
-- [ ] Refactor `create_app()` to mount routers by mode. **Risk:** `create_app()`
+- [x] Refactor `create_app()` to mount routers by mode. **Risk:** `create_app()`
   currently builds all dependencies and mounts all routers unconditionally;
   factor the mode-independent agent wiring into a helper so the `agent`-mode app
   is identical to `001`.
-- [ ] Make agent-database initialization conditional on mode: open `state_database`
+- [x] Make agent-database initialization conditional on mode: open `state_database`
   and run agent migrations only when `mode == "agent"`; in `control-plane` mode,
   skip `state_database` resolution and engine creation entirely (the gateway audit
   database is opened separately in Task 2). Add a test: call
@@ -320,9 +320,9 @@ The installer-generated config file and `README` example must show
   control-plane host"). The complementary check — that the control-plane database
   contains no agent tables — belongs in Task 2's isolation test, where the
   control-plane DB is first created.
-- [ ] Add a regression test asserting the `agent`-mode router set and dependency
+- [x] Add a regression test asserting the `agent`-mode router set and dependency
   overrides are unchanged from `001` before refactoring anything else.
-- [ ] Re-run the focused tests and then:
+- [x] Re-run the focused tests and then:
 
   ```bash
   cd backend
@@ -346,11 +346,11 @@ The installer-generated config file and `README` example must show
 - Test: `backend/tests/integration/test_control_plane_audit.py`
 - Test: `backend/tests/contract/test_migration_contract.py`
 
-- [ ] Write failing integration tests that restart the application and verify
+- [x] Write failing integration tests that restart the application and verify
   routing intent/outcome records survive, including failures that occur before
   upstream dispatch. Until Task 4/5 exist, the test exercises the repository
   through a small dispatch stub rather than a real upstream call.
-- [ ] Create `backend/ic_env_guard/control_plane_migrations/` with an
+- [x] Create `backend/ic_env_guard/control_plane_migrations/` with an
   `__init__.py` (makes it an importable Python package, and ensures
   `include = ["ic_env_guard*"]` picks up the directory and its contents in the
   wheel). Create `run_control_plane_migrations(db_path)` in
@@ -360,19 +360,19 @@ The installer-generated config file and `README` example must show
   maintain `schema_versions`, be idempotent on repeated calls, and raise
   `MigrationError` if any prior migration has a `failed` result — add
   runner idempotency and failure-state tests alongside the audit tests.
-- [ ] Add `0001_control_plane_audit.py` (raw `sqlite3`, the `001` convention)
+- [x] Add `0001_control_plane_audit.py` (raw `sqlite3`, the `001` convention)
   with actor, source address, agent ID, operation, target, result, dispatch
   state, upstream status, correlation ID, failure category, and timestamp. The
   migration is the **single source of truth**; the ORM model maps the table and
   MUST NOT `create_all` it.
-- [ ] Add a test asserting database isolation: the agent DB contains no
+- [x] Add a test asserting database isolation: the agent DB contains no
   control-plane table and the control-plane DB contains no agent table after
   both runners have applied their migrations.
-- [ ] Open a dedicated durable engine against `control_plane.audit_database`
+- [x] Open a dedicated durable engine against `control_plane.audit_database`
   (default `/var/lib/ic-env-guard/control-plane.db`), created only in
   `control-plane` mode. This is separate from the agent audit database fixed in
   Task 0.
-- [ ] Extend `tests/integration/test_packaging_runtime.py` with a wheel-content
+- [x] Extend `tests/integration/test_packaging_runtime.py` with a wheel-content
   test. Add `build>=1.2` to the `test` extra in `pyproject.toml` first (it is
   not currently declared). The test should:
   - run `python -m build --wheel --no-isolation --outdir <tmp_dir>` against the
@@ -389,7 +389,7 @@ The installer-generated config file and `README` example must show
   (`httpx` and `websockets` will not yet appear in `Requires-Dist` at this task;
   the METADATA assertions are added in Task 4 and Task 9 once those deps are
   declared. The migration file assertions apply now.)
-- [ ] Add a repository method that creates intent before dispatch and finalizes
+- [x] Add a repository method that creates intent before dispatch and finalizes
   the same record after success or failure. Specify and test the following
   failure-mode rules explicitly:
   (a) **Intent commit fails**: the handler MUST fail closed and MUST NOT dispatch
@@ -403,8 +403,8 @@ The installer-generated config file and `README` example must show
   preserve and re-raise the original business exception; audit exceptions MUST
   NOT overwrite the original error or leak raw SQLite text to the caller.
   Add a test for each of these three cases.
-- [ ] Add bounded authenticated query routes under `/api/control-plane/audit`.
-- [ ] Run:
+- [x] Add bounded authenticated query routes under `/api/control-plane/audit`.
+- [x] Run:
 
   ```bash
   cd backend
@@ -431,20 +431,20 @@ The installer-generated config file and `README` example must show
 - Test: `backend/tests/contract/test_agents_api.py`
 - Test: `backend/tests/unit/test_agent_registry.py`
 
-- [ ] Write failing tests for immutable lookup, disabled targets, safe inventory
+- [x] Write failing tests for immutable lookup, disabled targets, safe inventory
   responses, and unknown targets.
-- [ ] Add config-contract coverage for the documented mode-specific fields,
+- [x] Add config-contract coverage for the documented mode-specific fields,
   credential rules, TLS exceptions, database path semantics, and exact agent ID
   regex in `specs/002-multi-agent-control-plane/contracts/control-plane-config.md`.
-- [ ] Implement one registry instance from validated startup configuration.
-- [ ] Ensure safe summaries omit URLs, token paths, CA paths, and raw transport
+- [x] Implement one registry instance from validated startup configuration.
+- [x] Ensure safe summaries omit URLs, token paths, CA paths, and raw transport
   errors.
-- [ ] Add `GET /api/capabilities` to local agents and inventory/detail/probe
+- [x] Add `GET /api/capabilities` to local agents and inventory/detail/probe
   routes to the control plane. Document the **minimum agent version** that
   exposes `/api/capabilities`: a control plane pointed at a pre-`002` agent that
   lacks this endpoint treats it as `agent_protocol_error` and surfaces no
   features, rather than silently half-working.
-- [ ] Run:
+- [x] Run:
 
   ```bash
   cd backend
@@ -465,33 +465,33 @@ The installer-generated config file and `README` example must show
 - Test: `backend/tests/unit/test_agent_client.py`
 - Test: `backend/tests/integration/test_agent_availability.py`
 
-- [ ] Promote `httpx` from the `test` extra to a runtime dependency in
+- [x] Promote `httpx` from the `test` extra to a runtime dependency in
   `pyproject.toml`; do not rely on a transitive dependency. Extend the wheel
   METADATA assertion in `tests/integration/test_packaging_runtime.py` to verify
   that `Requires-Dist` in the built wheel includes `httpx` (runtime deps appear
   in wheel METADATA, not as packaged files).
-- [ ] Write tests proving redirects are not followed, browser authorization and
+- [x] Write tests proving redirects are not followed, browser authorization and
   forwarding headers are not propagated, TLS settings are applied, response
   size/content type are bounded, and error categories map to the HTTP contract.
-- [ ] Add availability transition tests for `unknown`, `ready`, `degraded`,
+- [x] Add availability transition tests for `unknown`, `ready`, `degraded`,
   `unavailable`, `disabled`, timestamp updates, stale-to-`unknown`, missing
   capability endpoint, missing optional capability, and recovery.
-- [ ] Implement the constrained client as one application-lifetime
+- [x] Implement the constrained client as one application-lifetime
   `httpx.AsyncClient` with per-target credentials and verified TLS. Routers call
   this client directly (no transport-interface seam; that arrives only with the
   `combined` follow-up feature). The upstream terminal WebSocket (Task 9) is
   opened separately with the `websockets` client using an `ssl.SSLContext` built
   from the same per-target TLS settings; httpx is HTTP-only.
-- [ ] Generate or preserve one correlation ID per gateway request and send it as
+- [x] Generate or preserve one correlation ID per gateway request and send it as
   `X-Correlation-ID`.
-- [ ] Add contract tests proving successful inventory/service/monitoring/audit
+- [x] Add contract tests proving successful inventory/service/monitoring/audit
   responses and normalized error responses include `X-Correlation-ID`.
-- [ ] Permit a single read-only retry only when failure is known to occur before
+- [x] Permit a single read-only retry only when failure is known to occur before
   dispatch. Never retry POST or DELETE.
-- [ ] Add bounded-concurrency periodic probes with jitter, `observed_at`, and
+- [x] Add bounded-concurrency periodic probes with jitter, `observed_at`, and
   `stale_after`; cancel the probe task during shutdown.
-- [ ] Verify gateway `/readyz` remains ready when one test agent is unavailable.
-- [ ] Run:
+- [x] Verify gateway `/readyz` remains ready when one test agent is unavailable.
+- [x] Run:
 
   ```bash
   cd backend
@@ -511,18 +511,18 @@ The installer-generated config file and `README` example must show
 - Test: `backend/tests/contract/test_agent_services_api.py`
 - Test: `backend/tests/integration/test_multi_agent_monitoring.py`
 
-- [ ] Write contract tests for every service route and the JSON monitoring
+- [x] Write contract tests for every service route and the JSON monitoring
   snapshot route using two fake agents with overlapping service IDs.
-- [ ] Implement explicit allowlisted route handlers that dispatch through the
+- [x] Implement explicit allowlisted route handlers that dispatch through the
   constrained HTTP client (Task 4); do not add a catch-all `{path:path}` reverse
   proxy.
-- [ ] Preserve safe upstream application errors and status codes.
-- [ ] Map connection/TLS/auth failures to `503`, protocol failures to `502`,
+- [x] Preserve safe upstream application errors and status codes.
+- [x] Map connection/TLS/auth failures to `503`, protocol failures to `502`,
   pre-dispatch timeouts to `504`, and uncertain mutation outcomes to `424`.
-- [ ] Create/finalize one durable gateway audit record around each privileged
+- [x] Create/finalize one durable gateway audit record around each privileged
   request.
-- [ ] Keep raw `/metrics` outside the gateway API.
-- [ ] Run:
+- [x] Keep raw `/metrics` outside the gateway API.
+- [x] Run:
 
   ```bash
   cd backend
@@ -543,16 +543,16 @@ The installer-generated config file and `README` example must show
 - Test: `frontend/tests/agent-context.test.tsx`
 - Test: `frontend/tests/agent-routing.test.tsx`
 
-- [ ] Write failing tests for startup selection, session storage fallback,
+- [x] Write failing tests for startup selection, session storage fallback,
   unavailable-agent rendering, and delayed old-agent responses.
-- [ ] Load safe agent summaries only after browser authentication.
-- [ ] Persist only `activeAgentId`; never persist agent URLs or credentials.
-- [ ] Add a monotonically increasing selection generation or abort controller so
+- [x] Load safe agent summaries only after browser authentication.
+- [x] Persist only `activeAgentId`; never persist agent URLs or credentials.
+- [x] Add a monotonically increasing selection generation or abort controller so
   stale requests cannot update active pages.
-- [ ] Pass `agentId` explicitly to service and overview API functions.
-- [ ] Display agent identity and status next to primary navigation and on every
+- [x] Pass `agentId` explicitly to service and overview API functions.
+- [x] Display agent identity and status next to primary navigation and on every
   destructive confirmation.
-- [ ] Run:
+- [x] Run:
 
   ```bash
   cd frontend
@@ -570,17 +570,17 @@ The installer-generated config file and `README` example must show
 - Test: `frontend/tests/metrics-page.test.tsx`
 - Test: `backend/tests/contract/test_monitoring_api_contract.py`
 
-- [ ] Change the monitoring page to consume the global active agent and
+- [x] Change the monitoring page to consume the global active agent and
   `/api/agents/{agent_id}/monitoring/snapshot`.
-- [ ] Remove browser forms that submit agent addresses and bearer keys.
-- [ ] Mark `/api/monitoring/machines` mutation routes deprecated for one
+- [x] Remove browser forms that submit agent addresses and bearer keys.
+- [x] Mark `/api/monitoring/machines` mutation routes deprecated for one
   compatibility release; prevent new frontend use. Do NOT remove the routes or
   `MachineRegistry` in this task — deletion is a separate step that requires the
   compatibility window to have elapsed (documented in Task 10 and the operations
   guide). Removing in the same task as deprecating contradicts the one-release
   window.
-- [ ] Verify the UI has exactly one agent selector.
-- [ ] Run:
+- [x] Verify the UI has exactly one agent selector.
+- [x] Run:
 
   ```bash
   cd backend
@@ -599,23 +599,23 @@ The installer-generated config file and `README` example must show
 - Test: `backend/tests/contract/test_agent_terminal_http_contract.py`
 - Test: `backend/tests/unit/test_gateway_terminal_tickets.py`
 
-- [ ] Write tests for list, create, detail, history, resize, connect-token, and
+- [x] Write tests for list, create, detail, history, resize, connect-token, and
   `DELETE` close with duplicate terminal IDs on different agents, plus a
   capacity test: connect-token returns HTTP `429 gateway_capacity_exceeded` when
   the ticket store is full, and no upstream ticket is requested in that case.
-- [ ] Add gateway audit tests for terminal create, resize, connect-token, close,
+- [x] Add gateway audit tests for terminal create, resize, connect-token, close,
   authorization denial, and pre-dispatch upstream failures.
-- [ ] Implement explicit terminal routes preserving current methods and status
+- [x] Implement explicit terminal routes preserving current methods and status
   codes.
-- [ ] On connect-token, reserve ticket-store capacity **before** requesting the
+- [x] On connect-token, reserve ticket-store capacity **before** requesting the
   upstream ticket; if full, return `429` without contacting the agent. Only
   after reserving, obtain the upstream ticket server-side and issue a distinct
   gateway ticket bound to actor, agent, terminal, intended WebSocket path, and
   expiry. Release the reservation on any failure (upstream error, timeout,
   validation).
-- [ ] Enforce bounded storage, one-use consumption, expiry, and complete
+- [x] Enforce bounded storage, one-use consumption, expiry, and complete
   redaction of both ticket values.
-- [ ] Run:
+- [x] Run:
 
   ```bash
   cd backend
@@ -636,32 +636,32 @@ The installer-generated config file and `README` example must show
 - Test: `backend/tests/integration/test_agent_terminal_websocket.py`
 - Test: `frontend/tests/terminal-agent-routing.test.tsx`
 
-- [ ] Add `websockets` as a runtime dependency in `pyproject.toml` (it is not
+- [x] Add `websockets` as a runtime dependency in `pyproject.toml` (it is not
   declared today and must not be assumed transitively from `uvicorn[standard]`).
   Extend the wheel METADATA assertion in `tests/integration/test_packaging_runtime.py`
   to verify that `Requires-Dist` in the built wheel includes `websockets` (runtime
   deps appear in wheel METADATA, not as packaged files).
-- [ ] Write backend tests for ticket mismatch, frame limits, backpressure,
+- [x] Write backend tests for ticket mismatch, frame limits, backpressure,
   upstream failure, paired-task cancellation, reconnect cursor, gateway
   shutdown, and rejection past the global active-proxy cap (close code `4429`).
-- [ ] Add WebSocket attach audit tests for successful attach, actor mismatch,
+- [x] Add WebSocket attach audit tests for successful attach, actor mismatch,
   invalid ticket, proxy-cap rejection, upstream establishment failure, and
   sanitized close categories.
-- [ ] Open the upstream WebSocket with the `websockets` client and an
+- [x] Open the upstream WebSocket with the `websockets` client and an
   `ssl.SSLContext` derived from the target's TLS config.
-- [ ] On attach, atomically acquire a proxy slot and then consume the gateway
+- [x] On attach, atomically acquire a proxy slot and then consume the gateway
   ticket; if the global active-proxy cap is reached, reject with `4429` before
   consuming the ticket so a valid ticket is not wasted. Release the slot on any
   failure path.
-- [ ] Implement the WebSocket contract with bounded per-direction queues, the
+- [x] Implement the WebSocket contract with bounded per-direction queues, the
   configurable global cap on concurrent proxied sockets and outstanding tickets,
   and sanitized close codes.
-- [ ] Add `agentId` to every frontend terminal API and WebSocket URL.
-- [ ] Key frontend terminal state by `(agentId, terminalId)` and remount panes
+- [x] Add `agentId` to every frontend terminal API and WebSocket URL.
+- [x] Key frontend terminal state by `(agentId, terminalId)` and remount panes
   when the active agent changes.
-- [ ] Cancel old sockets and resize timers before activating a new agent.
-- [ ] Verify switching agents cannot send input to the previous terminal.
-- [ ] Run:
+- [x] Cancel old sockets and resize timers before activating a new agent.
+- [x] Verify switching agents cannot send input to the previous terminal.
+- [x] Run:
 
   ```bash
   cd backend
@@ -686,21 +686,21 @@ The installer-generated config file and `README` example must show
 - Test: `backend/tests/integration/test_agent_audit_routing.py`
 - Test: `backend/tests/integration/test_mixed_agent_versions.py`
 
-- [ ] Add agent-scoped audit queries and a separate gateway audit view; do not
+- [x] Add agent-scoped audit queries and a separate gateway audit view; do not
   merge or sort multiple remote histories in the first release.
-- [ ] Add tests for correlation IDs across gateway and agent events and for
+- [x] Add tests for correlation IDs across gateway and agent events and for
   secret exclusion in browser payloads, gateway logs, agent logs, audit rows,
   metrics, WebSocket close reasons, and frontend state snapshots.
-- [ ] Add mixed-version tests that disable missing capabilities and reject
+- [x] Add mixed-version tests that disable missing capabilities and reject
   unsupported API versions.
-- [ ] Extend `start.sh` with explicit `agent` and `control-plane` development
+- [x] Extend `start.sh` with explicit `agent` and `control-plane` development
   commands that honor configured bind and port values. (`combined` is deferred
   to feature `003`.)
-- [ ] Document TLS provisioning, per-agent token files, migration from the old
+- [x] Document TLS provisioning, per-agent token files, migration from the old
   machine registry, rollback to `agent` mode, gateway outage recovery, and the
   post-compatibility-release follow-up that removes deprecated
   `/api/monitoring/machines` mutation routes.
-- [ ] Run full verification:
+- [x] Run full verification:
 
   ```bash
   cd backend
@@ -717,20 +717,20 @@ The installer-generated config file and `README` example must show
 
 ## Completion Gate
 
-- [ ] The [requirements checklist](checklists/requirements.md) remains satisfied.
-- [ ] All feature `001` contract tests pass in `agent` mode; original assertions
+- [x] The [requirements checklist](checklists/requirements.md) remains satisfied.
+- [x] All feature `001` contract tests pass in `agent` mode; original assertions
   and external behavior are preserved (test infrastructure such as fixtures may
   be adjusted as needed by Task 0).
-- [ ] Security review finds no browser-visible agent token or upstream ticket.
-- [ ] Gateway audit survives restart and covers pre-dispatch failures.
-- [ ] One unavailable agent does not affect another agent or gateway readiness.
-- [ ] Service mutations are never automatically retried.
-- [ ] Duplicate terminal IDs across agents remain isolated end to end.
-- [ ] Rollback to single-agent operation is documented and tested.
-- [ ] Agent audit survives restart (Task 0), satisfying `001` FR-021/FR-026.
-- [ ] Agent and control-plane databases never contain each other's tables.
-- [ ] Connect-token returns `429` when the ticket store is full without
+- [x] Security review finds no browser-visible agent token or upstream ticket.
+- [x] Gateway audit survives restart and covers pre-dispatch failures.
+- [x] One unavailable agent does not affect another agent or gateway readiness.
+- [x] Service mutations are never automatically retried.
+- [x] Duplicate terminal IDs across agents remain isolated end to end.
+- [x] Rollback to single-agent operation is documented and tested.
+- [x] Agent audit survives restart (Task 0), satisfying `001` FR-021/FR-026.
+- [x] Agent and control-plane databases never contain each other's tables.
+- [x] Connect-token returns `429` when the ticket store is full without
   contacting the agent; the WS attach rejects past the cap with `4429` without
   wasting a valid ticket or growing memory unboundedly.
-- [ ] A config with `mode: combined` fails Pydantic validation; `combined` is not
+- [x] A config with `mode: combined` fails Pydantic validation; `combined` is not
   in the enum and never reaches application startup.

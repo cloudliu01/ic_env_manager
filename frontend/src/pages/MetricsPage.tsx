@@ -1,76 +1,60 @@
-import { useEffect, useMemo, useState } from 'react';
-import { addMachine, deleteMachine, getMachineSnapshot, HostSnapshot, listMachines, MachineCreateRequest, MachineSummary } from '../api/monitoring';
+import { useEffect, useRef, useState } from 'react';
+import { getAgentMonitoringSnapshot, HostSnapshot } from '../api/monitoring';
+import { agentSupports, useActiveAgent } from '../agents/AgentContext';
 import { DiskTable } from '../components/monitoring/DiskTable';
 import { formatBytes, formatDuration, formatPercent } from '../components/monitoring/format';
-import { MachineForm } from '../components/monitoring/MachineForm';
-import { MachineSelector } from '../components/monitoring/MachineSelector';
 import { MetricCard } from '../components/monitoring/MetricCard';
 
 const REFRESH_MS = 5000;
 
 export function MetricsPage() {
-  const [machines, setMachines] = useState<MachineSummary[]>([]);
-  const [selectedId, setSelectedId] = useState('local');
+  const { activeAgent, activeAgentId } = useActiveAgent();
+  const supportsMonitoring = agentSupports(activeAgent, 'monitoring.snapshot.v1');
   const [snapshot, setSnapshot] = useState<HostSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const requestGeneration = useRef(0);
 
-  const selectedMachine = useMemo(
-    () => machines.find((machine) => machine.id === selectedId) ?? machines[0],
-    [machines, selectedId],
-  );
+  async function loadSnapshot(agentId = activeAgentId, signal?: AbortSignal) {
+    const generation = requestGeneration.current + 1;
+    requestGeneration.current = generation;
+    if (!agentId || !supportsMonitoring) {
+      setSnapshot(null);
+      setError(null);
+      setLoading(false);
+      return;
+    }
 
-  async function loadMachines() {
-    const items = await listMachines();
-    setMachines(items);
-    setSelectedId((current) => (items.some((machine) => machine.id === current) ? current : 'local'));
-  }
-
-  async function loadSnapshot(machineId = selectedId) {
     setLoading(true);
     setError(null);
     try {
-      setSnapshot(await getMachineSnapshot(machineId));
+      const nextSnapshot = await getAgentMonitoringSnapshot(agentId, signal ? { signal } : undefined);
+      if (requestGeneration.current === generation) {
+        setSnapshot(nextSnapshot);
+      }
     } catch (err) {
-      setError((err as Error).message);
+      if ((err as Error).name !== 'AbortError' && requestGeneration.current === generation) {
+        setSnapshot(null);
+        setError((err as Error).message);
+      }
     } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    loadMachines()
-      .then(() => loadSnapshot('local'))
-      .catch((err: Error) => {
-        setError(err.message);
+      if (requestGeneration.current === generation) {
         setLoading(false);
-      });
-  }, []);
+      }
+    }
+  }
 
   useEffect(() => {
-    if (!selectedId) {
-      return;
-    }
-    void loadSnapshot(selectedId);
+    const controller = new AbortController();
+    void loadSnapshot(activeAgentId, controller.signal);
     const timer = window.setInterval(() => {
-      void loadSnapshot(selectedId);
+      void loadSnapshot(activeAgentId);
     }, REFRESH_MS);
-    return () => window.clearInterval(timer);
-  }, [selectedId]);
-
-  async function handleAdd(machine: MachineCreateRequest) {
-    const created = await addMachine(machine);
-    await loadMachines();
-    setSelectedId(created.id);
-  }
-
-  async function handleDelete(machineId: string) {
-    await deleteMachine(machineId);
-    await loadMachines();
-    if (selectedId === machineId) {
-      setSelectedId('local');
-    }
-  }
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [activeAgentId]);
 
   const rootDisk = snapshot?.disks.find((disk) => disk.mount === '/') ?? snapshot?.disks[0];
 
@@ -80,21 +64,23 @@ export function MetricsPage() {
         <div>
           <p className="eyebrow">Host monitoring</p>
           <h2>Machine telemetry</h2>
-          <p>Track CPU, memory, disk, uptime, and network activity across local and remote agents.</p>
+          <p>Track CPU, memory, disk, uptime, and network activity for the selected agent.</p>
         </div>
         <div className="monitoring-actions">
-          <MachineSelector machines={machines} selectedId={selectedId} onSelect={setSelectedId} />
-          <button type="button" onClick={() => void loadSnapshot(selectedId)}>Refresh</button>
+          <span className="machine-selector">Agent: {activeAgent?.name ?? activeAgentId ?? 'none'}</span>
+          <button type="button" disabled={!activeAgentId || !supportsMonitoring} onClick={() => void loadSnapshot(activeAgentId)}>Refresh</button>
         </div>
       </header>
 
+      {!activeAgentId ? <p role="status" className="monitoring-empty">No active agent selected.</p> : null}
+      {activeAgentId && !supportsMonitoring ? <p role="status" className="monitoring-empty">Selected agent does not support monitoring.</p> : null}
       {error ? <p role="alert" className="monitoring-error">{error}</p> : null}
 
       <div className="monitoring-status-card">
         <div>
           <span className={`status-badge status-${snapshot?.status ?? 'loading'}`}>{snapshot?.status ?? 'loading'}</span>
-          <strong>{snapshot?.name ?? selectedMachine?.name ?? 'Machine'}</strong>
-          <span>{snapshot?.hostname ?? snapshot?.address ?? selectedMachine?.endpoint}</span>
+          <strong>{snapshot?.name ?? activeAgent?.name ?? 'Agent'}</strong>
+          <span>{snapshot?.hostname ?? snapshot?.address ?? activeAgentId ?? ''}</span>
         </div>
         <div>
           <span>Sampled</span>
@@ -139,25 +125,10 @@ export function MetricsPage() {
         </article>
       </div>
 
-      <div className="monitoring-grid">
-        <article className="monitoring-panel">
-          <h3>Configured machines</h3>
-          <div className="machine-list">
-            {machines.map((machine) => (
-              <div className="machine-row" key={machine.id}>
-                <div>
-                  <strong>{machine.name}</strong>
-                  <span>{machine.is_local ? 'local agent' : machine.endpoint}</span>
-                </div>
-                <button type="button" disabled={machine.is_local} onClick={() => void handleDelete(machine.id)}>Delete</button>
-              </div>
-            ))}
-          </div>
-        </article>
-        <article className="monitoring-panel">
-          <MachineForm onAdd={handleAdd} />
-        </article>
-      </div>
+      <article className="monitoring-panel">
+        <h3>Selected agent</h3>
+        <p className="monitoring-empty">Agent credentials are managed by the control plane configuration.</p>
+      </article>
     </section>
   );
 }

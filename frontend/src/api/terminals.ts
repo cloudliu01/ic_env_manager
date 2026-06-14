@@ -28,36 +28,48 @@ export type TerminalHistory = {
   output: string;
 };
 
-export async function listTerminals(): Promise<TerminalSession[]> {
-  const response = await apiClient.request<{ terminals: TerminalSession[] }>('/api/terminals');
+function terminalPath(agentId: string, path = ''): string {
+  return `/api/agents/${encodeURIComponent(agentId)}/terminals${path}`;
+}
+
+export async function listTerminals(agentId: string, init?: RequestInit): Promise<TerminalSession[]> {
+  const path = terminalPath(agentId);
+  const response = init
+    ? await apiClient.request<{ terminals: TerminalSession[] }>(path, init)
+    : await apiClient.request<{ terminals: TerminalSession[] }>(path);
   return response.terminals;
 }
 
-export async function createTerminal(title = 'Terminal'): Promise<TerminalSession> {
-  return apiClient.request<TerminalSession>('/api/terminals', {
+export async function createTerminal(agentId: string, title = 'Terminal'): Promise<TerminalSession> {
+  return apiClient.request<TerminalSession>(terminalPath(agentId), {
     method: 'POST',
     body: JSON.stringify({ title, rows: 24, cols: 80 }),
   });
 }
 
-export async function closeTerminal(id: string): Promise<TerminalSession> {
-  return apiClient.request<TerminalSession>(`/api/terminals/${id}`, { method: 'DELETE' });
+export async function closeTerminal(agentId: string, id: string): Promise<TerminalSession> {
+  return apiClient.request<TerminalSession>(terminalPath(agentId, `/${encodeURIComponent(id)}`), { method: 'DELETE' });
 }
 
-export async function resizeTerminal(id: string, rows: number, cols: number): Promise<void> {
-  await apiClient.request<void>(`/api/terminals/${id}/resize`, {
+export async function resizeTerminal(agentId: string, id: string, rows: number, cols: number): Promise<void> {
+  await apiClient.request<void>(terminalPath(agentId, `/${encodeURIComponent(id)}/resize`), {
     method: 'POST',
     body: JSON.stringify({ rows, cols }),
   });
 }
 
-export async function getTerminalHistory(id: string, cursor: number): Promise<TerminalHistory> {
-  return apiClient.request<TerminalHistory>(`/api/terminals/${id}/history?cursor=${cursor}`);
+export async function getTerminalHistory(agentId: string, id: string, cursor: number): Promise<TerminalHistory> {
+  return apiClient.request<TerminalHistory>(
+    terminalPath(agentId, `/${encodeURIComponent(id)}/history?cursor=${encodeURIComponent(String(cursor))}`),
+  );
 }
 
-export async function createConnectToken(id: string): Promise<{ ticket: string; expires_in_seconds: number }> {
+export async function createConnectToken(
+  agentId: string,
+  id: string,
+): Promise<{ ticket: string; expires_in_seconds: number }> {
   return apiClient.request<{ ticket: string; expires_in_seconds: number }>(
-    `/api/terminals/${id}/connect-token`,
+    terminalPath(agentId, `/${encodeURIComponent(id)}/connect-token`),
     { method: 'POST' },
   );
 }

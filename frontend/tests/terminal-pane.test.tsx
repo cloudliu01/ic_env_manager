@@ -1,6 +1,7 @@
 import { act, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { TerminalPane } from '../src/terminal/TerminalPane';
+import { apiClient } from '../src/api/client';
 import { createConnectToken, resizeTerminal } from '../src/api/terminals';
 
 const terminalWrites: string[] = [];
@@ -20,7 +21,10 @@ class MockWebSocket {
   closed = false;
   listeners: Record<string, Listener[]> = {};
 
-  constructor(public readonly url: string) {
+  constructor(
+    public readonly url: string,
+    public readonly protocols: string[] = [],
+  ) {
     MockWebSocket.instances.push(this);
   }
 
@@ -94,6 +98,7 @@ beforeEach(() => {
   terminalDisposables.length = 0;
   MockWebSocket.instances.length = 0;
   vi.clearAllMocks();
+  apiClient.setToken('secret-token');
 
   class MockResizeObserver {
     observe = vi.fn();
@@ -130,7 +135,7 @@ afterEach(() => {
 
 describe('TerminalPane', () => {
   it('opens xterm in an unpadded full-size mount element', async () => {
-    render(<TerminalPane terminalId="term-1" status="running" />);
+    render(<TerminalPane agentId="agent-a" terminalId="term-1" status="running" />);
 
     await waitFor(() => expect(terminalOpenElements).toHaveLength(1));
     expect(terminalOpenElements[0].classList.contains('terminal-mount')).toBe(true);
@@ -138,12 +143,13 @@ describe('TerminalPane', () => {
   });
 
   it('writes websocket output exactly once and sends user input', async () => {
-    render(<TerminalPane terminalId="term-1" status="running" />);
+    render(<TerminalPane agentId="agent-a" terminalId="term-1" status="running" />);
 
-    await waitFor(() => expect(createConnectToken).toHaveBeenCalledWith('term-1'));
+    await waitFor(() => expect(createConnectToken).toHaveBeenCalledWith('agent-a', 'term-1'));
     const socket = MockWebSocket.instances[0];
-    expect(socket.url).toContain('/ws/terminals/term-1?');
-    expect(socket.url).toContain('ticket=ticket-1');
+  expect(socket.url).toContain('/ws/agents/agent-a/terminals/term-1?');
+  expect(socket.url).toContain('ticket=ticket-1');
+  expect(socket.protocols).toEqual(['bearer.c2VjcmV0LXRva2Vu']);
 
     act(() => {
       socket.emit('open');
@@ -164,7 +170,7 @@ describe('TerminalPane', () => {
   });
 
   it('ignores binary websocket control frames instead of writing them as text', async () => {
-    render(<TerminalPane terminalId="term-1" status="running" />);
+    render(<TerminalPane agentId="agent-a" terminalId="term-1" status="running" />);
 
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
     const socket = MockWebSocket.instances[0];
@@ -182,7 +188,7 @@ describe('TerminalPane', () => {
   });
 
   it('ignores stale websocket messages after unmount', async () => {
-    const { unmount } = render(<TerminalPane terminalId="term-1" status="running" />);
+    const { unmount } = render(<TerminalPane agentId="agent-a" terminalId="term-1" status="running" />);
 
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
     const socket = MockWebSocket.instances[0];
@@ -199,7 +205,7 @@ describe('TerminalPane', () => {
 
   it('deduplicates terminal resize updates', async () => {
     vi.useFakeTimers();
-    render(<TerminalPane terminalId="term-1" status="running" />);
+    render(<TerminalPane agentId="agent-a" terminalId="term-1" status="running" />);
 
     act(() => {
       terminalResizes[0]({ rows: 24, cols: 80 });
@@ -208,7 +214,7 @@ describe('TerminalPane', () => {
     });
 
     expect(resizeTerminal).toHaveBeenCalledTimes(1);
-    expect(resizeTerminal).toHaveBeenCalledWith('term-1', 24, 80);
+    expect(resizeTerminal).toHaveBeenCalledWith('agent-a', 'term-1', 24, 80);
     vi.useRealTimers();
   });
 });

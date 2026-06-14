@@ -2,7 +2,7 @@ import importlib.util
 import sqlite3
 from pathlib import Path
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+MIGRATIONS_DIR = Path(__file__).parent.parent / "migrations"
 
 
 class MigrationError(Exception):

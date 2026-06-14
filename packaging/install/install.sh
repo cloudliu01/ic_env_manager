@@ -29,6 +29,7 @@ server:
 auth:
   mode: bearer_token
   token_file: /var/lib/ic-env-guard/token
+state_database: /var/lib/ic-env-guard/state.db
 metrics:
   enabled: true
   collect_interval_seconds: 10

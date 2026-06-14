@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { AppRoutes } from '../src/pages/AppRoutes';
 
 const terminalMounts = vi.hoisted(() => vi.fn());
+const CAPABILITIES = ['services.v1', 'terminals.v1', 'audit.v1', 'monitoring.snapshot.v1'];
 
 vi.mock('../src/auth/session', () => ({
   loadSessionToken: vi.fn(() => 'secret-token'),
@@ -13,7 +14,12 @@ vi.mock('../src/auth/session', () => ({
 vi.mock('../src/api/client', () => ({
   apiClient: {
     setToken: vi.fn(),
-    request: vi.fn(async () => ({ status: 'ready' })),
+    request: vi.fn(async (path: string) => {
+      if (path === '/api/agents') {
+        return { agents: [{ id: 'agent-a', name: 'Alpha', status: 'ready', enabled: true, capabilities: CAPABILITIES }] };
+      }
+      return { status: 'ready' };
+    }),
   },
 }));
 
@@ -46,6 +52,7 @@ describe('AppRoutes terminal navigation', () => {
   it('keeps the terminal page mounted when switching to another section and back', async () => {
     const user = userEvent.setup();
     render(<AppRoutes />);
+    await screen.findByLabelText('Active agent');
 
     await user.click(screen.getByRole('button', { name: 'Terminal' }));
     expect(screen.getByLabelText('Terminal page').textContent).toContain('true');

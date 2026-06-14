@@ -9,20 +9,25 @@ CONDA_ENV_NAME="${CONDA_ENV_NAME:-venv312}"
 DEV_DIR="${IC_ENV_GUARD_DEV_DIR:-/tmp/ic-env-guard-dev}"
 TOKEN_FILE="${IC_ENV_GUARD_TOKEN_FILE:-${DEV_DIR}/token}"
 CONFIG_FILE="${IC_ENV_GUARD_CONFIG:-${DEV_DIR}/config.yaml}"
+AGENT_TOKEN_FILE="${IC_ENV_GUARD_AGENT_TOKEN_FILE:-${DEV_DIR}/agent.token}"
+DEV_CONFIG_MODE="${IC_ENV_GUARD_MODE:-agent}"
 BACKEND_HOST="${IC_ENV_GUARD_HOST:-127.0.0.1}"
 BACKEND_PORT="${IC_ENV_GUARD_PORT:-8765}"
+AGENT_PORT="${IC_ENV_GUARD_AGENT_PORT:-8766}"
 FRONTEND_HOST="${IC_ENV_GUARD_FRONTEND_HOST:-127.0.0.1}"
 FRONTEND_PORT="${IC_ENV_GUARD_FRONTEND_PORT:-5173}"
 
 usage() {
   cat <<'EOF'
-Usage: ./start.sh <backend|frontend|all|config|help>
+Usage: ./start.sh <agent|control-plane|backend|frontend|all|config|help> [mode]
 
 Commands:
+  agent          Start an agent-mode backend with a mode-specific dev config.
+  control-plane  Start a control-plane backend with a mode-specific dev config.
   backend   Activate Conda, ensure dev token/config, install missing backend deps, start FastAPI.
   frontend  Ensure npm dependencies, start Vite dev server.
   all       Start backend in the background, then start frontend in the foreground.
-  config    Create/validate the local development config and print paths.
+  config    Create/validate the local development config and print paths. Optional mode: agent|control-plane.
   help      Show this help.
 
 Environment overrides:
@@ -30,12 +35,25 @@ Environment overrides:
   IC_ENV_GUARD_DEV_DIR           Dev config/token directory. Default: /tmp/ic-env-guard-dev
   IC_ENV_GUARD_TOKEN_FILE        Token file path. Default: $IC_ENV_GUARD_DEV_DIR/token
   IC_ENV_GUARD_CONFIG            Config path. Default: $IC_ENV_GUARD_DEV_DIR/config.yaml
+  IC_ENV_GUARD_AGENT_TOKEN_FILE  Target agent token for control-plane dev. Default: $IC_ENV_GUARD_DEV_DIR/agent.token
+  IC_ENV_GUARD_MODE              Config mode for config/backend commands. Default: agent
   IC_ENV_GUARD_HOST              Backend host. Default: 127.0.0.1
   IC_ENV_GUARD_PORT              Backend port. Default: 8765
+  IC_ENV_GUARD_AGENT_PORT        Loopback target agent port for control-plane dev. Default: 8766
   IC_ENV_GUARD_FRONTEND_HOST     Frontend host. Default: 127.0.0.1
   IC_ENV_GUARD_FRONTEND_PORT     Frontend port. Default: 5173
   SKIP_INSTALL=1                 Skip automatic pip/npm dependency installation checks.
 EOF
+}
+
+use_mode_defaults() {
+  DEV_CONFIG_MODE="$1"
+  if [[ -z "${IC_ENV_GUARD_CONFIG:-}" ]]; then
+    CONFIG_FILE="${DEV_DIR}/${DEV_CONFIG_MODE}.yaml"
+  fi
+  if [[ -z "${IC_ENV_GUARD_TOKEN_FILE:-}" ]]; then
+    TOKEN_FILE="${DEV_DIR}/${DEV_CONFIG_MODE}.token"
+  fi
 }
 
 activate_backend_env() {
@@ -66,8 +84,40 @@ PY
     chmod 0600 "${TOKEN_FILE}"
   fi
 
+  if [[ "${DEV_CONFIG_MODE}" == "control-plane" && ! -f "${AGENT_TOKEN_FILE}" ]]; then
+    umask 077
+    python - <<'PY' > "${AGENT_TOKEN_FILE}"
+import secrets
+print(secrets.token_urlsafe(32))
+PY
+    chmod 0600 "${AGENT_TOKEN_FILE}"
+  fi
+
   if [[ ! -f "${CONFIG_FILE}" ]]; then
-    cat > "${CONFIG_FILE}" <<YAML
+    if [[ "${DEV_CONFIG_MODE}" == "control-plane" ]]; then
+      cat > "${CONFIG_FILE}" <<YAML
+mode: control-plane
+server:
+  bind: ${BACKEND_HOST}
+  port: ${BACKEND_PORT}
+  remote_bind_enabled: false
+auth:
+  mode: bearer_token
+  token_file: ${TOKEN_FILE}
+development:
+  allow_insecure_http: true
+control_plane:
+  audit_database: ${DEV_DIR}/control-plane.db
+agents:
+  - id: local-agent
+    name: Local development agent
+    base_url: http://${BACKEND_HOST}:${AGENT_PORT}
+    token_file: ${AGENT_TOKEN_FILE}
+    enabled: true
+YAML
+    else
+      cat > "${CONFIG_FILE}" <<YAML
+mode: agent
 server:
   bind: ${BACKEND_HOST}
   port: ${BACKEND_PORT}
@@ -78,16 +128,22 @@ auth:
 metrics:
   enabled: true
   collect_interval_seconds: 10
+state_database: ${DEV_DIR}/state.db
 terminal:
   idle_timeout_minutes: 60
   replay_buffer_bytes: 2097152
   exited_retention_minutes: 30
 services: []
 YAML
+    fi
     chmod 0600 "${CONFIG_FILE}"
   fi
 
+  echo "Dev mode:   ${DEV_CONFIG_MODE}"
   echo "Dev token:  ${TOKEN_FILE}"
+  if [[ "${DEV_CONFIG_MODE}" == "control-plane" ]]; then
+    echo "Agent token: ${AGENT_TOKEN_FILE}"
+  fi
   echo "Dev config: ${CONFIG_FILE}"
 }
 
@@ -105,6 +161,8 @@ import psutil
 import prometheus_client
 import pydantic
 import sqlalchemy
+import httpx
+import websockets
 import yaml
 PY
   then
@@ -201,6 +259,14 @@ start_all() {
 
 command="${1:-help}"
 case "${command}" in
+  agent)
+    use_mode_defaults agent
+    start_backend
+    ;;
+  control-plane)
+    use_mode_defaults control-plane
+    start_backend
+    ;;
   backend)
     start_backend
     ;;
@@ -211,6 +277,9 @@ case "${command}" in
     start_all
     ;;
   config)
+    if [[ "${2:-}" == "agent" || "${2:-}" == "control-plane" ]]; then
+      use_mode_defaults "$2"
+    fi
     activate_backend_env
     ensure_dev_config
     ensure_backend_deps

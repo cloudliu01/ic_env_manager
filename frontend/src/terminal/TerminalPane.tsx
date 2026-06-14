@@ -3,9 +3,11 @@ import { Terminal } from 'xterm';
 import 'xterm/css/xterm.css';
 import { FitAddon } from '@xterm/addon-fit';
 import { createConnectToken, resizeTerminal } from '../api/terminals';
+import { apiClient } from '../api/client';
 import { terminalWriter } from './terminalWriter';
 
 export type TerminalPaneProps = {
+  agentId: string;
   terminalId: string;
   initialCursor?: number;
   status?: string;
@@ -14,13 +16,14 @@ export type TerminalPaneProps = {
 
 type ConnectionState = 'connecting' | 'connected' | 'disconnected' | 'closed' | 'error';
 
-function terminalWebSocketUrl(terminalId: string, ticket: string, cursor: number): string {
+function terminalWebSocketUrl(agentId: string, terminalId: string, ticket: string, cursor: number): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const params = new URLSearchParams({ ticket, cursor: String(cursor) });
-  return `${protocol}//${window.location.host}/ws/terminals/${terminalId}?${params.toString()}`;
+  return `${protocol}//${window.location.host}/ws/agents/${encodeURIComponent(agentId)}/terminals/${encodeURIComponent(terminalId)}?${params.toString()}`;
 }
 
 export function TerminalPane({
+  agentId,
   terminalId,
   initialCursor = 0,
   status = 'running',
@@ -42,7 +45,7 @@ export function TerminalPane({
 
   useEffect(() => {
     cursorRef.current = initialCursor;
-  }, [initialCursor, terminalId]);
+  }, [initialCursor, agentId, terminalId]);
 
   useEffect(() => {
     if (!containerRef.current || terminalRef.current) {
@@ -99,7 +102,7 @@ export function TerminalPane({
       }
       fit.fit();
       lastResizeRef.current = { rows: terminal.rows, cols: terminal.cols };
-      void resizeTerminal(terminalId, terminal.rows, terminal.cols);
+      void resizeTerminal(agentId, terminalId, terminal.rows, terminal.cols);
     };
 
     fitTerminal();
@@ -130,7 +133,7 @@ export function TerminalPane({
       fitRef.current = null;
       writerRef.current = null;
     };
-  }, []);
+  }, [agentId, terminalId]);
 
   useEffect(() => {
     const becameActive = active && !wasActiveRef.current;
@@ -152,10 +155,10 @@ export function TerminalPane({
       fit.fit();
       terminal.focus();
       lastResizeRef.current = { rows: terminal.rows, cols: terminal.cols };
-      void resizeTerminal(terminalId, terminal.rows, terminal.cols);
+      void resizeTerminal(agentId, terminalId, terminal.rows, terminal.cols);
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [active, terminalId]);
+  }, [active, agentId, terminalId]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
@@ -173,7 +176,7 @@ export function TerminalPane({
         window.clearTimeout(resizeDebounceRef.current);
       }
       resizeDebounceRef.current = window.setTimeout(() => {
-        void resizeTerminal(terminalId, size.rows, size.cols);
+        void resizeTerminal(agentId, terminalId, size.rows, size.cols);
       }, 100);
     });
 
@@ -184,7 +187,7 @@ export function TerminalPane({
         resizeDebounceRef.current = null;
       }
     };
-  }, [terminalId]);
+  }, [agentId, terminalId]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
@@ -209,12 +212,15 @@ export function TerminalPane({
     async function connect() {
       setConnectionState('connecting');
       try {
-        const { ticket } = await createConnectToken(terminalId);
+        const { ticket } = await createConnectToken(agentId, terminalId);
         if (!isCurrentConnection()) {
           return;
         }
 
-        socket = new WebSocket(terminalWebSocketUrl(terminalId, ticket, cursorRef.current));
+        socket = new WebSocket(
+          terminalWebSocketUrl(agentId, terminalId, ticket, cursorRef.current),
+          apiClient.webSocketProtocols(),
+        );
         socket.binaryType = 'arraybuffer';
         if (!isCurrentConnection()) {
           socket.close();
@@ -278,7 +284,7 @@ export function TerminalPane({
         socketRef.current = null;
       }
     };
-  }, [terminalId, status]);
+  }, [agentId, terminalId, status]);
 
   return (
     <div className="terminal-shell">

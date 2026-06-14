@@ -23,6 +23,14 @@ export class ApiClient {
     this.token = token;
   }
 
+  webSocketProtocols(): string[] {
+    if (!this.token) {
+      return [];
+    }
+    const encoded = btoa(this.token).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    return [`bearer.${encoded}`];
+  }
+
   async request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const headers = new Headers(init.headers);
     headers.set('Accept', 'application/json');

@@ -8,15 +8,22 @@ export type ServiceSummary = {
   allowed_operations: string[];
 };
 
-export async function listServices(): Promise<ServiceSummary[]> {
-  const response = await apiClient.request<{ services: ServiceSummary[] }>('/api/services');
+function agentPath(agentId: string, path: string): string {
+  return `/api/agents/${encodeURIComponent(agentId)}${path}`;
+}
+
+export async function listServices(agentId: string, init?: RequestInit): Promise<ServiceSummary[]> {
+  const path = agentPath(agentId, '/services');
+  const response = init
+    ? await apiClient.request<{ services: ServiceSummary[] }>(path, init)
+    : await apiClient.request<{ services: ServiceSummary[] }>(path);
   return response.services;
 }
 
-export async function startService(id: string) {
-  return apiClient.request(`/api/services/${id}/start`, { method: 'POST' });
+export async function startService(agentId: string, id: string) {
+  return apiClient.request(agentPath(agentId, `/services/${encodeURIComponent(id)}/start`), { method: 'POST' });
 }
 
-export async function stopService(id: string) {
-  return apiClient.request(`/api/services/${id}/stop`, { method: 'POST' });
+export async function stopService(agentId: string, id: string) {
+  return apiClient.request(agentPath(agentId, `/services/${encodeURIComponent(id)}/stop`), { method: 'POST' });
 }

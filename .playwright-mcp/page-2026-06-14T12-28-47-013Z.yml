@@ -1,0 +1,6 @@
+- main [ref=e3]:
+  - heading "IC Design Environment Guard" [level=1] [ref=e4]
+  - generic [ref=e5]:
+    - text: Generated local bearer token
+    - textbox "Generated local bearer token" [ref=e6]
+    - button "Sign in" [ref=e7] [cursor=pointer]

@@ -1,13 +1,13 @@
 import importlib.util
 import sqlite3
-from pathlib import Path
 
 import pytest
 
 from ic_env_guard.db.audit import AuditEventCreate, AuditRepository
+from ic_env_guard.db.migrations import MIGRATIONS_DIR
 from ic_env_guard.terminal.manager import TerminalManager
 
-_MIGRATION_PATH = Path(__file__).resolve().parents[2] / "migrations" / "0001_initial.py"
+_MIGRATION_PATH = MIGRATIONS_DIR / "0001_initial.py"
 _SPEC = importlib.util.spec_from_file_location("migration_0001_initial", _MIGRATION_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 initial_migration = importlib.util.module_from_spec(_SPEC)

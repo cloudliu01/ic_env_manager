@@ -5,7 +5,7 @@ import { TerminalPage } from '../src/pages/TerminalPage';
 
 vi.mock('../src/api/terminals', () => ({
   listTerminals: vi.fn(async () => []),
-  createTerminal: vi.fn(async () => ({
+  createTerminal: vi.fn(async (_agentId: string) => ({
     id: 'term-1',
     owner: 'local-admin',
     title: 'Terminal 1',
@@ -41,9 +41,14 @@ vi.mock('../src/api/terminals', () => ({
   })),
 }));
 
+vi.mock('../src/agents/AgentContext', () => ({
+  agentSupports: () => true,
+  useActiveAgent: () => ({ activeAgent: { id: 'agent-a', capabilities: ['terminals.v1'] }, activeAgentId: 'agent-a' }),
+}));
+
 vi.mock('../src/terminal/TerminalPane', () => ({
-  TerminalPane: ({ terminalId, initialCursor }: { terminalId: string; initialCursor?: number }) => (
-    <div aria-label="Terminal">terminal pane for {terminalId} cursor {initialCursor}</div>
+  TerminalPane: ({ agentId, terminalId, initialCursor }: { agentId: string; terminalId: string; initialCursor?: number }) => (
+    <div aria-label="Terminal">terminal pane for {agentId} {terminalId} cursor {initialCursor}</div>
   ),
 }));
 
@@ -56,6 +61,6 @@ describe('TerminalPage', () => {
 
     expect(await screen.findByRole('tab', { name: /terminal 1/i })).toBeTruthy();
     expect(screen.getByLabelText('Terminal')).toBeTruthy();
-    expect(screen.getByText(/terminal pane for term-1 cursor 1234/i)).toBeTruthy();
+    expect(screen.getByText(/terminal pane for agent-a term-1 cursor 1234/i)).toBeTruthy();
   });
 });

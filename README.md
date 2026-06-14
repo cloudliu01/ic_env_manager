@@ -14,7 +14,7 @@ The post-MVP multi-agent control-plane design is:
 - [specs/002-multi-agent-control-plane/architecture.md](specs/002-multi-agent-control-plane/architecture.md)
 - [specs/002-multi-agent-control-plane/plan.md](specs/002-multi-agent-control-plane/plan.md)
 
-Operational docs live in [docs/operations/](docs/operations/), including lifecycle, recovery, service configuration, Prometheus, terminal safety, and validation notes.
+Operational docs live in [docs/operations/](docs/operations/), including lifecycle, recovery, service configuration, Prometheus, terminal safety, control-plane operations, and validation notes.
 
 ## Repository Layout
 
@@ -39,10 +39,13 @@ specs/002-multi-agent-control-plane/  Multi-agent spec, architecture, contracts,
 Use [start.sh](start.sh) from the repository root for common local development workflows. The wrapper initializes the needed environment before starting the selected process.
 
 ```bash
+./start.sh agent     # activate Conda, create/validate agent-mode dev config, start FastAPI on 127.0.0.1:8765
+./start.sh control-plane  # create/validate control-plane dev config, start the gateway on 127.0.0.1:8765
 ./start.sh backend   # activate Conda, create/validate dev config, start FastAPI on 127.0.0.1:8765
 ./start.sh frontend  # install npm dependencies if needed, start Vite on 127.0.0.1:5173
 ./start.sh all       # start backend in the background, then frontend in the foreground
-./start.sh config    # create/validate the local dev token and config only
+./start.sh config    # create/validate the local agent-mode dev token and config only
+./start.sh config control-plane  # create/validate the local control-plane dev token and config only
 ./start.sh help      # show wrapper options
 ```
 
@@ -51,6 +54,8 @@ The wrapper creates local development files by default under:
 ```text
 /tmp/ic-env-guard-dev/token
 /tmp/ic-env-guard-dev/config.yaml
+/tmp/ic-env-guard-dev/agent.yaml
+/tmp/ic-env-guard-dev/control-plane.yaml
 ```
 
 Useful overrides:
@@ -58,6 +63,7 @@ Useful overrides:
 ```bash
 CONDA_ENV_NAME=venv312 ./start.sh backend
 IC_ENV_GUARD_PORT=9000 ./start.sh backend
+IC_ENV_GUARD_AGENT_PORT=8766 ./start.sh control-plane
 IC_ENV_GUARD_FRONTEND_PORT=3000 ./start.sh frontend
 SKIP_INSTALL=1 ./start.sh all
 ```
@@ -124,6 +130,7 @@ server:
 auth:
   mode: bearer_token
   token_file: /tmp/ic-env-guard-dev/token
+state_database: /tmp/ic-env-guard-dev/state.db
 metrics:
   enabled: true
   collect_interval_seconds: 10
@@ -167,13 +174,17 @@ python -m ic_env_guard.systemd.cli validate /tmp/ic-env-guard-dev/config.yaml
 
 See [docs/operations/service-config.md](docs/operations/service-config.md) for the service configuration reference.
 
+For multi-agent deployments, run each managed host in `agent` mode and run a separate `control-plane` mode process with server-side per-agent token files. The control plane owns only the gateway registry, gateway audit database, and routed browser entry point; host services, terminals, Prometheus `/metrics`, and local audit remain on each agent. See [docs/operations/control-plane.md](docs/operations/control-plane.md) and [docs/operations/security-review.md](docs/operations/security-review.md) before exposing a control plane beyond localhost.
+
 ## Running the Backend Locally
 
 Preferred local command:
 
 ```bash
-./start.sh backend
+./start.sh agent
 ```
+
+`./start.sh backend` remains available as the generic backend command and uses `IC_ENV_GUARD_MODE` or the existing config path when supplied.
 
 The current development app factory requires a bearer token file or token to be supplied. If you need to start it manually instead of using the wrapper, run:
 
@@ -317,6 +328,6 @@ Local scrapes are allowed by default. Remote metrics exposure must be explicitly
 
 ## Security and Scope Boundaries
 
-The MVP remains a local web application served by a Linux host agent. It does not include a desktop wrapper, custom SSH server, custom time-series database, PromQL, alerting engine, unrestricted command API, cloud control plane, Windows PTY support, or multi-host orchestration.
+The MVP remains a local web application served by Linux host agents and an optional same-origin control plane. It does not include a desktop wrapper, custom SSH server, custom time-series database, PromQL, alerting engine, unrestricted command API, cloud control plane, Windows PTY support, or discovery-based/unrestricted multi-host orchestration.
 
 Security review guidance is in [docs/operations/security-review.md](docs/operations/security-review.md). Terminal privacy guidance is in [docs/operations/terminal-safety.md](docs/operations/terminal-safety.md).

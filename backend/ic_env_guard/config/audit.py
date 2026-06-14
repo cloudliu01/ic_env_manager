@@ -1,10 +1,10 @@
 from pathlib import Path
 
-from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from ic_env_guard.db.agent_state import AgentStateRepository
-from ic_env_guard.db.session import Base
+from ic_env_guard.db.migrations import run_migrations
+from ic_env_guard.db.session import create_sqlite_engine
 
 
 def audit_config_load(
@@ -29,8 +29,8 @@ def audit_config_load_to_db(
     config_hash: str | None = None,
     failure_reason: str | None = None,
 ) -> None:
-    engine = create_engine(f"sqlite:///{db_path}", future=True)
-    Base.metadata.create_all(engine)
+    run_migrations(db_path)
+    engine = create_sqlite_engine(db_path)
     session = sessionmaker(bind=engine, future=True)()
     try:
         audit_config_load(session, config_path, result, config_hash, failure_reason)

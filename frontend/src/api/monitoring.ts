@@ -1,23 +1,5 @@
 import { apiClient } from './client';
 
-export type MachineSummary = {
-  id: string;
-  name: string;
-  address: string;
-  port: number | null;
-  endpoint: string;
-  is_local: boolean;
-  created_at: string | null;
-  updated_at: string | null;
-};
-
-export type MachineCreateRequest = {
-  name?: string;
-  address: string;
-  port: number;
-  key: string;
-};
-
 export type MetricBytes = {
   used_bytes: number;
   total_bytes: number;
@@ -63,22 +45,9 @@ export type HostSnapshot = {
   uptime_seconds: number;
 };
 
-export async function listMachines(): Promise<MachineSummary[]> {
-  const response = await apiClient.request<{ machines: MachineSummary[] }>('/api/monitoring/machines');
-  return response.machines;
-}
-
-export async function addMachine(machine: MachineCreateRequest): Promise<MachineSummary> {
-  return apiClient.request<MachineSummary>('/api/monitoring/machines', {
-    method: 'POST',
-    body: JSON.stringify(machine),
-  });
-}
-
-export async function deleteMachine(machineId: string): Promise<void> {
-  await apiClient.request<void>(`/api/monitoring/machines/${machineId}`, { method: 'DELETE' });
-}
-
-export async function getMachineSnapshot(machineId: string): Promise<HostSnapshot> {
-  return apiClient.request<HostSnapshot>(`/api/monitoring/machines/${machineId}/snapshot`);
+export async function getAgentMonitoringSnapshot(
+  agentId: string,
+  init: RequestInit = {},
+): Promise<HostSnapshot> {
+  return apiClient.request<HostSnapshot>(`/api/agents/${encodeURIComponent(agentId)}/monitoring/snapshot`, init);
 }
