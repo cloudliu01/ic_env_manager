@@ -26,7 +26,7 @@ Commands:
   control-plane  Start a control-plane backend with a mode-specific dev config.
   backend   Activate Conda, ensure dev token/config, install missing backend deps, start FastAPI.
   frontend  Ensure npm dependencies, start Vite dev server.
-  all       Start backend in the background, then start frontend in the foreground.
+  all       Start local agent and control-plane in the background, then start frontend.
   config    Create/validate the local development config and print paths. Optional mode: agent|control-plane.
   help      Show this help.
 
@@ -139,6 +139,12 @@ YAML
     chmod 0600 "${CONFIG_FILE}"
   fi
 
+  if [[ "${DEV_CONFIG_MODE}" == "agent" ]] && ! grep -q '^state_database:' "${CONFIG_FILE}"; then
+    cat >> "${CONFIG_FILE}" <<YAML
+state_database: ${DEV_DIR}/state.db
+YAML
+  fi
+
   echo "Dev mode:   ${DEV_CONFIG_MODE}"
   echo "Dev token:  ${TOKEN_FILE}"
   if [[ "${DEV_CONFIG_MODE}" == "control-plane" ]]; then
@@ -245,15 +251,34 @@ PY
 }
 
 start_all() {
-  start_backend &
-  backend_pid=$!
+  local control_plane_port="${BACKEND_PORT}"
+  local agent_pid=""
+  local control_plane_pid=""
+
+  activate_backend_env
 
   cleanup() {
-    kill "${backend_pid}" >/dev/null 2>&1 || true
+    if [[ -n "${agent_pid}" ]]; then
+      kill "${agent_pid}" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${control_plane_pid}" ]]; then
+      kill "${control_plane_pid}" >/dev/null 2>&1 || true
+    fi
   }
   trap cleanup EXIT INT TERM
 
+  use_mode_defaults agent
+  BACKEND_PORT="${AGENT_PORT}"
+  start_backend &
+  agent_pid=$!
   wait_for_backend
+
+  use_mode_defaults control-plane
+  BACKEND_PORT="${control_plane_port}"
+  start_backend &
+  control_plane_pid=$!
+  wait_for_backend
+
   start_frontend
 }
 

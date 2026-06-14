@@ -14,9 +14,23 @@ import {
 } from '../src/api/terminals';
 import { AppRoutes } from '../src/pages/AppRoutes';
 
+type ApiErrorBody = {
+  error: string;
+  message: string;
+  correlation_id?: string;
+};
+
 const apiRequest = vi.hoisted(() => vi.fn());
 const setToken = vi.hoisted(() => vi.fn());
 const terminalMounts = vi.hoisted(() => vi.fn());
+const MockApiClientError = vi.hoisted(() => class ApiClientError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly body: ApiErrorBody,
+  ) {
+    super(body.message);
+  }
+});
 const CAPABILITIES = ['services.v1', 'terminals.v1', 'audit.v1', 'monitoring.snapshot.v1'];
 
 vi.mock('../src/auth/session', () => ({
@@ -24,6 +38,7 @@ vi.mock('../src/auth/session', () => ({
 }));
 
 vi.mock('../src/api/client', () => ({
+  ApiClientError: MockApiClientError,
   apiClient: {
     setToken,
     request: apiRequest,

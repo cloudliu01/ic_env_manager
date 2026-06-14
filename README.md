@@ -43,7 +43,7 @@ Use [start.sh](start.sh) from the repository root for common local development w
 ./start.sh control-plane  # create/validate control-plane dev config, start the gateway on 127.0.0.1:8765
 ./start.sh backend   # activate Conda, create/validate dev config, start FastAPI on 127.0.0.1:8765
 ./start.sh frontend  # install npm dependencies if needed, start Vite on 127.0.0.1:5173
-./start.sh all       # start backend in the background, then frontend in the foreground
+./start.sh all       # start local agent, control-plane, then frontend for multi-agent dev
 ./start.sh config    # create/validate the local agent-mode dev token and config only
 ./start.sh config control-plane  # create/validate the local control-plane dev token and config only
 ./start.sh help      # show wrapper options

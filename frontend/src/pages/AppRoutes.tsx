@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { apiClient } from '../api/client';
 import { AgentProvider, agentSupports, useActiveAgent } from '../agents/AgentContext';
 import { AgentSelector } from '../agents/AgentSelector';
-import { loadSessionToken } from '../auth/session';
+import { clearSessionToken, loadSessionToken } from '../auth/session';
 import { AuditStatusPage } from './AuditStatusPage';
 import { HostOverviewPage } from './HostOverviewPage';
 import { LoginPage } from './LoginPage';
@@ -12,6 +12,12 @@ import { TerminalPage } from './TerminalPage';
 
 export function AppRoutes() {
   const [actor, setActor] = useState<string | null>(null);
+
+  function handleAuthenticationExpired() {
+    clearSessionToken();
+    apiClient.setToken(null);
+    setActor(null);
+  }
 
   useEffect(() => {
     const token = loadSessionToken();
@@ -26,7 +32,7 @@ export function AppRoutes() {
   }
 
   return (
-    <AgentProvider>
+    <AgentProvider onAuthenticationExpired={handleAuthenticationExpired}>
       <AuthenticatedRoutes actor={actor} />
     </AgentProvider>
   );

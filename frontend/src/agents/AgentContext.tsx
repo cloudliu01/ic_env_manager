@@ -1,7 +1,12 @@
 import { createContext, ReactNode, useContext, useEffect, useMemo, useState } from 'react';
 import { AgentSummary, listAgents } from '../api/agents';
+import { ApiClientError } from '../api/client';
 
 const ACTIVE_AGENT_STORAGE_KEY = 'activeAgentId';
+
+export function clearActiveAgentSelection(): void {
+  window.sessionStorage.removeItem(ACTIVE_AGENT_STORAGE_KEY);
+}
 
 type AgentContextValue = {
   agents: AgentSummary[];
@@ -28,7 +33,7 @@ function chooseActiveAgentId(agents: AgentSummary[], storedId: string | null): s
     ?? null;
 }
 
-export function AgentProvider({ children }: { children: ReactNode }) {
+export function AgentProvider({ children, onAuthenticationExpired }: { children: ReactNode; onAuthenticationExpired?: () => void }) {
   const [agents, setAgents] = useState<AgentSummary[]>([]);
   const [activeAgentId, setActiveAgentIdState] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -48,16 +53,21 @@ export function AgentProvider({ children }: { children: ReactNode }) {
         if (nextId) {
           window.sessionStorage.setItem(ACTIVE_AGENT_STORAGE_KEY, nextId);
         } else {
-          window.sessionStorage.removeItem(ACTIVE_AGENT_STORAGE_KEY);
+          clearActiveAgentSelection();
         }
       })
-      .catch((err: Error) => {
+      .catch((err: unknown) => {
         if (!active) {
           return;
         }
-        setError(err.message);
+        if (err instanceof ApiClientError && err.status === 401 && onAuthenticationExpired) {
+          clearActiveAgentSelection();
+          onAuthenticationExpired();
+          return;
+        }
+        setError(err instanceof Error ? err.message : 'Unable to load agents');
         setActiveAgentIdState(null);
-        window.sessionStorage.removeItem(ACTIVE_AGENT_STORAGE_KEY);
+        clearActiveAgentSelection();
       })
       .finally(() => {
         if (active) {
@@ -68,7 +78,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
     return () => {
       active = false;
     };
-  }, []);
+  }, [onAuthenticationExpired]);
 
   function setActiveAgentId(agentId: string) {
     const nextId = agents.some((agent) => agent.id === agentId) ? agentId : null;
@@ -76,7 +86,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
     if (nextId) {
       window.sessionStorage.setItem(ACTIVE_AGENT_STORAGE_KEY, nextId);
     } else {
-      window.sessionStorage.removeItem(ACTIVE_AGENT_STORAGE_KEY);
+      clearActiveAgentSelection();
     }
   }
 
