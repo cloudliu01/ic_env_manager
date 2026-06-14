@@ -54,13 +54,16 @@ requires a transport abstraction underneath every resource router. Forcing that
 seam into this feature's routing for the lowest-value deployment is not
 worthwhile, so `combined` is split into a follow-up feature `003` that
 introduces a domain-typed transport (`ServiceTarget`, `TerminalTarget`,
-`MonitoringTarget`). The `mode` enum still accepts `combined`, but this feature
-rejects it at startup with a pointer to `003`.
+`MonitoringTarget`).
 
-Mode is explicit and defaults to `agent`, so existing single-host
-configurations and contracts are unchanged. An empty `agents` list in
-`control-plane` mode is valid but leaves no active agent; it does not silently
-create a self-referential target.
+`combined` is not in the `mode` enum for this feature. A config file with
+`mode: combined` fails Pydantic validation with a clear unknown-value error;
+it does not reach application startup. Feature `003` adds `combined` to the
+enum when it is implemented.
+
+Mode defaults to `agent`, so existing single-host configurations and contracts
+are unchanged. An empty `agents` list in `control-plane` mode is valid but
+leaves no active agent; it does not silently create a self-referential target.
 
 ## Component Boundaries
 
@@ -119,12 +122,17 @@ single source of truth is the control-plane migration; the ORM model maps the
 table and does not `create_all` it.
 
 Because the shared `db/migrations.py` runner applies every migration file to any
-database it is handed, the control plane uses its own migration directory and
-`run_control_plane_migrations()` runner. The two databases never receive each
-other's tables. This is separate from the `001` agent audit database, whose
-own durability defect (it was in-memory) is fixed as a prerequisite so the
-agent-audit view can meet the original `001` contract; see the implementation
-plan's Task 0.
+database it is handed, the control plane uses its own migration directory
+(`ic_env_guard/control_plane_migrations/`) and `run_control_plane_migrations()`
+runner. Both directories live inside the `ic_env_guard` package so they are
+included in the wheel without additional packaging configuration. The two
+databases never receive each other's tables. This is separate from the `001`
+agent audit database, whose own durability defect (it was in-memory) is fixed as
+a prerequisite so the agent-audit view can meet the original `001` contract; see
+the implementation plan's Task 0. As part of Task 0, the existing agent
+migrations are also moved from `backend/migrations/` into
+`ic_env_guard/migrations/` to fix a pre-existing packaging bug where `MIGRATIONS_DIR`
+resolved incorrectly after wheel install.
 
 Every privileged routing attempt is recorded even when DNS, TLS, authentication,
 or connection setup fails.
@@ -158,13 +166,16 @@ The mapping is bound to:
 It is consumed once. Restart invalidates gateway tickets but does not alter
 upstream terminal ownership.
 
-The WebSocket attach atomically acquires a proxy slot and then consumes the
-gateway ticket. If the global active-proxy cap is reached, the attach is
-rejected with close code `4429` before the ticket is consumed, so a valid ticket
-is not burned; the slot is released on every failure path. Together with the
-connect-token `429`, this bounds both outstanding tickets and concurrent sockets
-so a flood of terminals cannot exhaust gateway memory. The upstream socket is
-opened with the `websockets` client and verified TLS.
+The WebSocket attach calls `try_acquire_proxy_slot()` — an atomic operation that
+either reserves a slot under the global cap or fails immediately. If it fails,
+the attach is rejected with `4429` before touching the ticket store, so no valid
+ticket is consumed and no TOCTOU race exists between a pre-check and the actual
+acquire. After acquiring a slot, the gateway consumes the ticket; any failure
+releases the slot. Together with the connect-token `429` (which reserves ticket
+capacity before requesting the upstream ticket), this bounds both outstanding
+tickets and concurrent sockets so a flood of terminal connections cannot exhaust
+gateway memory. The upstream socket is opened with the `websockets` client and
+verified TLS.
 
 ## Configuration
 

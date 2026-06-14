@@ -118,17 +118,18 @@ validate that each agent's `/metrics` endpoint remains Prometheus compatible.
   selecting and operating multiple configured host agents.
 - **FR-002**: The host agent from feature `001` MUST remain independently
   deployable and its existing local API contracts MUST remain compatible.
-- **FR-003**: The system MUST define explicit `agent`, `control-plane`, and
-  `combined` runtime modes, with `agent` as the default so existing single-host
-  configurations and contracts are unaffected.
+- **FR-003**: The system MUST define `agent` and `control-plane` runtime modes,
+  with `agent` as the default so existing single-host configurations and
+  contracts are unaffected. `combined` is not in the config enum for this
+  feature; it will be added as a valid value when feature `003` implements it.
 - **FR-004**: `agent` mode MUST expose local host-agent resources and MUST NOT
   expose control-plane routing APIs.
 - **FR-005**: `control-plane` mode MUST expose gateway APIs and MUST NOT imply
   management of the control-plane host.
-- **FR-006**: `combined` mode (deferred to feature `003`) MAY manage the local
-  host, but local requests MUST resolve through an in-process transport, never
-  through HTTP or WebSocket self-proxying. This feature rejects `combined` at
-  startup with a pointer to `003`.
+- **FR-006**: When feature `003` adds `combined` mode, local requests MUST
+  resolve through an in-process transport, never through HTTP or WebSocket
+  self-proxying. This feature does not implement or validate `combined`; it is
+  simply not a recognized configuration value.
 - **FR-007**: All service, terminal, audit, and monitoring requests MUST resolve
   their target through one authoritative agent registry.
 - **FR-008**: Agent IDs MUST be unique, stable, URL-safe identifiers matching
@@ -241,8 +242,8 @@ upstream tickets, or unsanitized exception strings.
 - Generic reverse proxying of arbitrary agent paths
 - Raw Prometheus aggregation or a custom metrics store
 - Preserving live xterm buffers across agent switches in the first release
-- `combined` mode (deferred to follow-up feature `003`; the mode is
-  recognized but rejected at startup in this feature)
+- `combined` mode (follow-up feature `003`; `combined` is not a valid
+  configuration value in this feature)
 
 ## Success Criteria
 
@@ -276,8 +277,9 @@ upstream tickets, or unsanitized exception strings.
 - **SC-012**: Agent audit events survive process restart (prerequisite fix to
   `001`); control-plane gateway audit events survive restart independently in the
   dedicated control-plane database; the two databases do not share tables.
-- **SC-013**: Attempting to start in `combined` mode produces a clear startup
-  error pointing to follow-up feature `003` rather than partially initializing.
+- **SC-013**: A config file with `mode: combined` fails Pydantic validation with
+  a clear unknown-value error, since `combined` is not in the enum for this
+  feature; it does not reach application startup at all.
 
 ## Related Documents
 

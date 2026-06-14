@@ -8,7 +8,9 @@
 
 **Tech Stack:** Python 3.11+, FastAPI, httpx (upstream HTTP; promoted to a runtime dependency — it is test-only today), `websockets` (upstream WebSocket client, a new runtime dependency; httpx cannot act as a WS client), Pydantic, SQLAlchemy ORM, raw-`sqlite3` `.py` migrations (the `001` convention — not Alembic, despite the unused `alembic` pin in `pyproject.toml`), pytest, React, TypeScript, Vitest, xterm.js.
 
-**Migration isolation:** The existing `db/migrations.py` runner globs every `migrations/[0-9][0-9][0-9][0-9]_*.py` and applies all of them to whatever `db_path` it is handed ([migrations.py:45](../../backend/ic_env_guard/db/migrations.py#L45)). A `0003` file in that shared directory would therefore create control-plane tables in the agent DB and agent tables in the control-plane DB. The control plane uses its own migration directory and runner — `backend/control_plane_migrations/` with `run_control_plane_migrations()` — so the two databases never receive each other's schema.
+**Migration isolation and packaging:** The existing `db/migrations.py` runner globs every `migrations/[0-9][0-9][0-9][0-9]_*.py` and applies all of them to whatever `db_path` it is handed ([migrations.py:45](../../backend/ic_env_guard/db/migrations.py#L45)). A shared directory would cross-contaminate schemas. The control plane therefore uses its own migration directory and runner.
+
+Both migration directories live **inside** the `ic_env_guard` package — `ic_env_guard/migrations/` (existing, moved from top-level `backend/migrations/`) and `ic_env_guard/control_plane_migrations/` (new) — so they are included in the wheel by the existing `include = ["ic_env_guard*"]` rule. The top-level `backend/migrations/` currently referenced by `MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"` is a pre-existing packaging bug: that path resolves correctly from source but points to `site-packages/migrations/` after wheel install. Moving migration directories inside the package and updating the `MIGRATIONS_DIR` constant fixes both the new and pre-existing issue at once.
 
 **Audit persistence:** Two distinct problems, two distinct fixes.
 - The `001` audit store is built in `create_app()` against an in-memory `sqlite://` engine (`StaticPool`); both audit writes and the query API use it, so audit is lost on restart. This already violates `001` FR-021/FR-026 ("migration-managed local durable state"). Task 0 fixes it as a prerequisite, because the MVP 3 agent-audit view cannot meet the original contract on top of an ephemeral store.
@@ -74,12 +76,14 @@ backend/ic_env_guard/
 │   ├── agent_terminals.py
 │   ├── agent_terminal_ws.py
 │   └── control_plane_audit.py
-└── db/
-    ├── control_plane_audit.py
-    └── control_plane_migrations.py   # dedicated runner, separate from db/migrations.py
-
-backend/control_plane_migrations/     # control-plane-only migrations (isolated from migrations/)
-└── 0001_control_plane_audit.py
+├── db/
+│   ├── control_plane_audit.py
+│   └── control_plane_migrations.py   # dedicated runner, separate from db/migrations.py
+├── migrations/                        # moved from backend/migrations/ — now inside the package
+│   ├── 0001_initial.py
+│   └── 0002_state_audit_indexes.py
+└── control_plane_migrations/          # new, inside the package — picked up by "ic_env_guard*"
+    └── 0001_control_plane_audit.py
 
 frontend/src/
 ├── agents/
@@ -95,24 +99,44 @@ modules call those contracts rather than duplicating host process logic.
 ## Task 0: Fix Agent Durable Audit (Prerequisite)
 
 `001` requires audit to persist in migration-managed durable state (FR-021,
-FR-026), but `create_app()` currently wires both audit writes and the query API
-to an in-memory `sqlite://` engine, so audit is lost on restart. This must be
-fixed before the MVP 3 agent-audit view can meet the original contract; it is a
-correctness fix to `001`, not a `002` feature.
+FR-026), but `create_app()` wires both audit writes and the query API to an
+in-memory `sqlite://`/`StaticPool` engine, so audit is lost on restart. This
+must be fixed before the MVP 3 agent-audit view can meet the original contract.
+
+**The fix does NOT add a new migration.** `audit_events` already exists in
+`migrations/0001_initial.py` (line 46); the table is migration-managed. The
+defect is purely that `main.py` constructs an in-memory engine and calls
+`Base.metadata.create_all()` instead of pointing to the configured durable
+database path and running the existing migration runner.
 
 **Files:**
 
+- Move: `backend/migrations/` → `backend/ic_env_guard/migrations/`
+- Modify: `backend/ic_env_guard/db/migrations.py` (update `MIGRATIONS_DIR`)
+- Modify: `backend/ic_env_guard/config/audit.py` (update `MIGRATIONS_DIR` ref)
 - Modify: `backend/ic_env_guard/main.py`
-- Create: `backend/migrations/0003_audit_events.py`
+- Modify: `backend/ic_env_guard/config/models.py` (expose `state_database` path)
+- Modify: `backend/tests/integration/test_packaging_runtime.py`
 - Test: `backend/tests/integration/test_agent_audit_durability.py`
 
+- [ ] Move `backend/migrations/` to `backend/ic_env_guard/migrations/` so it is
+  included in the wheel by the `include = ["ic_env_guard*"]` rule. Update
+  `MIGRATIONS_DIR` in `db/migrations.py` from `parents[2] / "migrations"` to
+  `Path(__file__).parent.parent / "migrations"` (i.e. sibling of `db/` inside
+  the package). Verify the existing `0001`/`0002` migrations still apply cleanly.
 - [ ] Write a failing test that records audit events, restarts the app against
   the same database path, and asserts the events are still queryable.
-- [ ] Add a `0003` agent migration creating `audit_events` (the table is ORM-only
-  today) so it is migration-managed; the ORM model maps it without `create_all`.
-- [ ] Point the `create_app()` audit engine at the configured durable database
-  path instead of `sqlite://`/`StaticPool`. Update any `001` test fixtures that
-  assumed a fresh in-memory store to use a temp-file database.
+- [ ] In `create_app()`, replace the in-memory engine + `create_all()` with:
+  1. call `run_migrations(db_path)` on the configured agent state database path
+     (which applies `0001` and `0002`, including `audit_events`);
+  2. open a SQLAlchemy engine against that same `db_path`;
+  3. do NOT call `Base.metadata.create_all()` — the migration is the schema
+     source of truth.
+- [ ] Update any `001` test fixtures that provided a fresh in-memory audit store
+  to pass a `tmp_path`-scoped database file instead.
+- [ ] Extend `tests/integration/test_packaging_runtime.py` to assert that
+  `ic_env_guard.migrations` is importable and that `MIGRATIONS_DIR` points to
+  an existing directory containing at least `0001_initial.py`.
 - [ ] Run:
 
   ```bash
@@ -147,9 +171,12 @@ correctness fix to `001`, not a `002` feature.
   modes do not exist.
 
 - [ ] Add `AgentTlsConfig`, `AgentConfig`, `ControlPlaneConfig`, and
-  `mode: Literal["agent", "control-plane", "combined"]` to `AppConfig`. `mode`
-  MUST default to `agent` so existing configs and every test fixture that calls
-  `create_app()` keep producing the current single-host app unchanged.
+  `mode: Literal["agent", "control-plane"]` to `AppConfig`. `combined` is NOT
+  in the enum — an unknown value fails Pydantic validation with a clear message
+  rather than passing validation only to be rejected later. `mode` MUST default
+  to `agent` so existing configs and every test fixture that calls `create_app()`
+  keep producing the current single-host app unchanged. When feature `003` adds
+  `combined`, it adds it to the enum then.
 - [ ] Validate `base_url` as scheme, host, and optional port only; reject URL
   credentials, query, fragments, and non-root paths.
 - [ ] Permit insecure HTTP only for loopback when
@@ -157,9 +184,7 @@ correctness fix to `001`, not a `002` feature.
 - [ ] Refactor `create_app()` to mount routers by mode. **Risk:** `create_app()`
   currently builds all dependencies and mounts all routers unconditionally;
   factor the mode-independent agent wiring into a helper so the `agent`-mode app
-  is identical to `001`. The `mode` enum accepts `combined`, but startup rejects
-  it with a clear error pointing to follow-up feature `003`; only `agent` and
-  `control-plane` are wired in this feature.
+  is identical to `001`.
 - [ ] Add a regression test asserting the `agent`-mode router set and dependency
   overrides are unchanged from `001` before refactoring anything else.
 - [ ] Re-run the focused tests and then:
@@ -178,8 +203,9 @@ correctness fix to `001`, not a `002` feature.
 - Create: `backend/ic_env_guard/db/control_plane_audit.py`
 - Create: `backend/ic_env_guard/db/control_plane_migrations.py`
 - Create: `backend/ic_env_guard/api/control_plane_audit.py`
-- Create: `backend/control_plane_migrations/0001_control_plane_audit.py`
+- Create: `backend/ic_env_guard/control_plane_migrations/0001_control_plane_audit.py`
 - Modify: `backend/ic_env_guard/main.py`
+- Modify: `backend/tests/integration/test_packaging_runtime.py`
 - Test: `backend/tests/integration/test_control_plane_audit.py`
 - Test: `backend/tests/contract/test_migration_contract.py`
 
@@ -187,11 +213,12 @@ correctness fix to `001`, not a `002` feature.
   routing intent/outcome records survive, including failures that occur before
   upstream dispatch. Until Task 4/5 exist, the test exercises the repository
   through a small dispatch stub rather than a real upstream call.
-- [ ] Add a dedicated migration directory `backend/control_plane_migrations/`
-  and a `run_control_plane_migrations(db_path)` runner. Do NOT add the
-  control-plane migration to `backend/migrations/`: the shared `db/migrations.py`
-  runner applies every file to whatever database it is given, so a shared `0003`
-  would cross-contaminate the agent and control-plane schemas.
+- [ ] Create `backend/ic_env_guard/control_plane_migrations/` (inside the
+  package, picked up by `include = ["ic_env_guard*"]`) and a
+  `run_control_plane_migrations(db_path)` runner in `db/control_plane_migrations.py`.
+  Its `CONTROL_PLANE_MIGRATIONS_DIR` must resolve relative to `__file__` inside
+  the package (e.g. `Path(__file__).parent.parent / "control_plane_migrations"`),
+  not relative to the repo root, so it works after wheel install.
 - [ ] Add `0001_control_plane_audit.py` (raw `sqlite3`, the `001` convention)
   with actor, source address, agent ID, operation, target, result, dispatch
   state, upstream status, correlation ID, failure category, and timestamp. The
@@ -204,6 +231,10 @@ correctness fix to `001`, not a `002` feature.
   (default `/var/lib/ic-env-guard/control-plane.db`), created only in
   `control-plane` mode. This is separate from the agent audit database fixed in
   Task 0.
+- [ ] Extend `tests/integration/test_packaging_runtime.py` to assert that
+  `ic_env_guard.control_plane_migrations` is importable and that
+  `CONTROL_PLANE_MIGRATIONS_DIR` points to an existing directory containing
+  `0001_control_plane_audit.py`.
 - [ ] Add a repository method that creates intent before dispatch and finalizes
   the same record after success or failure.
 - [ ] Add bounded authenticated query routes under `/api/control-plane/audit`.
@@ -260,8 +291,9 @@ correctness fix to `001`, not a `002` feature.
 - Test: `backend/tests/integration/test_agent_availability.py`
 
 - [ ] Promote `httpx` from the `test` extra to a runtime dependency in
-  `pyproject.toml`; do not rely on a transitive dependency. Update the packaging
-  runtime test to assert it imports without the test extras installed.
+  `pyproject.toml`; do not rely on a transitive dependency. Extend
+  `tests/integration/test_packaging_runtime.py` to assert `import httpx`
+  succeeds without the test extras installed.
 - [ ] Write tests proving redirects are not followed, browser authorization and
   forwarding headers are not propagated, TLS settings are applied, response
   size/content type are bounded, and error categories map to the HTTP contract.
@@ -408,8 +440,9 @@ correctness fix to `001`, not a `002` feature.
 - Test: `frontend/tests/terminal-agent-routing.test.tsx`
 
 - [ ] Add `websockets` as a runtime dependency in `pyproject.toml` (it is not
-  declared today and must not be assumed transitively from `uvicorn[standard]`);
-  cover it in the packaging runtime test.
+  declared today and must not be assumed transitively from `uvicorn[standard]`).
+  Extend `tests/integration/test_packaging_runtime.py` to assert `import websockets`
+  succeeds without test extras installed.
 - [ ] Write backend tests for ticket mismatch, frame limits, backpressure,
   upstream failure, paired-task cancellation, reconnect cursor, gateway
   shutdown, and rejection past the global active-proxy cap (close code `4429`).

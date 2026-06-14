@@ -2,7 +2,10 @@
 
 ## General Rules
 
-- All `/api/agents...` routes require browser authentication.
+- All control-plane API routes (`/api/...`) require browser authentication and
+  explicit authorization, with the sole exceptions of `/healthz` and `/readyz`.
+  This includes `/api/agents/...`, `/api/control-plane/audit`, and any future
+  control-plane paths.
 - The control plane accepts and returns JSON unless stated otherwise.
 - Every response includes `X-Correlation-ID`.
 - Agent credentials, upstream tickets, raw upstream URLs, and unsanitized

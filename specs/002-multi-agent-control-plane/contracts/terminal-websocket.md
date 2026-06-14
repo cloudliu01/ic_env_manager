@@ -30,11 +30,12 @@ WebSocket is attached.
 
 The control plane:
 
-1. checks the global active-proxy cap; if reached, rejects with `4429` before
-   touching the ticket store;
-2. atomically acquires a proxy slot and consumes the gateway ticket; rejects
-   with `4401` if the ticket is missing, expired, reused, or mismatched — the
-   slot is released immediately on rejection;
+1. calls `try_acquire_proxy_slot()` — an atomic operation that either reserves
+   a slot under the global cap or returns failure; if it fails, rejects with
+   `4429` immediately, without touching the ticket store (no pre-check/acquire
+   race);
+2. consumes the gateway ticket; if the ticket is missing, expired, reused, or
+   mismatched, rejects with `4401` and releases the slot;
 3. resolves the same configured agent;
 4. opens the upstream WebSocket using the `websockets` client with an
    `ssl.SSLContext` built from the target's TLS settings (the HTTP client cannot
@@ -44,7 +45,7 @@ The control plane:
    releases the slot on any upstream establishment failure.
 
 If upstream establishment fails the browser connection closes with the mapped
-gateway close code; no consumed ticket is reusable and the proxy slot is freed.
+gateway close code; the proxy slot is freed and no consumed ticket is reusable.
 
 ## Data Frames
 
@@ -61,10 +62,10 @@ The first release preserves the `001` text-frame terminal protocol.
 ## Backpressure
 
 Each direction uses a bounded queue of at most 1 MiB. When a peer cannot drain
-the queue within 10 seconds, the proxy closes both WebSockets with `4413`. It
-does not buffer unbounded terminal content. Independently, the gateway bounds the
-total number of concurrent proxied sockets and outstanding tickets; attaches
-beyond that global cap are rejected with `4429`.
+the queue within 10 seconds, the proxy closes both WebSockets with `4413` and
+releases the proxy slot. The gateway bounds concurrent proxied sockets via the
+atomic `try_acquire_proxy_slot()` at connection establishment; `4429` is
+returned only when that atomic call fails, never from a non-atomic pre-check.
 
 ## Reconnect and Lifecycle
 
