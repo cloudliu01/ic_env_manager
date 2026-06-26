@@ -1,6 +1,10 @@
 import pytest
 
-from ic_env_guard.agents.registry import AgentNotFoundError, AgentRegistry
+from ic_env_guard.agents.registry import (
+    AgentInvalidConfigurationError,
+    AgentNotFoundError,
+    AgentRegistry,
+)
 from ic_env_guard.config.models import AgentConfig
 
 
@@ -51,3 +55,41 @@ def test_agent_registry_returns_safe_immutable_summaries(tmp_path):
     assert fresh[1]["status"] == "disabled"
     assert "base_url" not in fresh[0]
     assert "token_file" not in fresh[0]
+
+
+@pytest.mark.unit
+def test_agent_registry_runtime_enabled_switch_updates_summary(tmp_path):
+    registry = AgentRegistry([_agent(tmp_path, "lab-01")])
+
+    registry.set_enabled("lab-01", False)
+
+    assert registry.summary("lab-01")["enabled"] is False
+    assert registry.summary("lab-01")["status"] == "disabled"
+
+    registry.set_enabled("lab-01", True)
+
+    assert registry.summary("lab-01")["enabled"] is True
+    assert registry.summary("lab-01")["status"] == "unknown"
+
+
+@pytest.mark.unit
+def test_agent_registry_runtime_enabled_switch_rejects_unknown(tmp_path):
+    registry = AgentRegistry([_agent(tmp_path, "lab-01")])
+
+    with pytest.raises(AgentNotFoundError):
+        registry.set_enabled("missing", False)
+
+
+@pytest.mark.unit
+def test_agent_registry_rejects_enabling_agent_without_token_file():
+    registry = AgentRegistry([
+        AgentConfig(
+            id="lab-01",
+            name="Lab 01",
+            base_url="https://lab-01.example",
+            enabled=False,
+        )
+    ])
+
+    with pytest.raises(AgentInvalidConfigurationError):
+        registry.set_enabled("lab-01", True)

@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { listAgents } from '../src/api/agents';
@@ -35,6 +35,7 @@ const CAPABILITIES = ['services.v1', 'terminals.v1', 'audit.v1', 'monitoring.sna
 
 vi.mock('../src/auth/session', () => ({
   loadSessionToken: vi.fn(() => 'secret-token'),
+  clearSessionToken: vi.fn(),
 }));
 
 vi.mock('../src/api/client', () => ({
@@ -62,8 +63,14 @@ vi.mock('../src/pages/AuditStatusPage', () => ({
   AuditStatusPage: () => <div>Audit page</div>,
 }));
 
-function readyzResponse(status: string) {
-  return { status };
+function fleetResponse() {
+  return {
+    collected_at: '2026-06-26T00:00:00Z',
+    hosts: [
+      { id: 'agent-a', name: 'Alpha', status: 'ready', enabled: true, capabilities: CAPABILITIES },
+      { id: 'agent-b', name: 'Beta', status: 'ready', enabled: true, capabilities: CAPABILITIES },
+    ],
+  };
 }
 
 function servicesResponse(name: string) {
@@ -140,7 +147,7 @@ describe('agent-scoped API helpers', () => {
   });
 });
 
-describe('AppRoutes agent routing', () => {
+describe('AppRoutes fleet routing', () => {
   afterEach(() => {
     cleanup();
   });
@@ -152,20 +159,11 @@ describe('AppRoutes agent routing', () => {
     terminalMounts.mockClear();
   });
 
-  it('shows the selector after auth and routes overview and services through the active agent', async () => {
+  it('shows fleet overview and routes selected host services through that agent', async () => {
     const user = userEvent.setup();
     apiRequest.mockImplementation(async (path: string) => {
-      if (path === '/api/agents') {
-        return { agents: [
-          { id: 'agent-a', name: 'Alpha', status: 'ready', enabled: true, capabilities: CAPABILITIES },
-          { id: 'agent-b', name: 'Beta', status: 'ready', enabled: true, capabilities: CAPABILITIES },
-        ] };
-      }
-      if (path === '/api/agents/agent-a/readyz') {
-        return readyzResponse('ready');
-      }
-      if (path === '/api/agents/agent-b/readyz') {
-        return readyzResponse('degraded');
+      if (path === '/api/fleet/overview') {
+        return fleetResponse();
       }
       if (path === '/api/agents/agent-a/services') {
         return servicesResponse('Alpha service');
@@ -178,58 +176,25 @@ describe('AppRoutes agent routing', () => {
 
     render(<AppRoutes />);
 
-    expect(await screen.findByLabelText('Active agent')).toBeTruthy();
-    expect(await screen.findByText('Agent readiness: ready')).toBeTruthy();
-    expect(apiRequest).toHaveBeenCalledWith('/api/agents/agent-a/readyz', expect.anything());
+    expect(await screen.findByRole('heading', { name: 'Fleet Overview' })).toBeTruthy();
+    expect(screen.getByText('Alpha')).toBeTruthy();
+    expect(screen.getByText('Beta')).toBeTruthy();
+    expect(apiRequest).toHaveBeenCalledWith('/api/fleet/overview', expect.anything());
 
-    await user.click(screen.getByRole('button', { name: 'Services' }));
-    expect(await screen.findByText('Alpha service')).toBeTruthy();
-    expect(apiRequest).toHaveBeenCalledWith('/api/agents/agent-a/services', expect.anything());
-
-    await user.selectOptions(screen.getByLabelText('Active agent'), 'agent-b');
+    await user.click(screen.getAllByRole('button', { name: 'Manage' })[1]);
     expect(await screen.findByText('Beta service')).toBeTruthy();
     expect(apiRequest).toHaveBeenCalledWith('/api/agents/agent-b/services', expect.anything());
+
+    await user.selectOptions(screen.getByLabelText('Active agent'), 'agent-a');
+    expect(await screen.findByText('Alpha service')).toBeTruthy();
+    expect(apiRequest).toHaveBeenCalledWith('/api/agents/agent-a/services', expect.anything());
   });
 
-  it('keeps stale overview responses from older agent selections out of current state', async () => {
-    const user = userEvent.setup();
-    let resolveAlpha: (value: { status: string }) => void = () => {};
-    apiRequest.mockImplementation((path: string) => {
-      if (path === '/api/agents') {
-        return Promise.resolve({ agents: [
-          { id: 'agent-a', name: 'Alpha', status: 'ready', enabled: true, capabilities: CAPABILITIES },
-          { id: 'agent-b', name: 'Beta', status: 'ready', enabled: true, capabilities: CAPABILITIES },
-        ] });
-      }
-      if (path === '/api/agents/agent-a/readyz') {
-        return new Promise((resolve) => {
-          resolveAlpha = resolve;
-        });
-      }
-      if (path === '/api/agents/agent-b/readyz') {
-        return Promise.resolve(readyzResponse('beta-ready'));
-      }
-      return Promise.resolve({});
-    });
-
-    render(<AppRoutes />);
-
-    await screen.findByLabelText('Active agent');
-    await user.selectOptions(screen.getByLabelText('Active agent'), 'agent-b');
-
-    expect(await screen.findByText('Agent readiness: beta-ready')).toBeTruthy();
-    resolveAlpha(readyzResponse('alpha-stale'));
-    await waitFor(() => expect(screen.queryByText('Agent readiness: alpha-stale')).toBeNull());
-  });
-
-  it('keeps the terminal page mounted when switching to another section and back', async () => {
+  it('keeps the terminal page mounted when switching host workspace sections', async () => {
     const user = userEvent.setup();
     apiRequest.mockImplementation(async (path: string) => {
-      if (path === '/api/agents') {
-        return { agents: [{ id: 'agent-a', name: 'Alpha', status: 'ready', enabled: true, capabilities: CAPABILITIES }] };
-      }
-      if (path === '/api/agents/agent-a/readyz') {
-        return readyzResponse('ready');
+      if (path === '/api/fleet/overview') {
+        return fleetResponse();
       }
       if (path === '/api/agents/agent-a/services') {
         return servicesResponse('Alpha service');
@@ -238,8 +203,9 @@ describe('AppRoutes agent routing', () => {
     });
 
     render(<AppRoutes />);
-    await screen.findByLabelText('Active agent');
+    await screen.findByText('Alpha');
 
+    await user.click(screen.getAllByRole('button', { name: 'Manage' })[0]);
     await user.click(screen.getByRole('button', { name: 'Terminal' }));
     expect(screen.getByLabelText('Terminal page').textContent).toContain('true');
     expect(terminalMounts).toHaveBeenCalledTimes(1);

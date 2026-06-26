@@ -39,7 +39,8 @@ export function AppRoutes() {
 }
 
 function AuthenticatedRoutes({ actor }: { actor: string }) {
-  const [page, setPage] = useState<'overview' | 'terminal' | 'services' | 'metrics' | 'audit'>('overview');
+  const [view, setView] = useState<'fleet' | 'host'>('fleet');
+  const [hostPage, setHostPage] = useState<'terminal' | 'services' | 'metrics' | 'audit'>('services');
   const [terminalVisited, setTerminalVisited] = useState(false);
   const { activeAgent } = useActiveAgent();
   const supportsTerminals = agentSupports(activeAgent, 'terminals.v1');
@@ -48,32 +49,51 @@ function AuthenticatedRoutes({ actor }: { actor: string }) {
   const supportsAudit = agentSupports(activeAgent, 'audit.v1');
 
   useEffect(() => {
-    if (page === 'terminal') {
+    if (view === 'host' && hostPage === 'terminal') {
       setTerminalVisited(true);
     }
-  }, [page]);
+  }, [hostPage, view]);
+
+  function openHostWorkspace() {
+    setView('host');
+    setHostPage(supportsServices ? 'services' : supportsTerminals ? 'terminal' : supportsMonitoring ? 'metrics' : 'audit');
+  }
 
   return (
     <main>
         <h1>IC Design Environment Guard</h1>
         <p>Signed in as {actor}</p>
-        <AgentSelector />
         <nav aria-label="Primary">
-          <button type="button" onClick={() => setPage('overview')}>Overview</button>
-          <button type="button" onClick={() => setPage('terminal')} disabled={!supportsTerminals}>Terminal</button>
-          <button type="button" onClick={() => setPage('services')} disabled={!supportsServices}>Services</button>
-          <button type="button" onClick={() => setPage('metrics')} disabled={!supportsMonitoring}>Metrics</button>
-          <button type="button" onClick={() => setPage('audit')} disabled={!supportsAudit}>Audit</button>
+          <button type="button" onClick={() => setView('fleet')}>Fleet Overview</button>
+          <button type="button" onClick={openHostWorkspace} disabled={!activeAgent}>Host: {activeAgent?.name ?? 'none'}</button>
         </nav>
-        {page === 'overview' ? <HostOverviewPage /> : null}
+        {view === 'fleet' ? <HostOverviewPage onOpenHost={openHostWorkspace} /> : null}
+        {view === 'host' ? (
+          <section className="host-workspace">
+            <div className="host-workspace-header">
+              <div>
+                <p className="eyebrow">Host Workspace</p>
+                <h2>{activeAgent?.name ?? 'No active host'}</h2>
+                <p>{activeAgent?.id ?? 'Select a ready host from Fleet Overview.'}</p>
+              </div>
+              <AgentSelector />
+            </div>
+            <nav aria-label="Host workspace">
+              <button type="button" onClick={() => setHostPage('terminal')} disabled={!supportsTerminals}>Terminal</button>
+              <button type="button" onClick={() => setHostPage('services')} disabled={!supportsServices}>Services</button>
+              <button type="button" onClick={() => setHostPage('metrics')} disabled={!supportsMonitoring}>Metrics</button>
+              <button type="button" onClick={() => setHostPage('audit')} disabled={!supportsAudit}>Audit</button>
+            </nav>
+          </section>
+        ) : null}
         {terminalVisited ? (
-          <div hidden={page !== 'terminal'}>
-            <TerminalPage visible={page === 'terminal'} />
+          <div hidden={view !== 'host' || hostPage !== 'terminal'}>
+            <TerminalPage visible={view === 'host' && hostPage === 'terminal'} />
           </div>
         ) : null}
-        {page === 'services' ? <ServiceListPage /> : null}
-        {page === 'metrics' ? <MetricsPage /> : null}
-        {page === 'audit' ? <AuditStatusPage /> : null}
+        {view === 'host' && hostPage === 'services' ? <ServiceListPage /> : null}
+        {view === 'host' && hostPage === 'metrics' ? <MetricsPage /> : null}
+        {view === 'host' && hostPage === 'audit' ? <AuditStatusPage /> : null}
     </main>
   );
 }

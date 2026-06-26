@@ -60,6 +60,9 @@ class AgentAvailabilityService:
     def list_summaries(self) -> list[dict[str, object]]:
         return [self.summary(agent.id) for agent in self._registry.list_configs()]
 
+    def clear(self, agent_id: str) -> None:
+        self._observations.pop(agent_id, None)
+
     def has_capability(self, agent_id: str, capability: str) -> bool:
         observation = self._observations.get(agent_id)
         if observation is None or observation.stale_after <= datetime.now(UTC):
@@ -82,7 +85,11 @@ class AgentAvailabilityService:
                 await self.probe(agent_id)
 
         await asyncio.gather(
-            *(probe_with_limit(agent.id) for agent in self._registry.list_configs())
+            *(
+                probe_with_limit(agent.id)
+                for agent in self._registry.list_configs()
+                if agent.enabled
+            )
         )
 
     async def probe(self, agent_id: str) -> dict[str, object]:

@@ -2,11 +2,16 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel
 
 from ic_env_guard.agents.availability import AgentAvailabilityService
 from ic_env_guard.agents.client import AgentClientError, AgentHttpClient
 from ic_env_guard.agents.models import CapabilityResponse
-from ic_env_guard.agents.registry import AgentNotFoundError, AgentRegistry
+from ic_env_guard.agents.registry import (
+    AgentInvalidConfigurationError,
+    AgentNotFoundError,
+    AgentRegistry,
+)
 from ic_env_guard.api.agent_http import (
     ERROR_STATUS,
     augment_upstream_error_body,
@@ -28,6 +33,10 @@ from ic_env_guard.db.control_plane_audit import (
 
 local_capabilities_router = APIRouter(prefix="/api", tags=["capabilities"])
 control_plane_agents_router = APIRouter(prefix="/api/agents", tags=["agents"])
+
+
+class AgentEnabledRequest(BaseModel):
+    enabled: bool
 
 
 def get_agent_registry() -> AgentRegistry:
@@ -187,6 +196,58 @@ def get_agent(
         return availability.summary(agent_id)
     except AgentNotFoundError as exc:
         raise ApiError(404, "agent_not_found", "agent not found") from exc
+
+
+@control_plane_agents_router.post("/{agent_id}/enabled")
+def set_agent_enabled(
+    agent_id: str,
+    body: AgentEnabledRequest,
+    request: Request,
+    actor: Annotated[AuthContext, Depends(require_auth)],
+    registry: Annotated[AgentRegistry, Depends(get_agent_registry)],
+    availability: Annotated[AgentAvailabilityService, Depends(get_agent_availability)],
+    audit_repo: Annotated[ControlPlaneAuditRepository, Depends(get_control_plane_audit_repository)],
+    audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
+) -> dict[str, object]:
+    correlation_id = getattr(request.state, "correlation_id", None)
+    source_addr = request.client.host if request.client else None
+    try:
+        registry.set_enabled(agent_id, body.enabled)
+    except AgentNotFoundError as exc:
+        _record_agent_route_failure(
+            audit_repo,
+            audit_health,
+            actor,
+            source_addr,
+            agent_id,
+            "agents.enabled",
+            correlation_id,
+            "agent_not_found",
+        )
+        raise ApiError(404, "agent_not_found", "agent not found") from exc
+    except AgentInvalidConfigurationError as exc:
+        _record_agent_route_failure(
+            audit_repo,
+            audit_health,
+            actor,
+            source_addr,
+            agent_id,
+            "agents.enabled",
+            correlation_id,
+            "agent_invalid_configuration",
+        )
+        raise ApiError(
+            409,
+            "agent_invalid_configuration",
+            "agent cannot be enabled with its current configuration",
+        ) from exc
+    audit = _record_agent_route_intent(
+        audit_repo, audit_health, actor, source_addr, agent_id, "agents.enabled", correlation_id
+    )
+    availability.clear(agent_id)
+    audit_repo.finalize(audit.id, result="success", dispatch_state="not_dispatched")
+    commit_audit_outcome(audit_repo, audit_health)
+    return {"agent": availability.summary(agent_id)}
 
 
 @control_plane_agents_router.post("/{agent_id}/probe")

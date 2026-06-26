@@ -93,3 +93,20 @@ async def test_protocol_failure_marks_agent_unavailable(tmp_path):
 
     assert summary["status"] == "unavailable"
     assert summary["last_error"] == "agent_protocol_error"
+
+
+@pytest.mark.integration
+def test_runtime_disable_clears_ready_observation(tmp_path):
+    registry = AgentRegistry([_agent(tmp_path)])
+    service = AgentAvailabilityService(registry, FakeClient())
+    service.record_ready_for_test("lab-01", observed_at=datetime.now(UTC))
+
+    registry.set_enabled("lab-01", False)
+    service.clear("lab-01")
+
+    assert service.summary("lab-01")["status"] == "disabled"
+    assert service.summary("lab-01")["capabilities"] == []
+
+    registry.set_enabled("lab-01", True)
+
+    assert service.summary("lab-01")["status"] == "unknown"

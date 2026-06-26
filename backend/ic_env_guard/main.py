@@ -33,6 +33,7 @@ from ic_env_guard.api.auth import router as auth_router
 from ic_env_guard.api.control_plane_audit import get_control_plane_audit_repository
 from ic_env_guard.api.control_plane_audit import router as control_plane_audit_router
 from ic_env_guard.api.errors import register_error_handlers
+from ic_env_guard.api.fleet import router as fleet_router
 from ic_env_guard.api.health import router as health_router
 from ic_env_guard.api.metrics import (
     MetricsAccessPolicy,
@@ -334,6 +335,7 @@ def create_app(
         app.include_router(audit_router)
         app.include_router(terminal_ws.router)
     else:
+        app.include_router(fleet_router)
         app.include_router(control_plane_agents_router)
         app.include_router(agent_audit_router)
         app.include_router(agent_services_router)

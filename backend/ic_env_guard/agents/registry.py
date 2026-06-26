@@ -5,6 +5,10 @@ class AgentNotFoundError(Exception):
     pass
 
 
+class AgentInvalidConfigurationError(Exception):
+    pass
+
+
 class AgentRegistry:
     def __init__(self, agents: list[AgentConfig]) -> None:
         self._agents = {agent.id: agent for agent in agents}
@@ -24,6 +28,13 @@ class AgentRegistry:
 
     def summary(self, agent_id: str) -> dict[str, object]:
         return self._summary(self.get(agent_id))
+
+    def set_enabled(self, agent_id: str, enabled: bool) -> AgentConfig:
+        agent = self.get(agent_id)
+        if enabled and agent.token_file is None:
+            raise AgentInvalidConfigurationError("enabled agents require a token_file")
+        agent.enabled = enabled
+        return agent
 
     def _summary(self, agent: AgentConfig) -> dict[str, object]:
         return {
