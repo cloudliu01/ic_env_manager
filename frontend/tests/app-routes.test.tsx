@@ -71,6 +71,12 @@ describe('AppRoutes terminal navigation', () => {
     clearSessionToken.mockClear();
     apiRequest.mockReset();
     apiRequest.mockImplementation(async (path: string) => {
+      if (path === '/api/fleet/overview') {
+        return {
+          collected_at: '2026-06-26T00:00:00Z',
+          hosts: [{ id: 'agent-a', name: 'Alpha', status: 'ready', enabled: true, capabilities: CAPABILITIES }],
+        };
+      }
       if (path === '/api/agents') {
         return { agents: [{ id: 'agent-a', name: 'Alpha', status: 'ready', enabled: true, capabilities: CAPABILITIES }] };
       }
@@ -83,6 +89,7 @@ describe('AppRoutes terminal navigation', () => {
   it('keeps the terminal page mounted when switching to another section and back', async () => {
     const user = userEvent.setup();
     render(<AppRoutes />);
+    await user.click(await screen.findByRole('button', { name: 'Host: Alpha' }));
     await screen.findByLabelText('Active agent');
 
     await user.click(screen.getByRole('button', { name: 'Terminal' }));
@@ -106,6 +113,9 @@ describe('AppRoutes terminal navigation', () => {
     window.sessionStorage.setItem('activeAgentId', 'local-agent');
     loadSessionToken.mockReturnValue('definitely-wrong-token');
     apiRequest.mockImplementation((path: string) => {
+      if (path === '/api/fleet/overview') {
+        return Promise.reject(new Error('Fleet overview unavailable'));
+      }
       if (path === '/api/agents') {
         return new Promise((_resolve, reject) => {
           rejectAgents = reject;

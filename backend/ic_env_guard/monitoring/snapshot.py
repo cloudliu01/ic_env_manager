@@ -81,7 +81,21 @@ def _network_snapshots() -> list[dict[str, object]]:
 
 def local_host_snapshot(host_id: str = "local", name: str = "Local host") -> dict[str, object]:
     memory = psutil.virtual_memory()
-    swap = psutil.swap_memory()
+    try:
+        swap = psutil.swap_memory()
+        swap_snapshot = {
+            "used_bytes": swap.used,
+            "total_bytes": swap.total,
+            "free_bytes": swap.free,
+            "percent": swap.percent,
+        }
+    except (OSError, PermissionError):
+        swap_snapshot = {
+            "used_bytes": 0,
+            "total_bytes": 0,
+            "free_bytes": 0,
+            "percent": 0,
+        }
     boot_time = psutil.boot_time()
     return {
         "host_id": host_id,
@@ -102,12 +116,7 @@ def local_host_snapshot(host_id: str = "local", name: str = "Local host") -> dic
             "available_bytes": memory.available,
             "percent": memory.percent,
         },
-        "swap": {
-            "used_bytes": swap.used,
-            "total_bytes": swap.total,
-            "free_bytes": swap.free,
-            "percent": swap.percent,
-        },
+        "swap": swap_snapshot,
         "disks": _disk_snapshots(),
         "network": _network_snapshots(),
         "uptime_seconds": max(0, int(time.time() - boot_time)),

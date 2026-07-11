@@ -123,6 +123,28 @@ def test_local_monitoring_snapshot_contract(client, auth_headers):
 
 
 @pytest.mark.contract
+def test_local_monitoring_snapshot_survives_swap_memory_oserror(
+    client, auth_headers, monkeypatch
+):
+    def unavailable_swap_memory():
+        raise OSError
+
+    monkeypatch.setattr(
+        "ic_env_guard.monitoring.snapshot.psutil.swap_memory", unavailable_swap_memory
+    )
+
+    response = client.get("/api/monitoring/local", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.json()["swap"] == {
+        "used_bytes": 0,
+        "total_bytes": 0,
+        "free_bytes": 0,
+        "percent": 0,
+    }
+
+
+@pytest.mark.contract
 def test_machine_crud_does_not_return_key(client, auth_headers):
     create = client.post(
         "/api/monitoring/machines",
