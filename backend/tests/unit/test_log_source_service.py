@@ -2,6 +2,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import ValidationError
 
 from ic_env_guard.logs.models import (
     LogSourceConflict,
@@ -76,6 +77,11 @@ def test_upsert_normalizes_path_and_forces_local_producer(tmp_path):
     assert result.record.path == path.resolve()
     assert result.record.producer_id == "local"
     assert repository.cas_calls[0][0].producer_id == "local"
+
+
+def test_log_source_input_rejects_embedded_nul_path(tmp_path):
+    with pytest.raises(ValidationError, match="must not contain NUL"):
+        _payload(f"{tmp_path}/run\x00.log")
 
 
 @pytest.mark.parametrize("log_id", ["A", "1log", "log/id", "a" * 128])

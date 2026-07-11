@@ -290,6 +290,39 @@ def test_log_source_repository_rejects_non_normalized_stored_path(tmp_path):
 
 
 @pytest.mark.integration
+def test_log_source_repository_maps_stored_nul_path_to_storage_error(tmp_path):
+    db_path = tmp_path / "state.db"
+    connection = sqlite3.connect(db_path)
+    initial_migration.upgrade(connection)
+    observability_migration.upgrade(connection)
+    connection.execute(
+        """
+        INSERT INTO log_sources (
+            id, path, last_updated, observed_at, received_at, expires_at,
+            producer_id, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "run",
+            "/var/log/run\x00.log",
+            "2026-07-11T09:59:58.000000Z",
+            "2026-07-11T10:00:00.000000Z",
+            "2026-07-11T10:00:30.000000Z",
+            "2026-07-11T10:02:00.000000Z",
+            "local",
+            "2026-07-11T10:00:30.000000Z",
+        ),
+    )
+    connection.commit()
+    connection.close()
+    engine = create_engine(f"sqlite:///{db_path}")
+
+    with pytest.raises(LogStorageError, match="log_storage_unavailable"):
+        SQLiteLogSourceRepository(engine).get("run")
+    engine.dispose()
+
+
+@pytest.mark.integration
 def test_sqlite_cas_prevents_stale_concurrent_candidate_overwrite(tmp_path):
     db_path = tmp_path / "state.db"
     connection = sqlite3.connect(db_path)

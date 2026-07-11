@@ -25,6 +25,20 @@ def _serialized_lines_size(lines: tuple[str, ...]) -> int:
     )
 
 
+def _fit_utf8_suffix(value: str, max_bytes: int) -> tuple[str, bool]:
+    if len(value.encode("utf-8")) <= max_bytes:
+        return value, False
+    low = 0
+    high = len(value)
+    while low < high:
+        midpoint = (low + high) // 2
+        if len(value[midpoint:].encode("utf-8")) <= max_bytes:
+            high = midpoint
+        else:
+            low = midpoint + 1
+    return value[low:], True
+
+
 def _fit_json_budget(lines: tuple[str, ...]) -> tuple[tuple[str, ...], bool]:
     if not lines or _serialized_lines_size(lines) <= _SERIALIZED_LINES_BUDGET:
         return lines, False
@@ -72,7 +86,7 @@ class LogPathPolicy:
         candidate = Path(path)
         try:
             resolved = candidate.resolve(strict=True)
-        except (OSError, RuntimeError) as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             raise LogFileUnavailable("log target is not an existing regular file") from exc
         if not self.contains(resolved):
             raise LogPathForbidden("log path is outside allowed roots")
@@ -163,12 +177,10 @@ class LogTailReader:
             os.close(descriptor)
 
         decoded = raw.decode("utf-8", errors="replace")
-        encoded = decoded.encode("utf-8")
-        if len(encoded) > byte_limit:
-            encoded = encoded[-byte_limit:]
-            decoded = encoded.decode("utf-8", errors="ignore")
+        decoded, byte_trimmed = _fit_utf8_suffix(decoded, byte_limit)
         available_lines = decoded.splitlines()
         selected = tuple(available_lines[-lines:])
+        content_trimmed = False
         if len("\n".join(selected).encode("utf-8")) > byte_limit:
             low = 1
             high = len(selected)
@@ -180,8 +192,14 @@ class LogTailReader:
                 else:
                     low = midpoint + 1
             selected = selected[low:]
+            content_trimmed = True
         selected, wire_trimmed = _fit_json_budget(selected)
         truncated = (
-            position > 0 or len(available_lines) > lines or size > bytes_read or wire_trimmed
+            position > 0
+            or len(available_lines) > lines
+            or size > bytes_read
+            or byte_trimmed
+            or content_trimmed
+            or wire_trimmed
         )
         return TailResult(lines=selected, truncated=truncated)

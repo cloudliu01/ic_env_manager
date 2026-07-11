@@ -70,6 +70,8 @@ class LogSourceInput(BaseModel):
     @field_validator("path")
     @classmethod
     def validate_path(cls, value: str) -> str:
+        if "\x00" in value:
+            raise ValueError("path must not contain NUL")
         if not Path(value).is_absolute():
             raise ValueError("path must be absolute")
         return value

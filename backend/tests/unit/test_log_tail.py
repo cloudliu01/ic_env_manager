@@ -32,6 +32,17 @@ def test_tail_replaces_invalid_utf8_and_respects_byte_limit(tmp_path):
     assert result.truncated is True
 
 
+def test_tail_preserves_replacements_when_decoding_expands_past_budget(tmp_path):
+    path = tmp_path / "run.log"
+    path.write_bytes(6 * b"\xff")
+
+    result = _reader(tmp_path, max_bytes=16).read(path, lines=1)
+
+    assert result.lines == (5 * "\ufffd",)
+    assert len(result.lines[0].encode("utf-8")) == 15
+    assert result.truncated is True
+
+
 @pytest.mark.parametrize("lines", [0, 1001])
 def test_tail_rejects_line_count_outside_contract(tmp_path, lines):
     path = tmp_path / "run.log"

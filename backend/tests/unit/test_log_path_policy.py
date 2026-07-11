@@ -77,3 +77,8 @@ def test_rejects_unavailable_or_non_regular_targets(tmp_path, kind):
 def test_allowed_root_must_be_an_existing_directory(tmp_path):
     with pytest.raises(ValueError, match="existing directory"):
         LogPathPolicy([tmp_path / "missing"])
+
+
+def test_embedded_nul_path_maps_to_stable_unavailable_error(tmp_path):
+    with pytest.raises(LogFileUnavailable, match="existing regular file"):
+        LogPathPolicy([tmp_path]).resolve_regular_file(f"{tmp_path}/run\x00.log")
