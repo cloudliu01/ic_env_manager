@@ -1,6 +1,9 @@
 import logging
 import re
-from collections.abc import Mapping
+from collections import deque
+from collections.abc import Iterable, Iterator, Mapping
+from itertools import islice
+from typing import Any
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
@@ -15,6 +18,9 @@ from starlette.routing import Match
 
 _CORRELATION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 logger = logging.getLogger(__name__)
+_MAX_ROUTE_NODES = 512
+_MAX_ROUTE_DEPTH = 16
+_MAX_ALLOWED_METHODS = 32
 
 
 class V2ApiError(Exception):
@@ -66,6 +72,55 @@ async def v2_error_handler(request: Request, exc: V2ApiError) -> JSONResponse:
     )
 
 
+def _iter_routes(value: Any) -> Iterator[Any]:
+    if value is None or isinstance(value, (str, bytes)):
+        return
+    try:
+        routes: Iterable[Any] = iter(value)
+    except TypeError:
+        return
+    for route in islice(routes, _MAX_ROUTE_NODES):
+        if callable(getattr(route, "matches", None)):
+            yield route
+
+
+def _child_routes(route: Any) -> Iterator[Any]:
+    yield from _iter_routes(getattr(route, "routes", None))
+    for attribute in ("router", "original_router"):
+        container = getattr(route, attribute, None)
+        yield from _iter_routes(getattr(container, "routes", None))
+
+
+def _allowed_methods(request: Request) -> set[str]:
+    queue = deque(
+        (route, 0)
+        for route in _iter_routes(getattr(request.app.router, "routes", None))
+    )
+    seen: set[int] = set()
+    methods: set[str] = set()
+    visited = 0
+    while queue and visited < _MAX_ROUTE_NODES:
+        route, depth = queue.popleft()
+        identity = id(route)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        visited += 1
+        match, _ = route.matches(request.scope)
+        if match is Match.PARTIAL:
+            route_methods = getattr(route, "methods", ()) or ()
+            for method in route_methods:
+                if isinstance(method, str) and len(methods) < _MAX_ALLOWED_METHODS:
+                    methods.add(method)
+        if depth >= _MAX_ROUTE_DEPTH:
+            continue
+        for child in _child_routes(route):
+            if visited + len(queue) >= _MAX_ROUTE_NODES:
+                break
+            queue.append((child, depth + 1))
+    return methods
+
+
 async def v2_http_exception_handler(request: Request, exc: HTTPException):
     if not is_v2_path(request.url.path):
         return await http_exception_handler(request, exc)
@@ -82,12 +137,7 @@ async def v2_http_exception_handler(request: Request, exc: HTTPException):
             (value for key, value in exc.headers.items() if key.lower() == "allow"), None
         )
     if allow is None and exc.status_code == 405:
-        methods: set[str] = set()
-        for route in request.app.router.routes:
-            match, _ = route.matches(request.scope)
-            if match is Match.PARTIAL:
-                methods.update(getattr(route, "methods", ()) or ())
-        allow = ", ".join(sorted(methods)) or None
+        allow = ", ".join(sorted(_allowed_methods(request))) or None
     if allow is not None and len(allow) <= 128 and re.fullmatch(
         r"[A-Z]+(?:, ?[A-Z]+)*", allow
     ):
