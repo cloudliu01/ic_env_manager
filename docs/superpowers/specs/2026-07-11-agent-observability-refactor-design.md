@@ -16,6 +16,8 @@ Manager 默认通过一次性 SSH enrollment 证明操作者已经能以 Agent �
 
 监控逻辑不内置到 Agent。Shell、Python 程序、cron job、systemd timer 或其他本地工具负责采集数据，再把最新 Observation 或 Log Source 元数据提交给 Agent。Agent 负责输入校验、TTL、持久化、权限控制、查询和导出。
 
+Local Producer 通过独立的 loopback HTTP listener 提交数据，不使用 token。该边界明确把 Agent 主机上的全部本地用户和进程视为可信写入者；远端 Public/Manager listener 不挂载 Ingest routes。
+
 代码采用模块化单体：模块可以独立开发和测试，但每种运行模式仍是一个主进程。Manager 不是新的微服务集群，也不复制 Agent 的长期监控数据；Prometheus 继续负责时间序列历史。浏览器在 Manager 模式下只连接 Manager，不持有 Agent token，也不直接扫描网络或连接 Agent。
 
 ## 2. 背景与现状
@@ -54,7 +56,7 @@ Manager 默认通过一次性 SSH enrollment 证明操作者已经能以 Agent �
 1. 每台受管理 Linux Server 运行一个 Agent。
 2. 用户可以通过远端 Web 登录 Agent，并创建真实 PTY Shell。
 3. Shell 可以运行其操作系统账号有权运行的程序；是否可以使用 `sudo` 完全由主机 sudoers 策略决定。
-4. 本地程序可以通过本地 HTTP API 上报最新 Observation。
+4. 本地程序可以通过独立 loopback HTTP API 无 token 上报最新 Observation。
 5. 每个 Observation 必须具有独立 TTL，过期状态由 Agent 统一计算。
 6. Observation 支持 `details` 字典，以承载无需索引和导出的扩展信息。
 7. 本地程序可以注册 Log Source 元数据，但不把原始日志内容写入 SQLite。
@@ -100,6 +102,7 @@ Manager 默认通过一次性 SSH enrollment 证明操作者已经能以 Agent �
 - 允许远端 API 提交任意文件路径进行读取；
 - 通过 Observation API 执行任意命令；
 - 在第一版实现 PAM、LDAP、OIDC 或浏览器用户到多个 Linux 账号的动态映射；
+- 为 Local Producer 实现 token、per-user identity、namespace ACL 或本机用户隔离；本规格明确采用整机信任模型；
 - 在第一版实现批量共享 Agent token、自动证书签发或 Agent 主动注册；这些能力只有在单 Agent 凭据流程稳定后才能单独设计。
 - 让 Agent HTTP API 返回 `authorized_keys`、客户端公钥或私钥路径，并自行实现 SSH challenge/signature；密钥选择和持有证明交给系统 OpenSSH。
 - 把 SSH 作为常驻 Agent API、Terminal WebSocket 或 Prometheus scrape tunnel；SSH 只用于 enrollment 和显式恢复操作。
@@ -128,7 +131,7 @@ Enrollment control path
               └──fixed ic-env-guard enrollment helper
 
 Local collectors
-  └── localhost HTTP + producer token
+  └── localhost HTTP（no token）
           └── Agent Local Ingest API
                   ├── Observation Upsert
                   └── Log Source Upsert
@@ -169,8 +172,8 @@ Manager application modules
 - Manager 是一个主进程和一个 SQLite 数据库，不要求 PostgreSQL、Broker 或 Kubernetes。
 - 同一进程实例不能同时以 Agent 和 Manager 身份运行；本地开发由 `start.sh all` 启动两个进程。
 - Public HTTP 默认绑定 `127.0.0.1`；远端暴露必须显式开启。默认要求 HTTPS 或受信任的 TLS 反向代理；只有显式启用 `trusted_lan_http` 且接受本规格第 6.2 节信任假设时，才允许在配置的私有 CIDR 内使用 HTTP。
-- Local Ingest HTTP 单独绑定 `127.0.0.1`，不得配置为非 loopback 地址。
-- Public HTTP 和 Local Ingest HTTP 可以由同一主进程启动两个监听器，但二者使用不同端口、认证策略和路由集合。
+- Local Ingest HTTP 单独绑定 `127.0.0.1` 或 `::1`，不得配置为非 loopback 地址；它不执行 token 认证，并显式信任本机全部用户和进程。
+- Public HTTP 和 Local Ingest HTTP 可以由同一主进程启动两个监听器，但二者使用不同端口、暴露策略和路由集合。
 - 默认端口：Public `8765`，Local Ingest `8766`。
 - Manager 只暴露自己的浏览器会话；Agent 凭据始终保留在 Manager 服务端。
 
@@ -181,7 +184,7 @@ Manager application modules
 ```text
 backend/ic_env_guard/
   bootstrap/       配置加载、Composition Root、进程生命周期
-  auth/            浏览器认证、producer 认证、权限上下文
+  auth/            浏览器/Manager credential 认证和权限上下文
   enrollment/      Agent/Manager enrollment 用例、系统 SSH/CLI/Unix socket 适配器、激活和撤销
   terminal/        PTY 会话、回放、ticket、WebSocket 应用服务
   observations/    Observation 模型、验证、TTL、upsert/query 用例
@@ -221,7 +224,7 @@ backend/ic_env_guard/
 - token 文件必须是普通文件，权限不得允许非 owner 读取。
 - Public HTTP 非 loopback 暴露默认必须启用 HTTPS 或部署在受信任 TLS 反向代理之后。显式 `trusted_lan_http` profile 是例外：它把传输机密性委托给受控内网，UI 和部署文档必须持续显示未加密警告。
 - 登录失败必须限流并写入安全审计。
-- token、Terminal ticket 和 producer token 不得出现在日志、审计、metrics、API 错误或前端持久化状态中。
+- token 和 Terminal ticket 不得出现在日志、审计、metrics、API 错误或前端持久化状态中。
 - v2 将当前认证身份明确命名为 `local-admin`；多用户身份系统不在本规格范围内。
 
 ### 6.2 Manager 到 Agent 的身份
@@ -307,7 +310,7 @@ SSH adapter 固定设置 `PreferredAuthentications=publickey`、`PasswordAuthent
 
 #### 6.2.4 长期凭据与传输
 
-- Manager-specific token 在 Agent 上形成独立、可撤销的认证主体 `manager:<manager_id>`；初版授予与 `local-admin` 相同的 Manager API 能力，但不能用于 Local Ingest。
+- Manager-specific token 在 Agent 上形成独立、可撤销的认证主体 `manager:<manager_id>`；初版授予与 `local-admin` 相同的 Manager API 能力。Local Ingest 不处理任何 bearer token，并且只存在于独立 loopback listener。
 - Agent 支持多个独立 Manager credential；轮换时先验证新 token，再原子替换 Manager credential reference，最后撤销旧 token。
 - Manager 将 token 原子写入 `credential_directory` 下随机 opaque 文件名的独立文件。文件由 Manager 运行账号拥有、权限为 `0600`；SQLite 只保存 credential reference。
 - Credential Store 写入使用同目录临时文件、`fsync`、`chmod` 和 atomic rename；失败时请求远端 revoke，只有确认未激活/已撤销后才删除本地 token。启动 cleanup 只能删除既无 Registry reference、也无非 terminal enrollment/rotation journal reference 的 orphan。
@@ -420,7 +423,8 @@ PUT /api/v2/observations
 ```
 
 - 仅在 Local Ingest listener 提供。
-- 必须通过 producer bearer token 认证。
+- 不需要 token、cookie 或 `Authorization` header；listener 的 loopback 网络边界就是唯一访问边界。
+- 实际 TCP peer 必须是 loopback；忽略 `Forwarded`、`X-Forwarded-For` 和类似代理 header，部署文档禁止反向代理或端口转发暴露该 listener。
 - 请求体是单个 Observation。
 - 新建返回 `201`，更新或幂等重试返回 `200`。
 - 响应返回规范化后的完整记录，包括 `identity_key`、`received_at`、`expires_at` 和 `stale`。
@@ -502,7 +506,7 @@ PUT /api/v2/logs/{log_id}
 ```
 
 - 仅在 Local Ingest listener 提供。
-- 使用 producer bearer token。
+- 不需要 token、cookie 或 `Authorization` header，并遵循与 Observation Ingest 相同的 loopback-only 规则。
 - 新建返回 `201`，更新或幂等重试返回 `200`。
 
 ### 10.2 Public Read API
@@ -858,6 +862,8 @@ updated_at         TEXT NOT NULL
 - `expires_at`；
 - `last_updated`。
 
+Local Ingest 没有 producer identity；`observations.producer_id` 和 `log_sources.producer_id` 均由 Repository 强制写为常量 `local`，只为 schema/迁移兼容保留该列。
+
 ### 14.3 Agent `manager_credentials`
 
 Agent 为每个 Manager 保存独立 credential：
@@ -1016,13 +1022,14 @@ ic_env_log_source_stale{log_id="innovus-run-log"} 0
 
 ## 16. Local Producer 模型
 
-### 16.1 Producer 认证
+### 16.1 Producer 本地信任边界
 
-- Local Ingest API 只监听 loopback。
-- Producer 使用独立 token 文件，不复用浏览器管理员 token。
-- token 文件权限必须为 owner-only readable。
-- 每个请求解析出稳定 `producer_id`，写入 Observation 或 Log Source。
-- 初始版本支持一个本机 producer token；多 producer token 和细粒度 namespace 权限为后续扩展。
+- Local Ingest API 只监听 `127.0.0.1` 或 `::1`，不执行应用层认证。
+- Agent 主机上的所有本地 Linux 用户和进程都被允许创建或覆盖 Observation、注册 Log Source；这是显式产品假设，不描述为用户级隔离。
+- Agent 不读取 token、cookie、`Authorization`、`Forwarded` 或 `X-Forwarded-For` 来决定 Ingest 权限。
+- `producer_id` 由 Agent 固定写为 `local`。请求体或 header 中提供 `producer_id` 必须拒绝，避免形成看似可信但可伪造的归属信息。
+- 不实现 producer token、token file、token rotation、per-producer namespace 权限或 per-producer audit identity。
+- 请求体大小、字段、`details`、labels、identity/series 数量、并发和 SQLite 写入限制仍然生效，用于控制错误程序造成的资源消耗。
 
 ### 16.2 调度责任
 
@@ -1059,8 +1066,8 @@ enrollment:
 ingest:
   bind: 127.0.0.1
   port: 8766
-  token_file: /etc/ic-env-guard/producer-token
   max_request_bytes: 32768
+  max_concurrent_requests: 16
 
 observations:
   expired_retention_seconds: 86400
@@ -1143,10 +1150,10 @@ control_plane:
 配置校验必须保证：
 
 - `mode` 是 `agent` 时才启动 Local Ingest listener；
-- `ingest.bind` 必须是 loopback 地址；
+- `ingest.bind` 必须是 `127.0.0.1` 或 `::1`；配置模型不接受 hostname、wildcard 或非 loopback 地址；
 - Public 和 Ingest 端口不得相同；
-- producer token 与管理员 token 不得相同；
-- token 文件权限符合安全要求；
+- Local Ingest 不配置 token file、TLS、proxy trust 或远端 allowlist；
+- `ingest.max_concurrent_requests` 必须为 1–128，达到上限返回 `503 ingest_capacity_exceeded`；
 - `allowed_roots` 必须是绝对路径，启动时执行规范化和去重；
 - 所有大小、数量、TTL 和间隔配置在本文规定范围内；
 - 非 loopback Public bind 继续遵循现有 fail-closed 规则；默认要求 verified TLS。`server.trusted_lan_http.enabled=true` 时必须同时配置非空 private `client_cidrs`，且启动日志和 Runtime capability 明确标记无传输加密。
@@ -1190,6 +1197,7 @@ control_plane:
 - schema/范围错误使用 `422`；
 - 时序冲突使用 `409`；
 - 数据库不可用使用 `503 storage_unavailable`；
+- Local Ingest 并发达到上限使用 `503 ingest_capacity_exceeded`；
 - 未预期异常使用 `500 internal_error`，完整堆栈只写入受保护的服务日志。
 
 Manager 至少定义：
@@ -1215,7 +1223,7 @@ Frontend 只根据 `code` 决定交互分支；`message` 用于安全显示，co
 - Terminal 创建、attach、close、timeout 和异常退出；
 - Log tail 请求，包括 actor、log ID、行数、结果和 source address；
 - Log 路径安全拒绝；
-- Observation/Log 写入认证失败；
+- Local Ingest 非 loopback 配置和错误 listener/route 暴露在启动时被拒绝的事件；
 - 配置加载和安全校验失败；
 - 数据库迁移和存储健康变化。
 - Agent validate/add/edit/enable/disable/remove/probe；
@@ -1235,7 +1243,7 @@ Frontend 只根据 `code` 决定交互分支；`message` 用于安全显示，co
 - enrollment token、pending secret、完整 CLI command 或 SSH stdout/stderr；
 - Producer 提交的任意敏感文本。
 
-Observation 正常 upsert 不逐条写入安全审计，避免高吞吐和敏感数据风险；Agent metrics 记录成功、拒绝和失败计数。
+Observation/Log 正常 upsert 不逐条写入安全审计，避免高吞吐和敏感数据风险；Local Ingest 没有登录或认证失败事件。Agent metrics 记录成功、schema 拒绝、容量拒绝和存储失败计数。
 
 Manager 的 enrollment/validate 失败、credential activation/revocation、Registry mutation、Discovery start/cancel 和 routed privileged request 必须复用现有 durable intent/outcome 模型。Audit intent 提交失败时 fail closed，不得创建 enrollment、写 Registry/credential、启动扫描或 dispatch upstream；outcome 提交失败不得把已成功的远端 mutation 伪装成失败重试。
 
@@ -1548,6 +1556,7 @@ Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilitie
 - identity key 的 label canonicalization；
 - TTL、fresh/stale 和 cleanup 判定；
 - 乱序、幂等和 timestamp conflict；
+- Local Ingest 固定 `producer_id=local`，并拒绝请求提供 producer identity；
 - Log realpath、allowed roots 和 symlink escape；
 - tail 行数、字节数、UTF-8 replacement 和 truncation；
 - Prometheus name/label 验证和 series 上限；
@@ -1567,7 +1576,7 @@ Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilitie
 
 ### 22.2 Contract tests
 
-- Local Ingest Observation create/update/error 响应；
+- 无认证 Local Ingest Observation/Log create/update/error 响应，以及固定 `producer_id=local`；
 - Public Observation list/detail/filter/pagination；
 - Log Source upsert/list/detail/tail；
 - 统一 v2 error envelope 和 correlation ID；
@@ -1591,8 +1600,9 @@ Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilitie
 - 文件注册后被删除、替换为 symlink 或移出 allowed root；
 - 1000 行、960 KiB 内容和 1 MiB wire response tail 边界；
 - PTY 创建、输入输出、resize、reconnect、close 和 orphan cleanup；
-- Public 与 Ingest listener 的网络隔离；
-- 管理员 token 和 producer token 权限隔离；
+- Public 与 Ingest listener 的路由/端口隔离，Public listener 不提供任何写入路由；
+- 无 `Authorization` 的 loopback Producer 写入成功，Public/Manager bearer token 对 Local Ingest 不产生额外权限；
+- Local Ingest 并发上限和 `503 ingest_capacity_exceeded` 恢复；
 - Agent restart 后 Terminal 状态 reconciliation 和 Observation 保留；
 - YAML Agent 首次导入、离线/旧版记录不阻塞、本地 credential copy 失败全量回滚、duplicate identity 后续隔离，以及 Manager restart 后 Registry/status 恢复；
 - Agent credential 写入权限、hash-only persistence、两端 restart 后继续认证、更新失败 rollback 和删除；
@@ -1632,11 +1642,12 @@ Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilitie
 
 - 任意路径、`..`、symlink race 和特殊文件读取被拒绝；
 - 非 loopback Ingest bind 被配置校验拒绝；
+- Local Ingest 不信任 forwarded headers，且 Public listener、非 loopback 地址和 control-plane mode 均无法访问 Ingest routes；
 - token 不出现在错误、日志、审计和 metrics；
 - 超大 `details`、深层 JSON、过多 labels 和超大请求被拒绝；
 - Prometheus label cardinality 上限生效；
 - 未认证用户不能读取 Observation、Log 或 Terminal；
-- Producer token 不能调用 Public 管理和 Terminal API；
+- 本地无认证 Producer 只能访问独立 Ingest listener 的 Observation/Log write routes，不能通过该 listener 调用 Public 管理、读取或 Terminal API；
 - 浏览器响应、query cache 和 WebSocket URL 不包含 Agent token；
 - Agent `/healthz`、Discovery、capabilities 和 enrollment response 不返回用户公钥、`authorized_keys` 或 SSH key path；
 - Manager 不枚举/读取/上传个人私钥，不使用 `shell=True`；恶意 user/host/port/option 或 SSH config 中的 HostName/ProxyCommand/ProxyJump/LocalCommand 不能改变 validated effective target 或注入命令，`ssh -G` 与实际连接使用同一固定 overrides；
@@ -1665,7 +1676,7 @@ Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilitie
 7. Log Source 只保存元数据，SQLite 中不存在原始日志内容。
 8. 已授权用户可以通过 Log ID 获取最后 100 行，不能通过 API 读取 allowed roots 外文件。
 9. `details` 最多 16 KiB，可经 SQLite 完整 round-trip，但不出现在 Prometheus labels 中。
-10. Public 和 Ingest listener 使用不同端口和不同 token；Producer token 不能创建 Terminal。
+10. Public 和 Ingest listener 使用不同端口和路由集合；Local Ingest 只绑定 loopback、无需 token，并且不能创建 Terminal、读取数据或调用管理 API。
 11. 所有 v2 错误符合统一 envelope，并包含 correlation ID。
 12. Auth、Terminal、Observations、Logs、Metrics、Audit 和 Storage 可以分别使用内存依赖运行单元测试。
 13. 完整后端测试、frontend test/build 和 lint 全部通过。
@@ -1689,6 +1700,7 @@ Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilitie
 31. 可选 Manager service Ed25519 key 只允许执行 enrollment forced command，不能创建 SSH PTY、任意 Shell 或端口转发。
 32. Enrollment/rotation 在任何远端 issuance/activation 与本地 commit 边界崩溃后都能从 durable journal 恢复、完成撤销或显示可重试 residual，不遗失唯一 token/reference。
 33. Discovery result 只有在 URL、IP、port 和 transport profile 全部匹配时才能绑定 enrollment；注册后的 `source=discovery` 由服务端关系产生，浏览器不能伪造。
+34. Agent 主机任一本地用户都可以通过 loopback Local Ingest 无 token 写入；所有记录的 `producer_id` 固定为 `local`，请求不得伪造 producer identity。
 
 ## 24. 风险与缓解
 
@@ -1756,6 +1768,12 @@ Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilitie
 
 缓解：该 profile 默认关闭，只允许本地配置的 private CIDR，Manager 与 Agent 双方都必须显式启用，UI 持续显示未加密警告。任何不满足“无 Agent 冒充、无主动中间人、无被动抓包”假设的网络必须使用 verified TLS；不能在 UI 中一键忽略 TLS。
 
+### 24.13 本地进程伪造或淹没 Observation
+
+风险：Local Ingest 只依赖 loopback 且没有 token，因此 Agent 主机上的任意用户、被攻陷进程或本地代理都可以创建/覆盖 Observation、注册允许根目录内的 Log Source，或通过大量请求消耗资源。`producer_id=local` 不能提供归属或追责。
+
+缓解：这是本规格明确接受的单机信任模型。Ingest listener 只能绑定 `127.0.0.1`/`::1`，不出现在 Public/Manager listener，不信任 forwarded headers；请求体、字段、identity/series、并发和 SQLite 写入均有界。部署文档必须禁止端口转发/反向代理暴露 8766；若未来需要本机用户隔离，应单独设计 Unix socket owner/group policy，而不是重新加入共享 token。
+
 ## 25. 已确认设计决策
 
 1. 采用模块化单体，不采用微服务。
@@ -1783,3 +1801,4 @@ Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilitie
 23. 默认 transport 是 verified TLS；显式 trusted-LAN HTTP/WS profile 仅用于满足无 Agent 冒充、无主动中间人和无被动抓包假设的私有网络，并持续显示未加密警告。
 24. 普通内网主机即使能够访问 Agent 端口，也必须持有有效 token 才能读取 Agent 数据、创建 Terminal 或执行管理操作。
 25. Enrollment 和 credential rotation 使用 durable journal；远端 credential 已签发/激活后，本地 token/reference 在完成 Registry commit 或确认撤销前不得删除。
+26. Local Producer 通过独立 loopback HTTP listener 无 token 写入；系统信任本机全部用户/进程，`producer_id` 固定为 `local`，不提供 per-producer 身份或权限。
