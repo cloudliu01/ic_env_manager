@@ -55,14 +55,14 @@ class EnrollmentService:
         try:
             self.repository.issue(record, now=current, max_pending=self.max_pending)
         except Exception:
-            self.audit.record_outcome(
+            self._record_outcome(
                 operation=operation,
                 actor_id="local-admin",
                 credential_id=None,
                 result="failed",
             )
             raise
-        self.audit.record_outcome(
+        self._record_outcome(
             operation=operation,
             actor_id="local-admin",
             credential_id=record.credential_id,
@@ -96,6 +96,30 @@ class EnrollmentService:
             state=matched.state,
         )
 
+    def authenticate_revoked_for_revoke(
+        self, token: str, credential_id: str
+    ) -> ManagerCredentialContext | None:
+        try:
+            target_id = canonical_uuid(credential_id, "credential_id")
+        except ValueError:
+            return None
+        candidate = _token_hash(token)
+        matched: ManagerCredential | None = None
+        for record in self.repository.list_all():
+            if hmac.compare_digest(candidate, record.token_hash):
+                matched = record
+        if (
+            matched is None
+            or matched.state is not CredentialState.REVOKED
+            or matched.credential_id != target_id
+        ):
+            return None
+        return ManagerCredentialContext(
+            credential_id=matched.credential_id,
+            manager_id=matched.manager_id,
+            state=matched.state,
+        )
+
     def activate(
         self,
         credential_id: str,
@@ -118,7 +142,7 @@ class EnrollmentService:
             or context.credential_id != credential_id
             or context.state not in (CredentialState.PENDING, CredentialState.ACTIVE)
         ):
-            self.audit.record_outcome(
+            self._record_outcome(
                 operation=operation,
                 actor_id=actor_id,
                 credential_id=credential_id,
@@ -129,14 +153,14 @@ class EnrollmentService:
             credential_id, enrollment_id, _token_hash(token), current
         )
         if record is None:
-            self.audit.record_outcome(
+            self._record_outcome(
                 operation=operation,
                 actor_id=actor_id,
                 credential_id=credential_id,
                 result="denied",
             )
             raise EnrollmentForbidden("credential activation is forbidden")
-        self.audit.record_outcome(
+        self._record_outcome(
             operation=operation,
             actor_id=record.actor_id,
             credential_id=credential_id,
@@ -162,7 +186,7 @@ class EnrollmentService:
         )
         record = self.repository.get(credential_id)
         if record is None:
-            self.audit.record_outcome(
+            self._record_outcome(
                 operation=operation,
                 actor_id=actor_id,
                 credential_id=credential_id,
@@ -172,7 +196,7 @@ class EnrollmentService:
         if actor_id != "local-admin" and (
             manager_id is None or manager_id != record.manager_id
         ):
-            self.audit.record_outcome(
+            self._record_outcome(
                 operation=operation,
                 actor_id=actor_id,
                 credential_id=credential_id,
@@ -181,8 +205,14 @@ class EnrollmentService:
             raise EnrollmentForbidden("credential revocation is forbidden")
         revoked = self.repository.revoke(credential_id, current)
         if revoked is None:
+            self._record_outcome(
+                operation=operation,
+                actor_id=actor_id,
+                credential_id=credential_id,
+                result="failed",
+            )
             raise CredentialNotFound("credential not found")
-        self.audit.record_outcome(
+        self._record_outcome(
             operation=operation,
             actor_id=actor_id,
             credential_id=credential_id,
@@ -194,6 +224,20 @@ class EnrollmentService:
         if actor_id != "local-admin":
             raise EnrollmentForbidden("credential listing is forbidden")
         return self.repository.list_all()
+
+    def _record_outcome(
+        self, *, operation: str, actor_id: str, credential_id: str | None, result: str
+    ) -> None:
+        try:
+            self.audit.record_outcome(
+                operation=operation,
+                actor_id=actor_id,
+                credential_id=credential_id,
+                result=result,
+            )
+        except Exception:
+            # The mutation may already be durable; never invite an unsafe retry.
+            return
 
 
 def _token_hash(token: str) -> str:

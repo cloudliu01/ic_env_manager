@@ -98,6 +98,34 @@ def test_metadata_never_exposes_token_or_hash_and_enforces_revoke_ownership(app_
 
 @pytest.mark.contract
 @pytest.mark.security
+def test_revoked_token_can_only_retry_delete_of_itself(app_client):
+    app, client = app_client
+    service = app.state.container.enrollment_service
+    first = service.issue_pending(MANAGER_ID, "retry-enrollment", now=datetime.now(UTC))
+    service.activate(first.credential_id, "retry-enrollment", first.token)
+    other = service.issue_pending(MANAGER_ID, "other-enrollment", now=datetime.now(UTC))
+    service.activate(other.credential_id, "other-enrollment", other.token)
+    headers = {"Authorization": f"Bearer {first.token}"}
+
+    first_delete = client.delete(
+        f"/api/v2/manager-credentials/{first.credential_id}", headers=headers
+    )
+    retry = client.delete(
+        f"/api/v2/manager-credentials/{first.credential_id}", headers=headers
+    )
+
+    assert first_delete.status_code == 200
+    assert retry.status_code == 200
+    assert retry.json() == {"credential_id": first.credential_id, "state": "revoked"}
+    assert client.get("/api/v2/summary", headers=headers).status_code == 401
+    assert client.get("/api/terminals", headers=headers).status_code == 401
+    assert client.delete(
+        f"/api/v2/manager-credentials/{other.credential_id}", headers=headers
+    ).status_code in (401, 403)
+
+
+@pytest.mark.contract
+@pytest.mark.security
 def test_ingest_app_never_invokes_manager_credential_verifier(app_client, monkeypatch):
     from ic_env_guard.main import create_ingest_app
 

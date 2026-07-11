@@ -189,6 +189,68 @@ def test_lifecycle_audit_is_fail_closed_and_contains_no_secret(container, monkey
     assert hashlib.sha256(issued.token.encode()).hexdigest() not in values
 
 
+@pytest.mark.unit
+def test_outcome_audit_failure_never_turns_completed_mutation_into_failure(container):
+    class ThrowingOutcomeAudit:
+        def record_intent(self, **_values):
+            return None
+
+        def record_outcome(self, **_values):
+            raise sqlite3.OperationalError("outcome unavailable")
+
+    service = container.enrollment_service
+    service.audit = ThrowingOutcomeAudit()
+
+    issued = service.issue_pending(MANAGER_ID, "outcome-failure", now=NOW)
+    activated = service.activate(
+        issued.credential_id, "outcome-failure", issued.token, now=NOW
+    )
+    revoked = service.revoke(
+        issued.credential_id,
+        actor_id="local-admin",
+        manager_id=None,
+        now=NOW,
+    )
+
+    assert issued.credential.state is CredentialState.PENDING
+    assert activated.state is CredentialState.ACTIVE
+    assert revoked.state is CredentialState.REVOKED
+    assert container.manager_credential_repository.get(issued.credential_id).state is (
+        CredentialState.REVOKED
+    )
+
+
+@pytest.mark.unit
+def test_intent_audit_failure_blocks_activation_and_revoke_without_mutation(container):
+    service = container.enrollment_service
+    pending = service.issue_pending(MANAGER_ID, "blocked-activation", now=NOW)
+    active = service.issue_pending(MANAGER_ID, "blocked-revoke", now=NOW)
+    service.activate(active.credential_id, "blocked-revoke", active.token, now=NOW)
+
+    service.audit.record_intent = lambda **_: (_ for _ in ()).throw(
+        sqlite3.OperationalError("intent unavailable")
+    )
+
+    with pytest.raises(sqlite3.OperationalError):
+        service.activate(
+            pending.credential_id, "blocked-activation", pending.token, now=NOW
+        )
+    with pytest.raises(sqlite3.OperationalError):
+        service.revoke(
+            active.credential_id,
+            actor_id="local-admin",
+            manager_id=None,
+            now=NOW,
+        )
+
+    assert container.manager_credential_repository.get(pending.credential_id).state is (
+        CredentialState.PENDING
+    )
+    assert container.manager_credential_repository.get(active.credential_id).state is (
+        CredentialState.ACTIVE
+    )
+
+
 def sqlite3_to_sqlalchemy(statement: str):
     from sqlalchemy import text
 

@@ -76,7 +76,7 @@ class ManagerCredential:
 
     @property
     def actor_id(self) -> str:
-        if self.state is CredentialState.ACTIVE:
+        if self.state in (CredentialState.ACTIVE, CredentialState.REVOKED):
             return f"manager:{self.manager_id}"
         return f"pending-manager:{self.manager_id}"
 
@@ -111,7 +111,7 @@ class ManagerCredentialContext:
 
     @property
     def actor_id(self) -> str:
-        if self.state is CredentialState.ACTIVE:
+        if self.state in (CredentialState.ACTIVE, CredentialState.REVOKED):
             return f"manager:{self.manager_id}"
         return f"pending-manager:{self.manager_id}"
 

@@ -4,9 +4,10 @@ from fastapi import APIRouter, Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 
+from ic_env_guard.api.errors import ApiError
 from ic_env_guard.api.runtime import require_v2_auth
 from ic_env_guard.api.v2_errors import V2ApiError
-from ic_env_guard.auth.dependencies import AuthContext, require_auth
+from ic_env_guard.auth.dependencies import AuthContext, AuthState, get_auth_state
 from ic_env_guard.enrollment.models import (
     CredentialNotFound,
     CredentialStorageError,
@@ -70,9 +71,25 @@ def activate_credential(
 @router.delete("/{credential_id}")
 def revoke_credential(
     credential_id: str,
-    actor: Annotated[AuthContext, Depends(require_auth)],
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_AUTH_SCHEME)],
+    auth_state: Annotated[AuthState, Depends(get_auth_state)],
     service: Annotated[EnrollmentService, Depends(get_enrollment_service)],
 ) -> dict[str, str]:
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise V2ApiError(401, "unauthorized", "missing bearer token")
+    try:
+        actor = auth_state.authenticate(credentials.credentials)
+    except ApiError:
+        revoked_context = service.authenticate_revoked_for_revoke(
+            credentials.credentials, credential_id
+        )
+        if revoked_context is None:
+            raise V2ApiError(401, "unauthorized", "invalid bearer token") from None
+        actor = AuthContext(
+            revoked_context.actor_id,
+            manager_id=revoked_context.manager_id,
+            credential_id=revoked_context.credential_id,
+        )
     try:
         record = service.revoke(
             credential_id,
