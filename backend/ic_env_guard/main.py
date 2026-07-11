@@ -41,7 +41,15 @@ from ic_env_guard.api.errors import register_error_handlers
 from ic_env_guard.api.fleet import router as fleet_router
 from ic_env_guard.api.health import router as health_router
 from ic_env_guard.api.ingest_guard import IngestCapacityMiddleware
+from ic_env_guard.api.ingest_logs import router as ingest_logs_router
 from ic_env_guard.api.ingest_observations import router as ingest_observations_router
+from ic_env_guard.api.logs import (
+    AgentLogTailAuditRecorder,
+    get_log_source_service,
+    get_log_tail_audit_recorder,
+    get_logs_config,
+)
+from ic_env_guard.api.logs import router as logs_router
 from ic_env_guard.api.metrics import (
     MetricsAccessPolicy,
     get_metrics_access_policy,
@@ -248,7 +256,10 @@ def create_app(
             if (
                 mode == "agent"
                 and request.method == "PUT"
-                and request.url.path == "/api/v2/observations"
+                and (
+                    request.url.path == "/api/v2/observations"
+                    or request.url.path.startswith("/api/v2/logs/")
+                )
             ):
                 response = v2_error_response(
                     404, "not_found", "resource not found", correlation_id
@@ -371,8 +382,18 @@ def create_app(
         app.dependency_overrides[get_observation_service] = (
             lambda: container.observation_service
         )
+        app.dependency_overrides[get_log_source_service] = (
+            lambda: container.log_source_service
+        )
+        app.dependency_overrides[get_logs_config] = lambda: container.logs_config
+        app.dependency_overrides[get_log_tail_audit_recorder] = lambda: (
+            AgentLogTailAuditRecorder(
+                container.session_factory, container.audit_storage_health
+            )
+        )
         app.include_router(local_capabilities_router)
         app.include_router(observations_router)
+        app.include_router(logs_router)
         app.include_router(terminals_router)
         app.include_router(services_router)
         app.include_router(metrics_router)
@@ -422,9 +443,10 @@ def create_ingest_app(container: AgentContainer) -> FastAPI:
         )
         request.state.correlation_id = correlation_id
         try:
-            if (
+            if request.method != "PUT" and (
                 request.url.path == "/api/v2/observations"
-                and request.method != "PUT"
+                or request.url.path == "/api/v2/logs"
+                or request.url.path.startswith("/api/v2/logs/")
             ):
                 response = v2_error_response(
                     404, "not_found", "resource not found", correlation_id
@@ -439,7 +461,9 @@ def create_ingest_app(container: AgentContainer) -> FastAPI:
     app.dependency_overrides[get_observation_service] = (
         lambda: container.observation_service
     )
+    app.dependency_overrides[get_log_source_service] = lambda: container.log_source_service
     app.include_router(ingest_observations_router)
+    app.include_router(ingest_logs_router)
     app.add_middleware(
         IngestCapacityMiddleware,
         maximum=container.config.ingest.max_concurrent_requests,

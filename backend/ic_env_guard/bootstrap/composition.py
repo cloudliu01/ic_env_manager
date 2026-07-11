@@ -13,16 +13,19 @@ from ic_env_guard.agents.registry import AgentRegistry
 from ic_env_guard.agents.terminal_proxy import GatewayProxyLimiter, GatewayTicketStore
 from ic_env_guard.api.audit_health import AuditStorageHealth
 from ic_env_guard.bootstrap.identity import load_or_create_instance_id
-from ic_env_guard.config.models import AppConfig, MetricsConfig, ServiceConfig
+from ic_env_guard.config.models import AppConfig, LogsConfig, MetricsConfig, ServiceConfig
 from ic_env_guard.db.control_plane_migrations import run_control_plane_migrations
 from ic_env_guard.db.migrations import run_migrations
 from ic_env_guard.db.services import ServiceRuntime
 from ic_env_guard.db.session import create_session_factory, create_sqlite_engine
+from ic_env_guard.logs.policy import LogPathPolicy, LogTailReader
+from ic_env_guard.logs.service import LogSourceService
 from ic_env_guard.metrics.collector import MetricsCollector
 from ic_env_guard.metrics.registry import create_registry
 from ic_env_guard.monitoring.machines import MachineRegistry
 from ic_env_guard.observations.service import ObservationService
 from ic_env_guard.services.manager import ServiceManager
+from ic_env_guard.storage.log_sources import SQLiteLogSourceRepository
 from ic_env_guard.storage.observations import SQLiteObservationRepository
 from ic_env_guard.terminal.manager import TerminalManager
 from ic_env_guard.terminal.tickets import TerminalTicketManager
@@ -46,6 +49,11 @@ class AgentContainer:
     audit_storage_health: AuditStorageHealth
     agent_registry: AgentRegistry
     observation_service: ObservationService
+    logs_config: LogsConfig
+    log_path_policy: LogPathPolicy
+    log_source_repository: SQLiteLogSourceRepository
+    log_tail_reader: LogTailReader
+    log_source_service: LogSourceService
 
 
 @dataclass
@@ -106,6 +114,13 @@ def build_agent_container(
     metrics_collector = MetricsCollector(metrics_registry, terminal_manager, service_manager)
     metrics_collector.refresh()
     observation_service = ObservationService(SQLiteObservationRepository(database_engine))
+    logs_config = config.logs if config else LogsConfig()
+    log_path_policy = LogPathPolicy(logs_config.allowed_roots)
+    log_source_repository = SQLiteLogSourceRepository(database_engine)
+    log_tail_reader = LogTailReader(log_path_policy, max_bytes=logs_config.max_tail_bytes)
+    log_source_service = LogSourceService(
+        log_source_repository, log_path_policy, log_tail_reader
+    )
     return AgentContainer(
         config=config,
         instance_id=load_or_create_instance_id(
@@ -125,6 +140,11 @@ def build_agent_container(
         audit_storage_health=AuditStorageHealth(),
         agent_registry=AgentRegistry(config.agents if config else []),
         observation_service=observation_service,
+        logs_config=logs_config,
+        log_path_policy=log_path_policy,
+        log_source_repository=log_source_repository,
+        log_tail_reader=log_tail_reader,
+        log_source_service=log_source_service,
     )
 
 
