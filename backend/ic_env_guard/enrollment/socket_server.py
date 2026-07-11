@@ -1,6 +1,7 @@
 import ctypes
 import json
 import os
+import secrets
 import socket
 import stat
 import struct
@@ -72,6 +73,7 @@ class EnrollmentSocketServer:
         self._thread: threading.Thread | None = None
         self._thread_started = False
         self._identity: tuple[int, int] | None = None
+        self._temporary_path: Path | None = None
         self._healthy = False
         self._state_lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -92,25 +94,29 @@ class EnrollmentSocketServer:
         self._validate_parent()
         if self.path.exists() or self.path.is_symlink():
             raise SocketSecurityError("enrollment socket path already exists")
+        temporary_path = self.path.parent / f".e-{secrets.token_hex(8)}"
+        self._temporary_path = temporary_path
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            listener.bind(str(self.path))
-            metadata = self._bound_path_metadata()
+            listener.bind(str(temporary_path))
+            metadata = self._bound_path_metadata(temporary_path)
             self._identity = (metadata.st_dev, metadata.st_ino)
             self._validate_bound_path(metadata)
-            os.chmod(self.path, self.mode)
-            metadata = self._bound_path_metadata()
+            os.chmod(temporary_path, self.mode)
+            metadata = self._bound_path_metadata(temporary_path)
             if (metadata.st_dev, metadata.st_ino) != self._identity:
                 raise SocketSecurityError("enrollment socket path changed during startup")
             if stat.S_IMODE(metadata.st_mode) & ~self.mode:
                 raise SocketSecurityError("enrollment socket permissions are too broad")
             listener.listen(8)
             listener.settimeout(0.1)
+            os.link(temporary_path, self.path, follow_symlinks=False)
+            if self._remove_path_if_owned(temporary_path):
+                self._temporary_path = None
         except Exception:
             listener.close()
-            if self._identity is None:
-                self._adopt_bound_path_for_cleanup()
             self._remove_if_owned()
+            self._remove_temporary_if_owned()
             self._identity = None
             raise
         thread = threading.Thread(target=self._serve, daemon=True)
@@ -149,6 +155,7 @@ class EnrollmentSocketServer:
         if thread is not None and thread_started:
             thread.join(timeout=2)
         self._remove_if_owned()
+        self._remove_temporary_if_owned()
         self._identity = None
 
     def _rollback_start(self, listener: socket.socket) -> None:
@@ -160,6 +167,7 @@ class EnrollmentSocketServer:
             self._thread_started = False
         listener.close()
         self._remove_if_owned()
+        self._remove_temporary_if_owned()
         self._identity = None
 
     def _validate_parent(self) -> None:
@@ -174,17 +182,17 @@ class EnrollmentSocketServer:
         if stat.S_IMODE(metadata.st_mode) & 0o022:
             raise SocketSecurityError("enrollment socket directory permissions are unsafe")
 
-    def _bound_path_metadata(self) -> os.stat_result:
+    def _bound_path_metadata(self, path: Path) -> os.stat_result:
         last_error: OSError | None = None
         for _ in range(3):
             try:
-                return os.lstat(self.path)
+                return os.lstat(path)
             except FileNotFoundError:
                 raise
             except OSError as exc:
                 last_error = exc
         try:
-            return os.stat(self.path, follow_symlinks=False)
+            return os.stat(path, follow_symlinks=False)
         except OSError as exc:
             if last_error is not None:
                 raise last_error from exc
@@ -196,14 +204,6 @@ class EnrollmentSocketServer:
             raise SocketSecurityError("enrollment socket is not a socket")
         if metadata.st_uid != os.geteuid():
             raise SocketSecurityError("enrollment socket owner is unsafe")
-
-    def _adopt_bound_path_for_cleanup(self) -> None:
-        try:
-            metadata = self._bound_path_metadata()
-            self._validate_bound_path(metadata)
-        except (OSError, SocketSecurityError):
-            return
-        self._identity = (metadata.st_dev, metadata.st_ino)
 
     def _serve(self) -> None:
         try:
@@ -273,11 +273,24 @@ class EnrollmentSocketServer:
             return
 
     def _remove_if_owned(self) -> None:
+        self._remove_path_if_owned(self.path)
+
+    def _remove_temporary_if_owned(self) -> None:
+        if self._temporary_path is not None and self._remove_path_if_owned(
+            self._temporary_path
+        ):
+            self._temporary_path = None
+
+    def _remove_path_if_owned(self, path: Path) -> bool:
         if self._identity is None:
-            return
+            return False
         try:
-            metadata = self._bound_path_metadata()
+            metadata = self._bound_path_metadata(path)
+        except FileNotFoundError:
+            return True
         except OSError:
-            return
+            return False
         if (metadata.st_dev, metadata.st_ino) == self._identity and stat.S_ISSOCK(metadata.st_mode):
-            self.path.unlink()
+            path.unlink()
+            return True
+        return False

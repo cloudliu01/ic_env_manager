@@ -250,7 +250,7 @@ def test_post_bind_chmod_failure_removes_only_owned_socket_and_allows_retry(
 
     def fail_first_chmod(target, mode):
         nonlocal failed
-        if Path(target) == path and not failed:
+        if Path(target).parent == socket_dir and not failed:
             failed = True
             raise PermissionError("chmod failed after bind")
         return real_chmod(target, mode)
@@ -285,7 +285,7 @@ def test_first_post_bind_lstat_failure_is_retried_before_mutation(
 
     def fail_first_lstat(target, *args, **kwargs):
         nonlocal failed
-        if Path(target) == path and not failed:
+        if Path(target).parent == socket_dir and not failed:
             failed = True
             raise OSError("transient lstat failure")
         return real_lstat(target, *args, **kwargs)
@@ -299,3 +299,83 @@ def test_first_post_bind_lstat_failure_is_retried_before_mutation(
     finally:
         server.stop()
     assert not path.exists()
+
+
+@pytest.mark.security
+def test_persistent_metadata_failure_never_publishes_final_and_retry_recovers(
+    tmp_path, socket_dir, monkeypatch
+):
+    container = build_agent_container(None, tmp_path / "state.db", tmp_path / "instance-id")
+    path = socket_dir / "enroll.sock"
+    server = EnrollmentSocketServer(
+        path, 0o600, container.instance_id, container.enrollment_service
+    )
+    real_lstat = os.lstat
+    real_stat = os.stat
+    metadata_unavailable = True
+
+    def is_socket_candidate(target) -> bool:
+        candidate = Path(target)
+        return candidate.parent == socket_dir and candidate != socket_dir
+
+    def failing_lstat(target, *args, **kwargs):
+        if metadata_unavailable and is_socket_candidate(target):
+            raise OSError("persistent metadata failure")
+        return real_lstat(target, *args, **kwargs)
+
+    def failing_stat(target, *args, **kwargs):
+        if metadata_unavailable and is_socket_candidate(target):
+            raise OSError("persistent metadata failure")
+        return real_stat(target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", failing_lstat)
+    monkeypatch.setattr(os, "stat", failing_stat)
+
+    with pytest.raises(OSError, match="persistent metadata failure"):
+        server.start()
+
+    assert path.name not in os.listdir(socket_dir)
+    assert not server.healthy
+    assert server._socket is None
+    assert server._thread is None
+    assert server._identity is None
+
+    metadata_unavailable = False
+    server.start()
+    try:
+        assert server.healthy
+        assert parse_response(_exchange(path, _request())).token
+    finally:
+        server.stop()
+    assert not path.exists()
+
+
+@pytest.mark.security
+def test_atomic_publish_never_overwrites_or_removes_racing_final_path(
+    tmp_path, socket_dir, monkeypatch
+):
+    container = build_agent_container(None, tmp_path / "state.db", tmp_path / "instance-id")
+    path = socket_dir / "enroll.sock"
+    server = EnrollmentSocketServer(
+        path, 0o600, container.instance_id, container.enrollment_service
+    )
+    real_link = os.link
+
+    def replace_before_link(source, destination, *args, **kwargs):
+        assert Path(destination) == path
+        path.write_text("replacement", encoding="utf-8")
+        return real_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", replace_before_link)
+
+    try:
+        with pytest.raises(FileExistsError):
+            server.start()
+    finally:
+        if server.healthy:
+            server.stop()
+
+    assert path.read_text(encoding="utf-8") == "replacement"
+    assert server._socket is None
+    assert server._thread is None
+    assert server._identity is None
