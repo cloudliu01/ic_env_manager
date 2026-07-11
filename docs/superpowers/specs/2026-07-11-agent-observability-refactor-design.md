@@ -12,6 +12,8 @@
 
 本次重构保留一个代码库和一个安装包，但明确两种可组合的运行方式：每台 Linux Server 上运行可独立使用的 Agent；需要集中管理时，额外运行一个轻量 Manager。Agent 保留浏览器登录和 PTY Shell，并提供本地数据写入 API、SQLite 最新状态存储、远端查询 API 和 Prometheus 兼容导出。Manager 提供 Agent 注册、删除、验证、状态探测、受控网络发现、API/Terminal 代理和统一 Fleet Web Console。
 
+Manager 默认通过一次性 SSH enrollment 证明操作者已经能以 Agent 所在主机的现有 Linux 用户登录，并为该 Manager 注册独立、可撤销的 Agent token；之后的查询、Terminal 和管理操作继续使用 HTTP/WebSocket，不建立长期 SSH tunnel。该流程不要求 Manager 与 Agent 用户名一致，不创建专用 Linux 用户，也不依赖 NIS、LDAP 或跨网络统一 UID。Manager 以普通用户运行时可以非交互调用系统 OpenSSH；以 systemd 服务运行时由当前用户 CLI 完成同一 enrollment，并通过本地 Unix socket 把结果交给 Manager。现有 Agent token 表单保留为兼容回退。
+
 监控逻辑不内置到 Agent。Shell、Python 程序、cron job、systemd timer 或其他本地工具负责采集数据，再把最新 Observation 或 Log Source 元数据提交给 Agent。Agent 负责输入校验、TTL、持久化、权限控制、查询和导出。
 
 代码采用模块化单体：模块可以独立开发和测试，但每种运行模式仍是一个主进程。Manager 不是新的微服务集群，也不复制 Agent 的长期监控数据；Prometheus 继续负责时间序列历史。浏览器在 Manager 模式下只连接 Manager，不持有 Agent token，也不直接扫描网络或连接 Agent。
@@ -63,9 +65,10 @@
 12. Manager 用户可以按 Agent 地址添加、验证、编辑、启停和删除 Agent。
 13. Manager 必须列出所有 Agent，并显示地址、连接状态、版本、能力、最后探测时间、Observation 状态和受管服务摘要。
 14. Manager 可以在本地配置允许的网络范围和端口集合内执行受控 Agent 发现。
-15. 发现结果必须经过凭据验证才能加入注册表，扫描成功不等于信任或注册成功。
+15. 发现结果必须经过 SSH enrollment 或显式 Agent token 验证才能加入注册表，扫描成功不等于获得 Agent 权限或注册成功。
 16. Manager 用户可以从 Agent 详情进入 Terminal、Services、Observations、Logs、Metrics 和 Audit，不需要重新输入 Agent token。
 17. Manager 不保存 Observation/Prometheus 长期历史，只缓存 Fleet 页面所需的最新状态摘要。
+18. 普通用户进程和 systemd Manager 共用同一 enrollment 契约；Manager daemon 不读取、上传或保存个人 SSH 私钥。
 
 ### 3.2 工程目标
 
@@ -75,7 +78,7 @@
 4. HTTP、SQLite 和 Prometheus 通过端口/适配器连接到应用层。
 5. `create_app()` 不再直接构造所有业务对象；组合集中在 Bootstrap Composition Root。
 6. Agent v2 契约使用明确版本、统一错误格式和可重复的 contract tests。
-7. Agent Registry、Discovery、Availability 和 Agent Proxy 具有独立应用服务和 Repository 接口。
+7. Agent Registry、Enrollment、Discovery、Availability 和 Agent Proxy 具有独立应用服务和 Repository/adapter 接口。
 8. React 前端按 feature 组织，路由状态进入 URL，远端数据状态由 query cache 管理。
 9. Terminal 状态按 `agent_id + terminal_id` 隔离，切换页面或 Agent 时不得串线。
 10. Agent-only 和 Manager UI 复用同一套 feature，但通过 Runtime Capabilities 决定入口和可见导航。
@@ -88,7 +91,7 @@
 - 将 Manager 拆成多个微服务或引入分布式服务发现；
 - 让浏览器直接访问 Agent token、Agent 内网地址或执行端口扫描；
 - 扫描用户任意输入的 CIDR、端口范围或公网；
-- 发现后自动信任、自动写入凭据或自动安装 Agent；
+- 仅凭 Discovery 自动授权、自动写入凭据或自动安装 Agent；用户显式启动 enrollment 后允许自动验证和保存；
 - 在 Manager 中复制 Prometheus 时间序列或建立第二套监控历史库；
 - 在 Agent 内实现通用调度器、告警引擎或规则引擎；
 - 替代 cron、systemd timer、Prometheus、Alertmanager 或 Grafana；
@@ -98,22 +101,31 @@
 - 通过 Observation API 执行任意命令；
 - 在第一版实现 PAM、LDAP、OIDC 或浏览器用户到多个 Linux 账号的动态映射；
 - 在第一版实现批量共享 Agent token、自动证书签发或 Agent 主动注册；这些能力只有在单 Agent 凭据流程稳定后才能单独设计。
+- 让 Agent HTTP API 返回 `authorized_keys`、客户端公钥或私钥路径，并自行实现 SSH challenge/signature；密钥选择和持有证明交给系统 OpenSSH。
+- 把 SSH 作为常驻 Agent API、Terminal WebSocket 或 Prometheus scrape tunnel；SSH 只用于 enrollment 和显式恢复操作。
+- 要求 Manager 与 Agent 使用同名 Linux 用户、相同 UID、NIS 或统一目录服务。
 
 ## 5. 核心架构
 
 ```text
 Standalone usage
-  Remote Browser ──HTTPS──> Agent Public HTTP / Web UI
+  Remote Browser ──HTTP(S)──> Agent Public HTTP / Web UI
 
 Fleet usage
-  Remote Browser ──HTTPS──> Manager Public HTTP / Fleet Web UI
+  Remote Browser ──HTTP(S)──> Manager Public HTTP / Fleet Web UI
                                   │
                                   ├── Agent Registry + latest status cache
                                   ├── bounded Discovery jobs
+                                  ├── one-time SSH enrollment orchestration
                                   ├── Agent API proxy
                                   └── Terminal WebSocket proxy
                                             │
-                                            └──HTTPS──> Agent(s)
+                                            └──HTTP(S)/WS(S)──> Agent(s)
+
+Enrollment control path
+  Existing Linux user / Manager process
+      └──system OpenSSH──> existing Agent Linux user
+              └──fixed ic-env-guard enrollment helper
 
 Local collectors
   └── localhost HTTP + producer token
@@ -141,6 +153,7 @@ Infrastructure adapters
 Manager application modules
   ├── Agent Registry
   ├── Credential Store
+  ├── Enrollment Orchestrator
   ├── Availability Probe
   ├── Discovery
   ├── Fleet Summary
@@ -155,7 +168,7 @@ Manager application modules
 - 集中管理部署额外运行一个 Manager；现有配置值继续使用 `mode: control-plane`，产品文案统一显示 “Manager”。
 - Manager 是一个主进程和一个 SQLite 数据库，不要求 PostgreSQL、Broker 或 Kubernetes。
 - 同一进程实例不能同时以 Agent 和 Manager 身份运行；本地开发由 `start.sh all` 启动两个进程。
-- Public HTTP 默认绑定 `127.0.0.1`；远端暴露必须显式开启并通过 HTTPS 或受信任的 TLS 反向代理。
+- Public HTTP 默认绑定 `127.0.0.1`；远端暴露必须显式开启。默认要求 HTTPS 或受信任的 TLS 反向代理；只有显式启用 `trusted_lan_http` 且接受本规格第 6.2 节信任假设时，才允许在配置的私有 CIDR 内使用 HTTP。
 - Local Ingest HTTP 单独绑定 `127.0.0.1`，不得配置为非 loopback 地址。
 - Public HTTP 和 Local Ingest HTTP 可以由同一主进程启动两个监听器，但二者使用不同端口、认证策略和路由集合。
 - 默认端口：Public `8765`，Local Ingest `8766`。
@@ -169,6 +182,7 @@ Manager application modules
 backend/ic_env_guard/
   bootstrap/       配置加载、Composition Root、进程生命周期
   auth/            浏览器认证、producer 认证、权限上下文
+  enrollment/      Agent/Manager enrollment 用例、系统 SSH/CLI/Unix socket 适配器、激活和撤销
   terminal/        PTY 会话、回放、ticket、WebSocket 应用服务
   observations/    Observation 模型、验证、TTL、upsert/query 用例
   logs/            Log Source 模型、路径策略、tail 用例
@@ -192,8 +206,10 @@ backend/ic_env_guard/
 - 不创建包含跨领域业务逻辑的通用 `utils` 模块。
 - SQLite 可以使用一个数据库文件，但表所有权和 Repository 必须按模块隔离；不得跨 Repository join 后形成隐式耦合。
 - Manager Registry 不得再以启动 YAML 中的 `agents` 列表作为唯一事实来源；YAML 只用于首次导入和本地安全边界。
-- Discovery 只产生未受信任 Candidate，不得直接调用 Registry 写入。
+- Discovery 只产生尚未授权给当前 Manager 的 Candidate，不得直接调用 Registry 写入。
 - Agent Proxy 只接受 Registry 中已启用且已验证的 Agent ID，不接受用户提供的任意 upstream URL。
+- Enrollment 只通过固定协议向 Registry 交付已验证结果；SSH adapter 不读取 Agent 业务数据，Registry 也不执行 SSH。
+- SSH 必须通过参数数组调用系统 `ssh`，不得拼接 shell command；浏览器不能提交任意 SSH option、identity path 或远端命令。
 
 ## 6. 身份认证与 Web Terminal
 
@@ -203,23 +219,102 @@ backend/ic_env_guard/
 - Manager 使用独立管理员 token；Manager 登录凭据和任何 Agent token 不得相同。
 - 浏览器登录 Agent 时只能管理该主机；浏览器登录 Manager 时通过 Manager 访问整个 Fleet。
 - token 文件必须是普通文件，权限不得允许非 owner 读取。
-- Public HTTP 非 loopback 暴露时必须启用 HTTPS 或部署在受信任 TLS 反向代理之后。
+- Public HTTP 非 loopback 暴露默认必须启用 HTTPS 或部署在受信任 TLS 反向代理之后。显式 `trusted_lan_http` profile 是例外：它把传输机密性委托给受控内网，UI 和部署文档必须持续显示未加密警告。
 - 登录失败必须限流并写入安全审计。
 - token、Terminal ticket 和 producer token 不得出现在日志、审计、metrics、API 错误或前端持久化状态中。
 - v2 将当前认证身份明确命名为 `local-admin`；多用户身份系统不在本规格范围内。
 
 ### 6.2 Manager 到 Agent 的身份
 
-- 添加 Agent 时，管理员在 HTTPS 表单中提供 Agent base URL 和 Agent token。
-- `validate` API 只能在内存中使用该 token 完成一次连接验证，不得持久化、记录或返回 token。
-- `create/update` API 必须重新验证同一组连接参数，验证成功后才写 Registry。
-- Manager 将每个 Agent token 原子写入 `credential_directory` 下使用随机 opaque 文件名的独立文件。
-- credential 文件必须由 Manager 运行账号拥有、权限为 `0600`；SQLite 只保存 credential reference，不保存 token 明文。
-- 删除 Agent 时必须删除对应 credential 文件；审计记录保留，但不得包含 token。
+#### 6.2.1 内网信任边界
+
+本规格支持一个显式的 trusted-LAN 部署 profile，其假设是：Discovery 或指定地址返回的 IC Env Guard fingerprint 来自真实 Agent，Manager 到 Agent 的网络路径不存在 Agent 冒充、主动中间人或被动抓包。普通内网主机仍可以主动连接 Agent 端口，因此它们不自动获得 API、Terminal 或 sudo 权限。
+
+该假设允许简化 Agent 服务端身份 bootstrap，但不能取消 Manager 身份认证：Discovery 只证明“这里是 Agent”，SSH enrollment 证明“这个 Manager 的操作者已经被远端现有 Linux 用户授权”。若网络不能满足无冒充和无抓包假设，必须改用 verified-TLS transport，并按正常 OpenSSH host key/Host CA 策略核对服务器身份。
+
+Agent fingerprint、Discovery 和 enrollment info 不得返回 `authorized_keys`、客户端公钥、私钥路径或 token。应用不扫描或解析 `~/.ssh/id_*`；客户端密钥选择、签名和持有证明全部交给系统 OpenSSH。
+
+#### 6.2.2 默认 SSH enrollment
+
+添加 Agent 的默认方式是一次性 SSH enrollment：
+
+1. 用户提供或从 Discovery 预填 Agent base URL，并指定 `ssh_user`、`ssh_host` 和 `ssh_port`；远端用户名允许与 Manager 本地用户名不同。
+2. Manager 创建一个 10 分钟有效、有界且一次消费的 pending enrollment；此时不写 Agent Registry。
+3. enrollment adapter 通过参数数组调用系统 `ssh`，执行固定的 `ic-env-guard agent enroll-manager` helper；不得使用 `shell=True`、任意远端命令或浏览器提交的 SSH option。`manager_id` 和 enrollment nonce 通过有界、版本化 JSON stdin 传入，不进入远端 command line。
+4. 远端 helper 必须以 Agent 运行账号执行，或由现有 sudoers 明确允许调用受保护的 Agent enrollment socket；项目不创建用户、不修改 sudoers，也不自动编辑 `authorized_keys`。
+5. Agent 生成 256-bit 随机 Manager-specific token，只通过 SSH stdout 返回一次，并在 pending 状态只保存 verifier/hash。pending token 只能读取 capabilities/summary 并完成激活，不能创建 Terminal 或执行 Service mutation。
+6. Manager 使用该 token 验证 endpoint、`instance_id`、API version、capabilities 和 summary；用户确认保存后才激活 token，并把 Agent 写入 Registry。
+7. 激活后 Agent 持久化 token hash，Manager Credential Store 保存发送请求所需的 token 明文。未激活的失败、取消或超时在确认 pending expiry 后删除临时 credential；已激活或状态未知时保留 durable journal/reference 直到 Registry commit 或 revoke 确认。
+
+Agent enrollment contract：
+
+```text
+GET    /api/v2/capabilities
+GET    /api/v2/summary
+GET    /api/v2/manager-credentials
+POST   /api/v2/manager-credentials/{credential_id}/activate
+DELETE /api/v2/manager-credentials/{credential_id}
+```
+
+Pending token 只能调用 capabilities/summary 和激活自己的 credential；active Manager token 可以撤销自己以及相同 `manager_id` 的旧 credential，Agent 本地 `local-admin` 可以列出和撤销任意 Manager credential。List 只返回 credential ID、Manager ID、state 和时间字段；Public API 永不列出 token hash。远端 SSH helper 通过受保护的本地 enrollment socket 调用同一个 Enrollment Service，不直接修改 SQLite。
+
+Activate 和 revoke 必须按 credential ID 幂等：重复激活同一 active credential 返回成功；重复撤销已 revoked credential 返回成功但不泄露其他 metadata。Activate 要求 pending token、credential ID 和 enrollment ID 全部匹配；revoke 不比较 enrollment ID，只允许 active token 撤销相同 `manager_id` 的 credential，或允许本地 `local-admin` 撤销任意 credential；其他情况返回 `403`。
+
+SSH helper 使用固定的 versioned JSON 协议。stdin 最大 4 KiB，只接受一个对象：
+
+```json
+{
+  "protocol": "manager-enrollment.v1",
+  "manager_id": "2b576727-4f36-4f08-b90b-e8cbe98ebc80",
+  "enrollment_id": "01J2W4..."
+}
+```
+
+stdout 最大 8 KiB，只返回一个 JSON object，不允许 banner 或附加文本：
+
+```json
+{
+  "protocol": "manager-enrollment.v1",
+  "instance_id": "a670d8f8-6074-4d7e-a118-15f445a25d72",
+  "credential_id": "9dcb5e43-14c0-4056-aaae-fbaf94c27211",
+  "token": "write-only-pending-token",
+  "expires_at": "2026-07-11T10:10:00Z"
+}
+```
+
+Agent 把 pending credential 绑定到 `manager_id + enrollment_id`；重复或过期 enrollment ID 不重新返回 token。Manager 必须核对 protocol、TTL、credential ID、helper `instance_id` 和后续 capabilities `instance_id`，并把 remote credential ID 写入 durable enrollment journal。stderr 仅用于有界安全诊断，不得包含 token。
+
+SSH host key 策略与 HTTP transport 分开，因为 TLS certificate 不认证 SSH server：
+
+- `trusted_lan_http`：auto、CLI 和 service-key 首次连接均可使用 `StrictHostKeyChecking=accept-new`；已记录 key 改变必须失败。
+- `verified_tls` auto：使用 `StrictHostKeyChecking=yes`；未知 host key 返回 `ssh_host_key_unknown` 并引导 CLI，不能在 Web 后台自动接受。
+- `verified_tls` CLI：使用正常 `ask`/known_hosts/Host CA 流程，由当前用户在终端确认；Manager 不代替用户点击确认。
+- `verified_tls` service key：要求预配置 Manager owner 的 known_hosts 或 Host CA，并使用 strict checking；缺失时 enrollment fail closed。
+
+所有 profile 下已记录 host key 变化都必须失败为 `ssh_host_key_changed`，不能静默覆盖。SSH 只承载 enrollment 和显式凭据恢复，不承载日常 Agent API、Terminal WebSocket 或 Prometheus 流量。
+
+SSH adapter 固定设置 `PreferredAuthentications=publickey`、`PasswordAuthentication=no`、`KbdInteractiveAuthentication=no`、`ClearAllForwardings=yes`、`RequestTTY=no`、`PermitLocalCommand=no`、`CanonicalizeHostname=no`，并把 ProxyCommand/ProxyJump 设为 none。Manager 先解析并校验目标 IP，再以 command-line `Hostname=<validated-ip>`、`User=<validated-user>`、`Port=<validated-port>` 和稳定 `HostKeyAlias` 覆盖用户 config；调用前使用 `ssh -G` 验证 effective target 和禁用项，避免第二次 DNS、config rewrite 和目标 TOCTOU。用户 config 只贡献 key/IdentityAgent 等非路由选择；CLI 可以在本机交互解锁加密私钥，但不得向 Web/Manager 传递 passphrase。stdout/stderr、执行时间和响应 JSON 都必须有界。
+
+#### 6.2.3 两种 Manager 运行方式
+
+- **普通用户进程：** Manager 使用自己的进程环境调用系统 OpenSSH，并以 `BatchMode=yes` 自动尝试现有 `ssh-agent`、SSH config 和可非交互使用的 key。加密 key 未加入 `ssh-agent`、需要密码或 sudo 交互时，自动路径立即失败并切换到 CLI 指引；Web 后台不得等待密码输入。
+- **systemd 服务：** Web 创建 pending enrollment 并显示不含 secret 的 CLI 命令。当前 Linux 用户运行 `ic-env-guardctl agent enroll --manager-socket ... --enrollment-id ... --ssh user@host`；CLI 使用该用户自己的 OpenSSH 环境，捕获并解析有界 JSON stdout 但不回显 token，再通过 Manager 本地 Unix socket 提交结果。socket 必须验证 peer credentials、owner/group/mode、enrollment ID、TTL 和单次提交，拒绝 replay。Agent token 不进入 CLI 参数、shell history 或浏览器。
+- **可选无人值守：** systemd Manager 可以配置一把 Manager 专用 Ed25519 SSH key，但不创建专用远端用户。管理员把公钥安装到远端现有用户的 `authorized_keys`，并使用 forced command、禁止 PTY、agent/X11/port forwarding 等限制，使该 key 只能进入 enrollment helper。项目提供精确配置模板和 Agent 端检查命令，但不自动分发或修改该文件，也不声称 Manager 能从网络证明远端限制正确。
+
+三种路径产生完全相同的 Manager-specific token 和 Registry 记录；差异只存在于 SSH adapter。Manager 不读取、上传、复制或保存个人私钥，也不要求 Manager 与 Agent 共享用户名、UID、NIS、LDAP 或其他用户目录。
+
+普通用户已有的 Ed25519、RSA/SHA-2、ECDSA、FIDO 或 SSH certificate 由本机 OpenSSH 按系统策略处理；应用不硬编码 RSA，也不重新启用 legacy `ssh-rsa`/SHA-1。新建的可选 service key 使用 Ed25519。
+
+#### 6.2.4 长期凭据与传输
+
+- Manager-specific token 在 Agent 上形成独立、可撤销的认证主体 `manager:<manager_id>`；初版授予与 `local-admin` 相同的 Manager API 能力，但不能用于 Local Ingest。
+- Agent 支持多个独立 Manager credential；轮换时先验证新 token，再原子替换 Manager credential reference，最后撤销旧 token。
+- Manager 将 token 原子写入 `credential_directory` 下随机 opaque 文件名的独立文件。文件由 Manager 运行账号拥有、权限为 `0600`；SQLite 只保存 credential reference。
+- Credential Store 写入使用同目录临时文件、`fsync`、`chmod` 和 atomic rename；失败时请求远端 revoke，只有确认未激活/已撤销后才删除本地 token。启动 cleanup 只能删除既无 Registry reference、也无非 terminal enrollment/rotation journal reference 的 orphan。
 - Manager 代理请求时从 Credential Store 读取 token，并通过 server-to-server `Authorization` header 发送；浏览器永远看不到该 header。
-- 非 loopback Agent 默认必须使用 HTTPS 和验证通过的证书。开发模式允许显式配置的 loopback HTTP，不允许 UI 临时绕过 TLS 校验。
-- Credential Store 写入必须使用同目录临时文件、`fsync`、`chmod` 和 atomic rename；数据库提交失败时删除新文件，启动时清理无 Registry reference 的 orphan。
-- credential directory 必须是 Manager owner 的真实目录而非 symlink；credential 必须是 Manager owner 的普通文件，不得接受 symlink、device 或 group/other readable 文件。
+- 默认 transport 是 verified TLS。显式配置的 `trusted_lan_http` 允许在 `allowed_agent_cidrs` 内使用 HTTP/WS，但 token、Terminal 内容和日志响应此时没有传输加密；UI 不允许临时开启或隐藏该警告。
+- Manual Agent admin token 只作为旧配置导入和高级恢复路径保留；默认 Add Agent UI 不要求用户复制 token。该 token 仍遵循 write-only、验证后持久化和不回显规则。
+- 在线删除 Agent 时先 best-effort 撤销远端 Manager credential，再删除本地 Registry 和 credential；Agent 离线时允许用户明确确认 local-only removal，并提示远端 credential 仍需在 Agent 本地撤销。
 
 ### 6.3 Shell 权限语义
 
@@ -463,12 +558,15 @@ Agent 安装时生成稳定 UUID `instance_id` 并写入 `/var/lib/ic-env-guard/
     "services.v1",
     "observations.v2",
     "logs.v2",
-    "summary.v2"
+    "summary.v2",
+    "manager-enrollment.v1"
   ]
 }
 ```
 
 `instance_id` 使用标准小写 UUID。Agent identity file 不是 secret，但必须只允许管理员修改；文件缺失或格式错误时 Agent 启动失败并给出恢复指引，不能每次启动生成新 ID。
+
+Manager 首次启动时也生成稳定小写 UUID `manager_id`，持久化在 Manager SQLite metadata 中。重新 enrollment 使用相同 `manager_id`，Agent 可以识别这是凭据轮换而不是一个未知 Manager；恢复 Manager 数据库时必须连同该 ID 和 Credential Store 一起恢复。
 
 Manager Registry 保存：
 
@@ -476,13 +574,16 @@ Manager Registry 保存：
 - Agent 自报且全局唯一的 `instance_id`；
 - 管理员可修改的 `display_name`；
 - 规范化 endpoint；
-- `credential_ref`；
-- 本地 TLS profile reference；
+- Manager-specific `credential_ref` 和远端 opaque `credential_id`；
+- 本地 transport profile reference；
+- enrollment method（`ssh_auto`、`ssh_cli`、`ssh_service_key` 或 `legacy_admin_token`）；
 - enabled 状态；
 - 创建/更新时间；
 - 最近一次验证的版本和 capabilities。
 
 `agent_id` 是 Manager 内不可变的路由 key：YAML import 保留现有配置 ID 以兼容旧 URL；Web 新增时默认使用 Agent `instance_id`。`instance_id` 单独存储并用于跨地址去重，用户只能修改 display name，不能修改这两个身份字段。
+
+Registry 不保存个人 SSH key path、`SSH_AUTH_SOCK`、`authorized_keys` 内容或任意 SSH option。SSH target 只存在于短期 enrollment job 和脱敏审计中；完成 enrollment 后的正常连接只依赖 endpoint、transport profile 和 Manager-specific token。
 
 Manager 把连接状态和 Agent 内工作负载健康分开：
 
@@ -505,12 +606,16 @@ workload_status:
 - `disabled`：管理员关闭路由和自动 probe。
 - validate/probe in-flight 是 UI/应用操作状态，不持久化为 connection status。
 - workload status 只从最新 Agent Summary 计算；summary 过期为 `stale`，尚无 summary 为 `unknown`。
+- 合法配置的 `trusted_lan_http` 不把 connection status 降为 `degraded`；transport security 是独立、持续可见的属性和警告。
 - UI 必须显示状态文字和图标，不能只依赖颜色。
 
 ### 11.2 Registry API v2
 
 ```text
-POST   /api/v2/agents/validate
+POST   /api/v2/agent-enrollments
+GET    /api/v2/agent-enrollments/{enrollment_id}
+POST   /api/v2/agent-enrollments/{enrollment_id}/cancel
+POST   /api/v2/agents/validate                    # legacy/manual recovery only
 POST   /api/v2/agents
 GET    /api/v2/agents
 GET    /api/v2/agents/{agent_id}
@@ -518,50 +623,69 @@ PUT    /api/v2/agents/{agent_id}
 DELETE /api/v2/agents/{agent_id}
 POST   /api/v2/agents/{agent_id}/probe
 POST   /api/v2/agents/{agent_id}/enabled
+POST   /api/v2/agents/{agent_id}/credential-rotation
 GET    /api/v2/fleet/overview
 ```
 
-Validate/Create 请求使用相同 connection input；Create 额外接受 display name：
+默认 enrollment 请求：
 
 ```json
 {
   "base_url": "https://eda-host-01.example:8765",
   "display_name": "EDA Host 01",
-  "token": "write-only-agent-token",
-  "tls_profile_id": "eda-internal-ca"
+  "transport_profile_id": "eda-internal-tls",
+  "ssh": {
+    "user": "edaops",
+    "host": "eda-host-01.example",
+    "port": 22
+  }
 }
 ```
 
-- `token` 是 write-only；任何响应、列表或 detail 均不得回显。
-- `tls_profile_id` 默认 `system`，使用操作系统 trust store；其他值必须引用 Manager 本地配置中已存在的 profile。API 不接受 CA 文件路径或关闭验证的布尔值。
+- `transport_profile_id` 必须引用 Manager 本地配置；API 不接受 CA 文件路径、任意 scheme 或关闭验证的布尔值。
+- 从 Discovery 进入时请求额外包含 opaque `discovery_result_id`。Manager 必须验证该结果仍存在、状态为 new，且 URL、resolved IP、port 和 transport profile 与请求完全匹配；没有该字段时 Registry source 为 `manual`。
+- SSH host 必须解析到 `allowed_agent_cidrs`，并与 base URL 的已验证地址集合相交；初版不支持浏览器提供 ProxyJump、改变有效目标的 SSH config 或不同目标的 bastion。
+- Manager 根据运行环境选择 `ssh_auto`、`ssh_cli` 或本地配置的 `ssh_service_key`；浏览器不能指定 identity file 或远端命令。
+- enrollment job 状态为 `pending`、`running`、`awaiting_cli`、`verifying`、`verified`、`failed`、`expired`、`cancelled` 或 `consumed`。job 默认 10 分钟过期，最大并发和总数由本地配置限制。
+- `GET enrollment` 可以返回不含 secret 的 CLI command、阶段状态、安全错误、Agent preview 和到期时间；不得返回 token、SSH output、private key path 或 `SSH_AUTH_SOCK`。
+- Manager 本地 enrollment socket 是内部 adapter，不属于 Public API；它只接受匹配 enrollment ID 的有界单次提交。
 - List 支持 `query`、`connection_status`、`workload_status`、`capability`、`limit`（默认 100，最大 1000）和 opaque cursor。
 - Create 返回 `201`，Update/Enable/Probe 返回 `200`，Delete 返回 `204`。
 
 添加流程：
 
 1. Web 表单在本地完成 URL shape 校验。
-2. `POST /agents/validate` 使用未持久化 token 请求目标 `/api/v2/capabilities`，身份和协议验证成功后再尝试 `/api/v2/summary`。
-3. Manager 返回 Agent ID、name、版本、证书摘要、capabilities 和 summary 预览，不返回 token。
-4. 任一输入发生变化后，前端必须使旧验证结果失效。
-5. 用户确认后，`POST /agents` 重新验证并在一个应用事务中写 credential 文件和 Registry。
-6. Agent `instance_id` 或规范化 endpoint 已存在时返回 `409 agent_already_registered`。
+2. `POST /agent-enrollments` 创建短期 job。普通用户 Manager 先自动 SSH；systemd Manager 没有可用 service key 时返回 `awaiting_cli` 和可复制命令。
+3. SSH adapter 获取 pending Manager-specific token 后，只在 Manager 服务端内存和临时 owner-only credential file 中使用它请求 `/api/v2/capabilities` 和 `/api/v2/summary`。
+4. Manager 返回 Agent ID、name、版本、transport 警告、capabilities 和 summary preview，不返回 token。
+5. 任一 connection/SSH 输入发生变化后取消旧 job；verified enrollment 只能消费一次。
+6. 用户确认后，`POST /agents` 只提交 `{ "enrollment_id": "...", "display_name": "..." }`。Manager 重新确认 job 未过期、输入未改变、identity 未重复，在同一 journal transaction 中持久化 `save_requested` 和最终 display name，再激活远端 credential 并写 Credential Store/Registry；新 Agent 默认 enabled。
+7. Agent `instance_id` 或 normalized endpoint 已存在时返回 `409 agent_already_registered`。未签发远端 credential 或已确认 pending expiry/revoke 的失败路径删除临时 credential；active revoke 结果未知时保留 journal、token reference 和 residual 告警，直到可重试清理。
 
-`validate` 响应必须分别报告 `network`、`tls`、`authentication`、`protocol`、`identity`、`capabilities` 和 `readiness` 阶段，便于 UI 给出可恢复错误；任一字段只允许稳定状态和安全 message，不返回原始 socket exception。Network/TLS/auth/protocol/identity 是添加 gate；Summary/readiness 失败作为 warning，不阻止身份和协议正确的 Agent 注册。Validate 不写 Registry、credential file 或长期数据库。
+Enrollment 是可恢复 saga，不假装成跨主机数据库 transaction：Agent 返回 pending credential 后，Manager 必须先 fsync 临时 credential 并提交包含 remote credential ID 的 journal，才能继续验证；激活前必须持久化 `save_requested`。若在远端激活后、本地 Registry commit 前崩溃，重启时使用 journal 和保留 token 完成 commit 或撤销，不能把文件当 orphan 删除。每个 phase boundary 都必须幂等，terminal cleanup 只有在 Registry commit 或远端 revoke 已确认后才能删除 token file/reference。
+
+Enrollment preview 必须分别报告 `network`、`ssh`、`transport`、`authentication`、`protocol`、`identity`、`capabilities` 和 `readiness` 阶段。SSH enrollment 的 network/SSH/transport/auth/protocol/identity 是添加 gate；Summary/readiness 失败作为 warning。Legacy v1 recovery 按下文明确降级 identity/readiness，不得把缺少 v2 字段误报为安全验证成功。错误只包含稳定 code 和安全 message，不返回原始 socket exception 或 SSH stderr 全文。
+
+`POST /agents/validate` 保留给 `legacy_admin_token` 导入和高级恢复。请求包含 base URL、write-only token 和 transport profile；成功后创建同样短期、一次消费的 verified enrollment job，并只返回 `enrollment_id` 和 preview，随后仍由 `POST /agents` 消费。Token 只存在于 Manager 内存/owner-only 临时 credential file；任何响应、列表、detail、日志或审计均不得回显。默认 Add Agent UI 不调用该接口。
+
+Legacy v1 validation profile 明确定义为：使用该 token 调用现有 authenticated `GET /api/capabilities`，接受受支持的 `api_version: "1"` 和 v1 capability IDs，不要求 `/api/v2/summary` 或 `instance_id`。Network、transport、authentication 和 v1 protocol compatibility 仍是 gate；identity 阶段返回 `legacy_identity_unavailable` warning 而不是失败。保存时 `instance_id=null`、`agent_id` 由 Manager 生成、只按 normalized endpoint 去重，connection status 为 `degraded`、workload status 为 `unknown`，并且只开放 Agent 实际声明的 v1 routes。UI 必须标记“无法跨地址验证身份”；改变 endpoint 必须重新提交 legacy token 并明确确认。升级到声明 `manager-enrollment.v1` 的 Agent 后，应通过 SSH enrollment 建立稳定 identity 和独立 Manager credential。
 
 更新规则：
 
-- 修改 display name 或 enabled 不要求重新提交 token。
-- 修改 base URL、token 或 TLS profile 必须重新验证，成功后原子替换并增加 Registry revision。
+- 修改 display name 或 enabled 不要求重新 enrollment。
+- 修改 base URL 或 transport profile 时，Manager 使用现有 credential 验证相同 `instance_id`；成功后原子替换并增加 Registry revision。认证失败或 identity 改变时要求重新 enrollment。
+- Credential rotation 复用 durable enrollment journal，并在开始时保存旧 local/remote credential reference。新 credential 验证并激活成功后才替换 Registry reference；相同 `manager_id` 的新 token 可以撤销旧 credential。旧 credential file 只有在撤销确认后才删除；失败或崩溃时 journal 保留 residual 状态供重试并在 UI 告警，不能丢失旧撤销能力。
 - 失败更新不得破坏原有可用配置。
 - `DELETE` 的 UI 文案为“Remove from Manager”，不得暗示会卸载远端 Agent 或删除 Agent 本地数据。
 - Agent 存在活跃 Terminal proxy 时删除返回 `409 agent_in_use`；用户先关闭 Terminal 后重试。
-- 删除成功后 Registry 和 credential file 被移除；Control-plane Audit 保留。
+- 在线删除先尝试撤销 Agent 端的 Manager credential；离线时默认返回可恢复冲突，用户明确确认 `local_only` 后才删除本地 Registry/credential，并看到远端 credential 仍需本地撤销的警告。Control-plane Audit 永久保留。
+- `legacy_admin_token` 没有远端独立 credential 可撤销，删除只清理 Manager 本地副本，并明确提示它不会轮换 Agent 原有 admin token。
 - list/detail API 必须返回 enabled、disabled、unknown、ready、degraded 和 unavailable Agent，不得因为 Agent 离线而隐藏。
-- Offline/disabled Agent 仍可读取 Registry Overview/Settings、修改凭据、重新验证和删除；只有需要 upstream 的 Terminal/Service/Log 操作被禁用。
+- Offline/disabled Agent 仍可读取 Registry Overview/Settings、重新 enrollment、执行 local-only removal；只有需要 upstream 的 Terminal/Service/Log 操作被禁用。
 - 任何 Registry 响应不得包含 token、credential path 或 Authorization header。
 - Probe 开始时读取 Registry revision；完成写 status 时 revision 必须仍匹配，避免旧地址的迟到 probe 覆盖新配置状态。
-- 动态 URL 校验、probe 和实际代理必须共用 `AgentTargetPolicy`：DNS 全部解析结果位于 allowed CIDR，禁止 self target/metadata/link-local/multicast/unspecified/reserved、禁止 redirect，并把连接 pin 到已验证 IP，同时保留原 hostname 用于 SNI/Host，防止 DNS rebinding。
-- `config_import` 且 endpoint 未改变的旧 Agent 继续按原启动配置安全规则运行；一旦通过 Web 修改 endpoint，该记录转为动态策略并必须满足 `allowed_agent_cidrs`。此兼容例外不得用于新增 Agent。
+- 动态 URL 校验、enrollment、probe 和实际代理必须共用 `AgentTargetPolicy`：DNS 全部解析结果位于 allowed CIDR，禁止 self target/metadata/link-local/multicast/unspecified/reserved、禁止 redirect，并把连接 pin 到已验证 IP，同时保留原 hostname 用于 TLS SNI/HTTP Host。verified-TLS 防止 DNS rebinding；trusted-LAN profile 依赖已声明的内网无冒充假设。
+- `source=config_import` 且 endpoint 未改变的旧 Agent 继续按原启动配置安全规则运行；一旦通过 Web 修改 endpoint，该记录转为动态策略并必须满足 `allowed_agent_cidrs`。此兼容例外不得用于新增 Agent。
 
 ### 11.3 Agent Summary
 
@@ -618,20 +742,24 @@ control_plane:
       - id: eda-lab
         name: EDA lab network
         cidr: 10.20.30.0/24
-        ports: [8765, 9443]
-        schemes: [https]
+        endpoints:
+          - port: 8765
+            transport_profile_id: eda-lan-http
+          - port: 9443
+            transport_profile_id: eda-internal-tls
 ```
 
 约束：
 
-- UI 只能选择预配置 Scope，不能提交任意 CIDR、任意端口范围或 URL。
+- UI 只能选择预配置 Scope，不能提交任意 CIDR、任意端口范围、scheme、transport profile 或 URL。
 - `scopes: []` 是默认值，此时 Discovery API 返回 feature disabled；管理员必须在本地配置显式启用。
-- 单个 Scope 最多 256 个地址、8 个端口；更大网络必须由管理员拆分。
+- 单个 Scope 最多 256 个地址、8 个预配置 endpoint；更大网络必须由管理员拆分。
 - 默认最大并发连接 32，单地址连接超时 500 ms，HTTP fingerprint 超时 2 秒，整个 job 最长 120 秒。
 - Manager 只执行 TCP connect 和 IC Env Guard fingerprint 请求，不进行通用 banner grabbing。
 - 非私有地址、Manager 自身地址、multicast、unspecified、reserved 和 link-local 地址必须拒绝。
-- Agent 的公开 `/healthz` 响应增加 `X-IC-Env-Guard-Agent: 2` header；发现只确认产品 fingerprint，不返回 Agent token、Terminal 或敏感配置。
-- 发现 Candidate 是不可信输入；必须走正常 token/TLS validation 才能加入 Registry。
+- Agent 的公开 `/healthz` 响应增加 `X-IC-Env-Guard-Agent: 2` header；发现只确认产品 fingerprint，不返回 Agent token、SSH 用户、公钥、`authorized_keys`、Terminal 或敏感配置。
+- trusted-LAN threat model 允许把匹配 fingerprint 的结果视为真实 Agent，但它仍是尚未授权给当前 Manager 的 Candidate；必须由用户显式启动 SSH enrollment 或 legacy token recovery 才能加入 Registry。
+- Discovery 不调用 SSH、不尝试已有 key、不创建 pending token，也不批量注册；SSH 只在用户选择单个 Candidate 后执行。
 
 ### 12.2 Discovery API
 
@@ -648,19 +776,20 @@ Job 状态：`queued`、`running`、`completed`、`cancelled`、`failed`。
 结果字段：
 
 - candidate URL；
-- IP、port 和 scheme；
+- IP、port 和 transport profile ID；
 - fingerprint API version；
 - 首次/最近发现时间；
 - `new` 或 `already_registered`；
-- 验证状态；
+- enrollment 状态（`enrollment_required`、`enrolling`、`verified` 或 `already_registered`）；
+- nullable linked `enrollment_id`；
 - 有界错误类别。
 
-Discovery job 和结果保留 24 小时后清理。UI 每秒 polling job 状态即可；初版不增加 SSE/WebSocket。批量自动添加不在范围内，每个 Candidate 单独进入 Add Agent 验证流程。
+Discovery job 和结果保留 24 小时后清理。由 Candidate 创建 enrollment 时，Manager 在同一 SQLite transaction 中写入 linked enrollment ID；结果状态从 enrollment journal/Registry 派生，不能由浏览器提交。成功注册后 Registry `source=discovery`。UI 每秒 polling job 状态即可；初版不增加 SSE/WebSocket。批量自动添加不在范围内，每个 Candidate 单独进入 Add Agent enrollment 流程；Candidate 记录不得保存 SSH key、Agent token 或 enrollment output。
 
 ## 13. Manager 路由与聚合
 
 - 浏览器在 Manager 模式下只请求同源 `/api/v2/agents/{agent_id}/...` 路由。
-- Manager 从 path 中解析 Agent ID，再从 Registry 获取 base URL 和 credential；请求体不得包含 upstream URL。
+- Manager 从 path 中解析 Agent ID，再从 Registry 获取 base URL、transport profile 和 Manager-specific credential；请求体不得包含 upstream URL。
 - v2 明确允许的详情代理至少包括：
 
 ```text
@@ -679,6 +808,7 @@ GET /api/v2/agents/{agent_id}/audit
 - “Monitoring” 全局页面只使用 Registry 中缓存的每 Agent Summary，按 workload status 和问题计数列出 Agent；具体 Observation、Service 和 Log 明细必须进入单个 Agent 后按需加载。初版不实现跨 Agent 明细 fan-out。
 - Prometheus 推荐直接 scrape 每个 Agent；初版 Manager 不重新导出所有 Agent metrics，也不实现 Prometheus service-discovery endpoint。
 - Terminal WebSocket 必须继续使用一次性 Manager ticket、上游一次性 Agent ticket、容量限制、frame 限制、backpressure 和 correlation ID。
+- 正常 HTTP/WS 代理路径不得启动 SSH 子进程或依赖 SSH tunnel。verified-TLS profile 使用 HTTPS/WSS；trusted-LAN profile 使用 HTTP/WS，并在 Agent detail 持续显示未加密状态。
 
 ## 14. SQLite 数据模型
 
@@ -728,7 +858,28 @@ updated_at         TEXT NOT NULL
 - `expires_at`；
 - `last_updated`。
 
-### 14.3 Manager `agents`
+### 14.3 Agent `manager_credentials`
+
+Agent 为每个 Manager 保存独立 credential：
+
+```text
+credential_id       TEXT PRIMARY KEY
+manager_id           TEXT NOT NULL
+enrollment_id        TEXT NOT NULL UNIQUE
+token_hash           TEXT NOT NULL UNIQUE
+state                TEXT NOT NULL
+pending_expires_at   TEXT NULL
+created_at           TEXT NOT NULL
+activated_at         TEXT NULL
+last_used_at         TEXT NULL
+revoked_at           TEXT NULL
+```
+
+`state` 是 `pending`、`active` 或 `revoked`。pending credential 默认 10 分钟过期，只能访问 enrollment validation endpoints；激活后才具有 Manager API 权限。Agent 只保存高熵 token 的 hash 并使用 constant-time comparison，不保存 token 明文。允许同一 Agent 同时存在多个不同 `manager_id` credential；同一 Manager 的轮换可以短时间保留新旧两条，完成后撤销旧条目。
+
+Credential issuance、activation、expiry 和 revocation 由 Enrollment Repository 独占；Auth 只通过公开 verifier 接口查询，不直接操作表。过期 pending row 由有界 cleanup 删除，revoked row 按安全审计保留期清理。
+
+### 14.4 Manager `agents`
 
 ```text
 agent_id            TEXT PRIMARY KEY
@@ -736,7 +887,9 @@ instance_id         TEXT NULL UNIQUE
 display_name        TEXT NOT NULL
 normalized_endpoint TEXT NOT NULL UNIQUE
 credential_ref      TEXT NOT NULL
-tls_profile_id      TEXT NOT NULL
+remote_credential_id TEXT NULL
+transport_profile_id TEXT NOT NULL
+enrollment_method   TEXT NOT NULL
 enabled             INTEGER NOT NULL
 source              TEXT NOT NULL
 revision            INTEGER NOT NULL
@@ -744,7 +897,7 @@ created_at          TEXT NOT NULL
 updated_at          TEXT NOT NULL
 ```
 
-`source` 是 `config_import`、`manual` 或 `discovery`。Version、capabilities 和 summary 不属于配置表。
+`source` 是 `config_import`、`manual` 或 `discovery`，描述记录从哪里进入 Registry；`enrollment_method` 是 `ssh_auto`、`ssh_cli`、`ssh_service_key` 或 `legacy_admin_token`，描述 credential 如何建立。YAML 导入固定为 `source=config_import`、`enrollment_method=legacy_admin_token`。Legacy credential 可以没有 `remote_credential_id`；新 SSH enrollment 必须保存 opaque remote credential ID 以支持轮换和撤销。Version、capabilities 和 summary 不属于配置表。
 
 Manager 每 Agent 一行的 `agent_status`：
 
@@ -763,16 +916,49 @@ last_error_code      TEXT NULL
 updated_at           TEXT NOT NULL
 ```
 
-另有有界的 `discovery_jobs`、`discovery_results`。这些表属于 Fleet/Discovery Repository，不与 Agent 本地 `observations` 或 `log_sources` 混用。
+Manager 使用 durable `agent_enrollment_jobs` journal 记录跨 SSH、Agent API 和本地 Credential Store 的恢复状态：
 
-### 14.4 数据库运行规则
+```text
+enrollment_id        TEXT PRIMARY KEY
+manager_id           TEXT NOT NULL
+state                TEXT NOT NULL
+normalized_endpoint  TEXT NOT NULL
+transport_profile_id TEXT NOT NULL
+discovery_result_id  TEXT NULL
+replace_agent_id     TEXT NULL
+requested_display_name TEXT NULL
+ssh_user             TEXT NULL
+ssh_host             TEXT NULL
+ssh_port             INTEGER NULL
+enrollment_method    TEXT NOT NULL
+remote_instance_id   TEXT NULL
+remote_credential_id TEXT NULL
+credential_temp_ref  TEXT NULL
+old_credential_ref   TEXT NULL
+old_remote_credential_id TEXT NULL
+save_requested       INTEGER NOT NULL
+expires_at           TEXT NOT NULL
+last_error_code      TEXT NULL
+created_at           TEXT NOT NULL
+updated_at           TEXT NOT NULL
+```
+
+Journal 不保存 token、SSH output、private key path、passphrase 或 Authorization header；`credential_temp_ref` 只引用 owner-only 临时文件。内部 state 至少覆盖 `pending`、`running`、`awaiting_cli`、`credential_issued`、`verifying`、`verified`、`activation_requested`、`activated` 和 terminal states；Public API 把内部状态折叠成第 11.2 节的稳定状态集合。
+
+SSH fields 对 `ssh_auto/ssh_cli/ssh_service_key` 必须非空，对 `legacy_admin_token` 必须为空。`requested_display_name` 在 `save_requested=true` 前可以为空，之后必须保存最终值，使 crash recovery 能精确重放 Registry row。`discovery_result_id` 与 `replace_agent_id` 分别标识 Discovery add 和 credential rotation，二者的组合及 target identity 由 Repository invariant 校验。
+
+另有有界的 `discovery_jobs`、`discovery_results`，其中 Discovery result 可以引用 enrollment ID。Manager metadata 保存稳定 `manager_id`。这些数据属于各自 Repository，不与 Agent 本地 `observations` 或 `log_sources` 混用。
+
+### 14.5 数据库运行规则
 
 - 继续使用 migration-managed SQLite。
 - 启用 foreign keys、busy timeout 和 WAL mode。
 - 每次 upsert 使用单个短事务。
 - tail 日志文件时不得持有数据库事务。
 - 数据库异常返回稳定错误，不在响应中暴露 SQL、文件路径或内部堆栈。
-- Observation、Log Source、Terminal metadata 和 Audit 使用独立 Repository。
+- Observation、Log Source、Manager Credential、Terminal metadata 和 Audit 使用独立 Repository。
+- Credential orphan cleanup 必须同时检查 Agent Registry 和所有非 terminal enrollment/rotation journal，不能删除恢复尚需使用的 token file。
+- Manager startup 扫描非 terminal journal：未激活的远端 pending credential 可以继续验证或等待 TTL；`activation_requested/activated` 且 `save_requested=true` 的 job 使用保留的 credential 完成 Registry commit，或在用户已取消时撤销；任何无法自动恢复的 residual credential 进入显式告警和可重试 cleanup，不得静默丢弃唯一 credential reference。
 
 ## 15. Prometheus 导出
 
@@ -860,6 +1046,15 @@ server:
   bind: 127.0.0.1
   port: 8765
   remote_bind_enabled: false
+  trusted_lan_http:
+    enabled: false
+    client_cidrs: []
+
+enrollment:
+  socket_path: /run/ic-env-guard/agent-enrollment.sock
+  socket_mode: "0600"
+  pending_ttl_seconds: 600
+  max_pending: 16
 
 ingest:
   bind: 127.0.0.1
@@ -905,9 +1100,27 @@ control_plane:
   max_outstanding_tickets: 128
   allowed_agent_cidrs:
     - 10.20.30.0/24
-  tls_profiles:
-    - id: eda-internal-ca
+  transport_profiles:
+    - id: eda-internal-tls
+      type: verified_tls
       ca_bundle: /etc/ic-env-guard/eda-internal-ca.pem
+    - id: eda-lan-http
+      type: trusted_lan_http
+      allowed_cidrs:
+        - 10.20.30.0/24
+  enrollment:
+    ssh_binary: /usr/bin/ssh
+    pending_ttl_seconds: 600
+    max_pending: 32
+    journal_retention_seconds: 86400
+    ssh_connect_timeout_seconds: 10
+    socket_path: /run/ic-env-guard/manager-enrollment.sock
+    socket_mode: "0660"
+    socket_group: eda-admins
+    service_key:
+      enabled: false
+      identity_file: /var/lib/ic-env-guard/ssh/id_ed25519
+      known_hosts_file: /var/lib/ic-env-guard/ssh/known_hosts
   discovery:
     max_concurrency: 32
     connect_timeout_milliseconds: 500
@@ -918,9 +1131,14 @@ control_plane:
       - id: eda-lab
         name: EDA lab network
         cidr: 10.20.30.0/24
-        ports: [8765, 9443]
-        schemes: [https]
+        endpoints:
+          - port: 8765
+            transport_profile_id: eda-lan-http
+          - port: 9443
+            transport_profile_id: eda-internal-tls
 ```
+
+上面的 Agent 示例保持安全默认值。若要与 `eda-lan-http` profile 配合，部署者必须在 Agent 本地把 Public bind 改为明确的非 loopback 地址、设置 `remote_bind_enabled: true`、启用 `trusted_lan_http`，并把 `client_cidrs` 限制为实际 Manager/管理网络；仅修改 Manager profile 不会自动开放 Agent listener。
 
 配置校验必须保证：
 
@@ -931,17 +1149,22 @@ control_plane:
 - token 文件权限符合安全要求；
 - `allowed_roots` 必须是绝对路径，启动时执行规范化和去重；
 - 所有大小、数量、TTL 和间隔配置在本文规定范围内；
-- 非 loopback Public bind 继续遵循现有 fail-closed 规则。
+- 非 loopback Public bind 继续遵循现有 fail-closed 规则；默认要求 verified TLS。`server.trusted_lan_http.enabled=true` 时必须同时配置非空 private `client_cidrs`，且启动日志和 Runtime capability 明确标记无传输加密。
 - `control-plane` mode 不启动 PTY、Local Ingest 或 Agent 本地数据采集模块；
 - Registry、latest status、Discovery 和 Control-plane Audit 共用现有 `control_plane.audit_database` SQLite 文件，但使用各自 Repository/table；不新增第二个 Manager database path；
 - `credential_directory` 必须由 Manager 账号拥有且目录权限不宽于 `0700`；
-- TLS profile ID 必须唯一；CA bundle 是本地普通文件且启动时验证，路径和值不通过 Public API 暴露；
-- `system` 是保留 TLS profile ID，不得在配置中覆盖；
+- Transport profile ID 必须唯一；`verified_tls` profile 的 CA bundle 是本地普通文件且启动时验证，路径和值不通过 Public API 暴露；
+- `system-tls` 是保留 transport profile ID，使用操作系统 trust store，不得在配置中覆盖；
+- `trusted_lan_http` profile 只能引用 private CIDR，必须是 `allowed_agent_cidrs` 的子集，并只接受 `http://` endpoint；`verified_tls` 只接受 `https://` endpoint。UI 不能创建、修改或临时绕过 profile；
 - `allowed_agent_cidrs` 默认空列表；为空时现有导入 Agent 可继续工作，但 Web Add/Edit endpoint 和 Discovery 明确 disabled，UI 显示本地配置指引；
 - 动态添加和 Discovery 只能访问 `allowed_agent_cidrs`；DNS 解析结果也必须落在允许范围内；
 - Discovery Scope CIDR 必须是 `allowed_agent_cidrs` 的子网，地址数不得超过 256；
-- Discovery ports 必须显式列出，单 Scope 不超过 8 个；
-- 非 loopback HTTP Agent 即使位于允许 CIDR 也必须拒绝，不能由 UI 覆盖。
+- Discovery endpoint 必须显式列出 port 和本地 transport profile，单 Scope 不超过 8 个；
+- 非 loopback HTTP Agent 只有同时匹配 Manager `trusted_lan_http` profile 和 Agent 本地 `trusted_lan_http` 配置时才允许；其他 HTTP endpoint fail closed；
+- Agent/Manager enrollment socket parent 必须由服务账号控制；socket mode 不宽于 `0660`，配置 group 时必须存在，并通过 Unix peer credentials 再验证提交者；
+- pending enrollment TTL 为 60–900 秒，容量为 1–128；过期、取消和重复提交必须 fail closed；
+- SSH binary 必须是本地配置的绝对可执行文件；远端 helper 和安全 SSH options 固定在程序中，Public API 不接受覆盖；
+- service key 启用时 identity file 必须由 Manager 账号拥有、是 owner-only 普通 Ed25519 private key，known_hosts file 也必须位于 Manager owner 的真实目录。项目不自动生成、复制或安装该 key。
 
 ## 18. 统一错误模型
 
@@ -972,9 +1195,14 @@ control_plane:
 Manager 至少定义：
 
 - `agent_not_found`、`agent_disabled`、`agent_in_use`；
-- `agent_already_registered`、`agent_identity_mismatch`；
+- `agent_already_registered`、`agent_identity_mismatch`、`agent_identity_conflict`；
 - `agent_network_error`、`agent_tls_error`、`agent_auth_error`、`agent_protocol_error`、`agent_version_unsupported`；
 - `agent_validation_required`、`agent_validation_changed`；
+- `legacy_identity_unavailable`、`legacy_agent_reenrollment_required`；
+- `ssh_unavailable`、`ssh_interaction_required`、`ssh_auth_failed`、`ssh_host_key_unknown`、`ssh_host_key_changed`、`ssh_remote_command_failed`；
+- `agent_enrollment_not_found`、`agent_enrollment_expired`、`agent_enrollment_consumed`、`agent_enrollment_submission_rejected`；
+- `agent_credential_activation_failed`、`agent_credential_revoke_failed`、`agent_local_only_confirmation_required`；
+- `transport_profile_not_found`、`transport_profile_mismatch`、`trusted_lan_http_disabled`；
 - `discovery_disabled`、`discovery_scope_forbidden`、`discovery_job_not_found`、`discovery_capacity_exceeded`。
 
 Frontend 只根据 `code` 决定交互分支；`message` 用于安全显示，correlation ID 提供复制按钮以便排障。
@@ -991,6 +1219,8 @@ Frontend 只根据 `code` 决定交互分支；`message` 用于安全显示，co
 - 配置加载和安全校验失败；
 - 数据库迁移和存储健康变化。
 - Agent validate/add/edit/enable/disable/remove/probe；
+- Enrollment create/start/awaiting-cli/verify/consume/cancel/expire，以及 credential activate/rotate/revoke 和 local-only removal；
+- SSH enrollment method、脱敏目标、host key changed 和 service-key 使用结果；不记录原始 SSH output；
 - Discovery start/cancel/finish，包括 scope、候选数量和结果，不记录逐地址原始错误；
 - Manager Agent-scoped proxy intent/outcome 和 indeterminate mutation；
 - Credential Store 写入、替换或删除失败的稳定类别。
@@ -1001,11 +1231,13 @@ Frontend 只根据 `code` 决定交互分支；`message` 用于安全显示，co
 - 日志内容；
 - Observation `details` 全文；
 - token 或认证 header；
+- SSH private/public key 内容、private key path、`authorized_keys`、`SSH_AUTH_SOCK` 或 enrollment socket payload；
+- enrollment token、pending secret、完整 CLI command 或 SSH stdout/stderr；
 - Producer 提交的任意敏感文本。
 
 Observation 正常 upsert 不逐条写入安全审计，避免高吞吐和敏感数据风险；Agent metrics 记录成功、拒绝和失败计数。
 
-Manager 的 validate 失败、Registry mutation、Discovery start/cancel 和 routed privileged request 必须复用现有 durable intent/outcome 模型。Audit intent 提交失败时 fail closed，不得写 Registry、credential、启动扫描或 dispatch upstream；outcome 提交失败不得把已成功的远端 mutation 伪装成失败重试。
+Manager 的 enrollment/validate 失败、credential activation/revocation、Registry mutation、Discovery start/cancel 和 routed privileged request 必须复用现有 durable intent/outcome 模型。Audit intent 提交失败时 fail closed，不得创建 enrollment、写 Registry/credential、启动扫描或 dispatch upstream；outcome 提交失败不得把已成功的远端 mutation 伪装成失败重试。
 
 ## 20. 前端产品与工程设计
 
@@ -1022,11 +1254,20 @@ GET /api/v2/runtime
 ```json
 {
   "mode": "manager",
-  "capabilities": ["fleet.v2", "agent-registry.v2", "discovery.v2"]
+  "capabilities": [
+    "fleet.v2",
+    "agent-registry.v2",
+    "discovery.v2",
+    "ssh-enrollment.auto.v1",
+    "ssh-enrollment.cli.v1",
+    "trusted-lan-http.v1"
+  ]
 }
 ```
 
 Runtime endpoint 是登录前可读的低风险元数据，只返回 mode 和 capability IDs，不返回地址、Agent、版本细节或配置；响应使用 `Cache-Control: no-store`，失败时登录页显示可重试错误而不是猜测 mode。
+
+`ssh-enrollment.auto.v1` 仅在 Manager 可以调用系统 SSH 时返回；`ssh-enrollment.cli.v1` 仅在受保护 local socket 可用时返回；配置并验证 service key 后增加 `ssh-enrollment.service-key.v1`；存在 trusted-LAN transport profile 时增加 `trusted-lan-http.v1`。这些 capability 只决定 UI 路径，不泄露 key path、socket path 或用户名。
 
 - Agent：登录后进入 `/terminal`，同时提供本机 Services、Observations、Logs、Metrics 和 Audit。
 - Manager：登录后进入 `/fleet`，同时提供 Fleet Monitoring 和 Control-plane Audit。
@@ -1084,7 +1325,7 @@ Fleet 页面采用 data-dense table + drill-down，而不是每 Agent 一个大�
 - connection status 图标和文字；
 - workload status 图标和文字；
 - display name / agent ID；
-- base URL；
+- base URL 和 transport security badge；
 - Agent/API version；
 - Observation critical/warning/stale 数量；
 - Services running/total/unhealthy；
@@ -1103,31 +1344,40 @@ Fleet 页面采用 data-dense table + drill-down，而不是每 Agent 一个大�
 
 ### 20.4 Add/Edit Agent 流程
 
-Add Agent 使用两步页面，不使用一个包含所有高级字段的大弹窗：
+Add Agent 使用三个短步骤；默认不显示 Agent token 输入框：
 
 **Step 1 — Connection**
 
 - Base URL；
 - display name（可选，验证后默认使用 Agent name）；
-- Agent token，使用 password input 并支持临时 show/hide；
-- TLS CA 选择只显示本地已配置选项，不能关闭非 loopback TLS verification；
-- “Test connection” 是该步唯一 primary action。
+- 本地预配置的 transport profile；`trusted_lan_http` 选项显示持续的“无传输加密”警告，UI 不能临时创建或绕过 profile；
+- SSH user、host 和 port，host 默认取 Base URL hostname，user 必须允许覆盖以支持不同用户系统；helper text 说明该用户必须是 Agent 运行账号，或已被现有 sudoers/本地 socket policy 授权执行固定 enrollment helper；
+- “Start enrollment” 是该步唯一 primary action。
 
-**Step 2 — Verify & save**
+**Step 2 — Enrollment**
 
-- 显示 Agent ID、name、URL、证书摘要、version、capabilities 和当前 summary；
+- 普通用户 Manager 或已配置 service key 时显示自动 SSH 的阶段进度；
+- systemd Manager 需要当前用户凭据时显示可复制且不含 secret 的 CLI command，并保持 `Waiting for CLI` 状态；
+- 明确展示 network、SSH、transport、authentication、identity 和 protocol 阶段，不显示原始 SSH stderr；
+- 加密 key 未加载、SSH 密码或 sudo 需要交互时从自动路径切换为 CLI，不在网页请求中等待输入；
+- 支持 Cancel、Retry 和到期后重新创建；durable enrollment journal 允许页面刷新或 Manager restart 后在 TTL 内通过 enrollment URL 恢复安全状态。
+
+**Step 3 — Verify & save**
+
+- 显示 Agent ID、name、URL、transport security、version、capabilities 和当前 summary；
 - 清楚显示 missing capability、重复 ID/URL 或版本不兼容；
-- “Add agent” 只有验证成功时可用；
-- 修改 Step 1 任一字段必须使旧验证失效。
+- “Add agent” 只有 enrollment verified 且未过期/消费时可用；
+- 修改 Step 1 任一字段必须取消旧 enrollment 并清除 preview。
 
 表单要求：
 
 - 所有字段有永久 label 和 helper text；
-- URL 在 blur 时校验 shape，服务端错误显示在对应字段或 validation summary；
+- URL/SSH target 在 blur 时校验 shape，服务端错误显示在对应字段或 validation summary；
 - 提交中按钮 disabled 并显示进度；错误必须说明原因和恢复操作；
-- token 只保存在当前 React form state，离开页面立即清除，不进入 URL、sessionStorage、query cache、日志或 error telemetry；
-- Edit 对 display name/enable 使用简单表单；改变 URL/credential 时重新进入验证流程；
-- Remove 使用明确确认对话框，说明“只从 Manager 删除，不卸载远端 Agent”，并处理 `agent_in_use` 恢复路径。
+- 浏览器响应、form state、URL、sessionStorage、query cache、日志和 error telemetry 均不得包含 Agent token、SSH output、key path 或 `SSH_AUTH_SOCK`；
+- “Import legacy token” 只出现在高级恢复入口，使用 write-only password input，并与默认 enrollment UI 分离；
+- Edit 对 display name/enable 使用简单表单；改变 URL/transport 时使用现有 credential 验证相同 identity；“Rotate credential” 进入新的 enrollment flow；
+- Remove 使用明确确认对话框，说明不会卸载 Agent。在线删除显示远端 credential revoke 结果；离线删除需要第二次确认 local-only removal 和远端残留 credential 风险。
 
 ### 20.5 Discovery 流程
 
@@ -1136,16 +1386,16 @@ Discovery 是独立页面：
 1. 选择 Manager 配置提供的命名 Network Scope；
 2. 显示将扫描的 CIDR、ports、地址数量和预计上限；
 3. 用户显式启动，页面显示 progress、已检查/总数、发现数和 Cancel；
-4. 结果表区分 New、Already registered 和 Validation required；
-5. 选择一个 New Candidate 后跳转 Add Agent，并只预填 candidate URL；token 仍由用户输入。
+4. 结果表区分 New、Already registered 和 Enrollment required；
+5. 选择一个 New Candidate 后跳转 Add Agent，并预填 candidate URL、transport profile 和 SSH host；SSH user 由用户确认，不读取或显示任何公钥。
 
 - 页面关闭后 job 继续由 Manager 执行，返回同一 URL 可以恢复状态。
 - Job 失败显示稳定错误和 Retry，不把底层 socket 错误/堆栈直接展示给用户。
-- 初版不提供 “Select all and trust”，避免共享凭据和误注册。
+- 初版不提供 “Select all and enroll”，每个 Candidate 必须由用户显式启动独立 SSH enrollment。
 
 ### 20.6 Agent 详情与 Monitoring
 
-Agent 详情 Header 固定显示：connection status、workload status、display name、base URL、last seen 和 Probe。二级页签为 Overview、Terminal、Services、Observations、Logs、Metrics、Audit、Settings；缺少 capability 的页签保持可见但 disabled，并解释原因。
+Agent 详情 Header 固定显示：connection status、workload status、display name、base URL、transport security、last seen 和 Probe。trusted-LAN HTTP Agent 持续显示未加密标记。二级页签为 Overview、Terminal、Services、Observations、Logs、Metrics、Audit、Settings；缺少 capability 的页签保持可见但 disabled，并解释原因。
 
 - Overview 显示当前问题优先的摘要，不重复堆叠装饰性 KPI。
 - Terminal 保留多 tab、resize、reconnect 和隐藏时不销毁会话；状态按 Agent 隔离。
@@ -1234,7 +1484,7 @@ frontend/src/
 
 ### 20.9 Agent-only UI
 
-Agent Web UI 复用 Terminal、Services、Observations、Logs、Metrics 和 Audit features，但不加载 Fleet、Registry 或 Discovery bundle。登录后默认进入本机 Terminal；顶部明确显示 “Standalone Agent” 和本机 agent ID，不显示无意义的 Agent selector。
+Agent Web UI 复用 Terminal、Services、Observations、Logs、Metrics 和 Audit features，但不加载 Fleet、Registry 或 Discovery bundle。登录后默认进入本机 Terminal；顶部明确显示 “Standalone Agent” 和本机 agent ID，不显示无意义的 Agent selector。Agent Settings 提供最小 “Manager access” 表，只显示 Manager ID、credential ID、state 和时间，并允许 `local-admin` 撤销；不显示 token hash、SSH key 或 enrollment output。
 
 ## 21. 兼容性与迁移
 
@@ -1245,19 +1495,22 @@ Agent Web UI 复用 Terminal、Services、Observations、Logs、Metrics 和 Audi
 - 现有 Terminal v1 HTTP/WebSocket 契约在至少一个发布周期内继续工作。
 - v2 Terminal 可以先复用现有 v1 wire contract；内部模块化不得改变外部行为。
 - 新 Observation 和 Log API 没有 v1 兼容负担。
+- SSH enrollment 只对声明 `manager-enrollment.v1` 的 Agent 开放；旧 Agent 继续使用 legacy admin token import，UI 明确标记兼容模式。
 - 废弃接口必须通过文档和响应 header 给出明确移除版本，不静默删除。
 
 ### 21.2 数据库迁移
 
 - 新 migration 创建 `observations` 和 `log_sources`，不得修改或删除现有审计、Terminal、服务状态表。
-- Manager migration 创建 `agents`、`agent_status`、`discovery_jobs` 和 `discovery_results`。
+- Agent migration 创建 `manager_credentials`；Manager migration 创建/扩展 `agents`、`agent_status`、`agent_enrollment_jobs`、`discovery_jobs`、`discovery_results` 和稳定 `manager_id` metadata。
 - migration 必须可在现有 Agent SQLite 上原地运行。
 - upgrade 前安装流程继续备份数据库。
 - migration 失败必须 fail clearly，Agent 不以部分 schema 启动。
 - rollback 到不识别新表的旧版本时允许新表保留；旧版本不得读取或修改它们。
-- Manager 首次以新 schema 启动且 `agents` 表为空时，把现有 YAML `agents` 逐条验证并导入 SQLite；全部成功才提交。
+- 回滚到不识别 `manager_credentials` 的旧 Agent 后，Manager-specific token 暂时不可用；恢复文档必须要求保留 legacy admin token recovery path，或在回滚前完成兼容凭据切换。
+- Manager 首次以新 schema 启动且 `agents` 表为空时，先对全部 YAML Agent 做本地 shape、duplicate endpoint/ID、token file permission 和 Credential Store copy 校验；任何本地错误都回滚本次 import 并阻止切换事实来源。Import 不要求远端在线或支持 v2：本地成功后按原 enabled 值写入 Registry，`instance_id` 可暂为 null、connection status 为 `unknown`、`source=config_import`、`enrollment_method=legacy_admin_token`，再由后台 probe 分批补全 identity/capabilities。离线或旧 Agent 不阻塞其他记录迁移。
 - 导入成功后 SQLite Registry 成为唯一运行时事实来源；YAML `agents` 标记 deprecated，不再在每次启动覆盖 Web 变更。
-- 导入时 credential 文件复制到 Manager credential directory；源 token 文件不自动删除。
+- 导入时 credential 文件复制到 Manager credential directory；源 token 文件不自动删除。新 Web Add 默认不复用该共享 admin token。
+- 后续 probe 发现 duplicate `instance_id` 时，相关导入记录标为 `unavailable`/`agent_identity_conflict` 并停止 privileged routing，等待管理员合并或删除；不能静默覆盖其中一条。
 - 回滚旧版本不会卸载 Agent，但旧版只能看到原 YAML 中的 Agent；动态添加的 Agent 必须在回滚说明中手工导出/恢复。
 
 ### 21.3 分阶段迁移
@@ -1266,13 +1519,15 @@ Agent Web UI 复用 Terminal、Services、Observations、Logs、Metrics 和 Audi
 2. 引入 Composition Root 和模块接口，保持现有 API 行为。
 3. 创建 Observation/Log 领域模型、Repository 和 Agent SQLite migration。
 4. 增加 Local Ingest API、Public Read API、Summary 和 Prometheus 动态导出。
-5. 创建 SQLite Agent Registry/Credential Store，迁移 YAML registry，并让 v1 API 读取新 Registry。
-6. 增加 Manager v2 validate/add/edit/remove/probe API。
-7. 增加 bounded Discovery jobs 和安全测试。
-8. 引入前端 Router、Runtime Capabilities、Query Client 和 App Shell，先保持旧页面可用。
-9. 迁移 Fleet/Add/Discovery/Agent Detail，再逐项迁移 Terminal、Services、Observations、Logs、Metrics 和 Audit。
-10. 删除 `AppRoutes` view state machine、全局 `AgentContext` 和已经无调用的旧 CSS/API wrapper。
-11. 更新安装、配置、凭据备份、Discovery、安全、Producer 和回滚文档。
+5. 增加 Agent Manager Credential Repository、受保护 enrollment socket/helper、激活/撤销和 contract tests。
+6. 创建 SQLite Agent Registry/Credential Store，迁移 YAML registry，并让 v1 API 读取新 Registry。
+7. 增加 Manager Enrollment Orchestrator、系统 SSH adapter、普通用户 auto path、systemd CLI/local socket path 和可选 service-key path。
+8. 增加 Manager v2 enrollment/add/edit/remove/probe API 和补偿清理。
+9. 增加 bounded Discovery jobs 和安全测试。
+10. 引入前端 Router、Runtime Capabilities、Query Client 和 App Shell，先保持旧页面可用。
+11. 迁移 Fleet/Add/Enrollment/Discovery/Agent Detail，再逐项迁移 Terminal、Services、Observations、Logs、Metrics 和 Audit。
+12. 删除 `AppRoutes` view state machine、全局 `AgentContext` 和已经无调用的旧 CSS/API wrapper。
+13. 更新普通用户、systemd CLI、受限 service key、trusted-LAN、凭据备份、Discovery、安全、Producer 和回滚文档。
 
 每个阶段必须可独立测试和发布，不允许长期维护一个不可运行的大重写分支。
 
@@ -1280,10 +1535,10 @@ Agent Web UI 复用 Terminal、Services、Observations、Logs、Metrics 和 Audi
 
 本系统规格定义共同目标，但后续必须写两个独立 implementation plan：
 
-- **Workstream A — Agent foundation：** Composition Root、Observation、Log、SQLite、Summary、Prometheus、Standalone UI 和 PTY 回归。
-- **Workstream B — Fleet Console：** SQLite Registry、Credential Store、Validation、Discovery、Manager proxy、Fleet/Monitoring UI 和前端 feature architecture。
+- **Workstream A — Agent foundation：** Composition Root、Observation、Log、SQLite、Summary、Prometheus、Manager Credential/Enrollment helper、Standalone UI 和 PTY 回归。
+- **Workstream B — Fleet Console：** SQLite Registry、Credential Store、SSH/CLI Enrollment、Validation、Discovery、Manager proxy、Fleet/Monitoring UI 和前端 feature architecture。
 
-Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilities/summary 契约，但不得反向让 Agent 依赖 Manager。
+Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilities/summary/manager-enrollment 契约，但不得反向让 Agent 依赖 Manager。
 
 ## 22. 测试策略
 
@@ -1298,7 +1553,13 @@ Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilitie
 - Prometheus name/label 验证和 series 上限；
 - Registry URL normalization、duplicate ID/URL 和原子更新；
 - Agent instance ID 首次生成、持久化、格式错误和升级保留；
+- Manager ID 首次生成、持久化和恢复；
+- Agent Manager credential hash、pending TTL、权限限制、激活、轮换和撤销；
 - Credential Store 权限、原子替换和删除；
+- Enrollment job 状态、TTL、容量、单次消费、取消和失败补偿；
+- SSH argv builder 的 user/host/port 校验、固定 remote helper 和 option injection 拒绝；
+- Local enrollment socket 的 peer credential、mode、重复提交和 replay 拒绝；
+- Transport profile/scheme/CIDR 匹配和 trusted-LAN 显式警告；
 - Discovery Scope 子网、host/port 上限、job 状态和 cleanup；
 - Fleet partial summary 和 status transition；
 - secret redaction；
@@ -1311,10 +1572,14 @@ Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilitie
 - Log Source upsert/list/detail/tail；
 - 统一 v2 error envelope 和 correlation ID；
 - `/metrics` fresh/stale 行为；
-- Agent validate/create/update/delete/probe/list；
+- Agent enrollment create/status/cancel/consume、legacy validate、create/update/delete/probe/list；
+- Legacy v1 `/api/capabilities` 无 `instance_id` 时的 degraded preview、Manager-generated ID、endpoint-only dedupe 和受限 v1 routes；
+- Agent pending Manager credential capabilities/summary/activate/revoke 权限；
+- SSH enrollment helper v1 stdin/stdout schema、4/8 KiB limits、identity binding、duplicate/replay 和 safe error；
 - Fleet Overview 和 `/api/v2/summary`；
 - `/api/v2/capabilities` 返回稳定 `instance_id` 和 v1/v2 capability IDs；
 - Discovery scopes/jobs/cancel/results；
+- Discovery result → enrollment ID binding、source derivation 和 mismatched URL/profile 拒绝；
 - Manager Agent-scoped Observation/Log/Service/Terminal proxy；
 - v1 Terminal HTTP 和 WebSocket 回归契约。
 
@@ -1329,11 +1594,19 @@ Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilitie
 - Public 与 Ingest listener 的网络隔离；
 - 管理员 token 和 producer token 权限隔离；
 - Agent restart 后 Terminal 状态 reconciliation 和 Observation 保留；
-- YAML Agent 首次导入、Manager restart 后 Registry/status 恢复；
-- Agent credential 写入权限、更新失败 rollback 和删除；
+- YAML Agent 首次导入、离线/旧版记录不阻塞、本地 credential copy 失败全量回滚、duplicate identity 后续隔离，以及 Manager restart 后 Registry/status 恢复；
+- Agent credential 写入权限、hash-only persistence、两端 restart 后继续认证、更新失败 rollback 和删除；
 - 多 Agent probe concurrency、单 Agent 超时和 Fleet partial result；
 - Discovery job progress/cancel/timeout/dedupe/24 小时 cleanup；
-- Add Agent 从 validate 到 save 的完整链路；
+- 普通用户 Manager 通过现有 SSH config/`ssh-agent`、不同远端用户名完成 auto enrollment；
+- systemd Manager pending enrollment → 用户 CLI SSH → local Unix socket → preview → add 完整链路；
+- SSH auth 失败、host key changed、pending 过期和 Add 失败补偿不留下可用 Registry credential；
+- Enrollment 在 credential issued、verified、activation requested、remote activated 和 local commit 每个 phase boundary crash 后均能恢复或留下可重试 residual，不丢失撤销所需 token/reference；
+- Credential rotation 保留旧连接直到新 token 可用；撤销失败/进程 crash 时保留 old reference 和 residual journal，恢复后最终撤销旧 token；
+- 在线删除撤销远端 credential，离线 local-only removal 给出残留状态；
+- verified-TLS 与显式 trusted-LAN HTTP/WS 的 API 和 Terminal 链路；
+- Discovery → enrollment → Registry → probe → HTTP API proxy 的完整链路；
+- 真实 v1 Agent admin token → `/api/capabilities`（无 instance ID）→ degraded preview → verified enrollment ID → save/import 链路，token 不进入响应；
 - Manager Terminal ticket 到 Agent Terminal ticket/WebSocket 的完整链路。
 
 ### 22.4 Frontend tests
@@ -1341,9 +1614,12 @@ Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilitie
 - Runtime mode 正确选择 Agent Terminal 或 Manager Fleet 默认入口；
 - URL deep link、back/forward、刷新和 query filter 恢复；
 - Fleet 搜索/筛选/排序、partial error、empty state 和 responsive card fallback；
-- Add Agent 验证成功/失败、输入变更使验证失效、token 不持久化；
-- Discovery progress/cancel/results 和 candidate 到 Add Agent 的预填；
+- Add Agent 自动 SSH 成功/失败、CLI waiting/submission、过期/retry、输入变更取消旧 enrollment；
+- Verify & Save preview、service-key capability 和 legacy recovery 入口；
+- Legacy v1 preview 显示 identity unavailable/degraded 警告，且不能误显示 v2 summary 或 stable instance ID；
+- Discovery progress/cancel/results 和 candidate 到 enrollment 的 URL/transport/SSH host 预填；
 - Agent 删除确认、`agent_in_use` 恢复、enable/disable/probe；
+- Standalone Agent Manager access 只显示安全 metadata，并能确认撤销 credential；
 - Capability 缺失页签 disabled reason；
 - Terminal tab 和 reconnect 行为；
 - 认证过期清理；
@@ -1362,9 +1638,17 @@ Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilitie
 - 未认证用户不能读取 Observation、Log 或 Terminal；
 - Producer token 不能调用 Public 管理和 Terminal API；
 - 浏览器响应、query cache 和 WebSocket URL 不包含 Agent token；
+- Agent `/healthz`、Discovery、capabilities 和 enrollment response 不返回用户公钥、`authorized_keys` 或 SSH key path；
+- Manager 不枚举/读取/上传个人私钥，不使用 `shell=True`；恶意 user/host/port/option 或 SSH config 中的 HostName/ProxyCommand/ProxyJump/LocalCommand 不能改变 validated effective target 或注入命令，`ssh -G` 与实际连接使用同一固定 overrides；
+- enrollment token 不出现在浏览器、URL、storage、query cache、进程参数、日志或审计；
+- 未授权 SSH key 不能 enrollment；password/keyboard-interactive auth 被禁用；trusted-LAN 首次 key 可 accept-new，verified-TLS auto 的未知 key 必须转 CLI，CLI 可人工确认，service-key 必须 strict known_hosts/Host CA；所有模式已记录 key 改变均失败；
+- enrollment socket 未授权 peer、过期 ID、重复提交和 replay 被拒绝；
 - 动态 Agent URL 和 DNS 解析结果必须位于 allowed CIDR，redirect 和 DNS rebinding 被拒绝；
 - Discovery 不能超出配置 Scope、host/port/concurrency/time 限制；
-- Candidate fingerprint 不能绕过 token/TLS validation；
+- Candidate fingerprint 不能绕过 SSH enrollment/Manager-token authorization；
+- trusted-LAN HTTP 只有本地 profile 和 Agent listener 同时启用、目标位于 allowed CIDR 时可用；其他 HTTP endpoint fail closed；
+- 普通内网主机没有有效 token 时不能读取数据、创建 Terminal ticket 或 attach WebSocket；
+- 可选 service Ed25519 key 的部署检查确认 forced command、禁 PTY 和禁 forwarding，不能启动任意 Shell；
 - credential directory/file 权限不合格时 Manager fail closed；
 - 删除、编辑、Discovery 和 Agent validation 写入审计但不记录 secret。
 
@@ -1388,16 +1672,23 @@ Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilitie
 14. 安装、升级和 rollback 文档覆盖新增端口、token、数据库表和配置。
 15. Standalone Agent 登录后直接进入本机 Terminal，且不加载/显示 Fleet selector。
 16. Manager 登录后 `/fleet` 能列出 SQLite Registry 中全部 Agent，包括 URL、status、version、Observation 和 Service summary。
-17. 用户可以通过 Web 完成 validate → preview → add；无效 token、错误 API version 或重复 ID/URL 不得写入 Registry。
+17. 用户可以通过 Web 完成 connection → SSH enrollment/CLI waiting → preview → add；SSH 未授权、enrollment 过期、错误 API version 或重复 ID/URL 不得写入可用 Registry credential。
 18. Agent instance ID 在重启和升级后保持不变；重复 instance ID 或 normalized endpoint 均不能注册。
-19. 修改 URL/credential 必须重新验证；失败更新保留旧配置和连接能力。
-20. 删除 Agent 会移除 managed credential file 但不影响远端 Agent 数据；活跃 Terminal 时删除被安全阻止。
-21. Discovery 只能扫描命名 Scope，显示可取消进度，并把 Candidate 带入逐个验证流程。
-22. 浏览器网络请求、storage、URL 和渲染内容中均不存在 Agent token。
+19. 修改 URL/transport 使用现有 credential 验证相同 identity；credential rotation 失败时旧配置和连接继续可用。
+20. 在线删除 Agent 撤销远端 Manager credential 并移除本地 credential；离线 local-only removal 必须明确确认且不影响远端 Agent 数据；活跃 Terminal 时删除被安全阻止。
+21. Discovery 只能扫描命名 Scope，显示可取消进度，并把 Candidate 带入逐个 SSH enrollment，不从 fingerprint 直接注册。
+22. 浏览器网络请求、storage、URL 和渲染内容中均不存在 Agent token、SSH output、private key path 或 `SSH_AUTH_SOCK`。
 23. Fleet 中单个 Agent 离线时其余 Agent 和 last-known summaries 仍正常显示。
 24. `/agents/:agentId/...` 可深链接、刷新和前进/后退；Terminal/请求状态不跨 Agent 泄漏。
 25. Fleet、Add、Discovery、Agent Detail 和 Audit 满足 WCAG 2.2 AA 关键交互要求，并通过 375–1440 px 布局验证。
 26. `AppRoutes` view state machine 和承担 Fleet 全局状态的 `AgentContext` 被目标路由/query 架构替代。
+27. 普通用户 Manager 可以使用现有 SSH config/`ssh-agent`，以不同远端用户名添加 Agent；全过程不创建远端专用用户，也不要求 NIS 或相同 UID。
+28. systemd Manager 可以通过短期 enrollment ID、当前用户 CLI 和受保护 Unix socket 完成同一添加流程，Manager daemon 不读取个人私钥。
+29. Agent 只保存 Manager token hash；Manager 只在 owner-only Credential Store 保存明文；两端重启后已激活 credential 继续有效。
+30. trusted-LAN HTTP/WS 只有双方本地显式启用且目标位于 private allowlist 时可用，并在 UI 持续显示未加密警告；普通内网主机无 token 时仍被拒绝。
+31. 可选 Manager service Ed25519 key 只允许执行 enrollment forced command，不能创建 SSH PTY、任意 Shell 或端口转发。
+32. Enrollment/rotation 在任何远端 issuance/activation 与本地 commit 边界崩溃后都能从 durable journal 恢复、完成撤销或显示可重试 residual，不遗失唯一 token/reference。
+33. Discovery result 只有在 URL、IP、port 和 transport profile 全部匹配时才能绑定 enrollment；注册后的 `source=discovery` 由服务端关系产生，浏览器不能伪造。
 
 ## 24. 风险与缓解
 
@@ -1405,7 +1696,7 @@ Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilitie
 
 风险：管理员 token 泄露可能导致远程执行任意命令；运行账号具有 sudo 时影响可达到 root。
 
-缓解：HTTPS、严格 token 文件权限、限流、短期 Terminal ticket、安全审计、最小 sudoers 和默认 loopback bind。部署文档必须明确风险，不把 bearer token 描述为低风险只读凭据。
+缓解：默认 HTTPS、严格 token 文件权限、限流、短期 Terminal ticket、安全审计、最小 sudoers 和默认 loopback bind。trusted-LAN HTTP 部署必须明确承担传输机密性风险。部署文档不能把 bearer token 描述为低风险只读凭据。
 
 ### 24.2 任意 `details` 导致存储膨胀或泄密
 
@@ -1425,15 +1716,15 @@ Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilitie
 
 ### 24.6 动态 Agent 凭据泄露
 
-风险：Web 添加 Agent 会让 Manager 持有高权限 Agent token。
+风险：SSH enrollment 会让 Manager 持有具备 Terminal/管理能力的 Manager-specific Agent token。
 
-缓解：只经 HTTPS 接收、validate 不持久化、独立 `0600` credential file、SQLite 只保存 reference、响应和审计脱敏、备份文档明确 credential directory 的敏感级别。
+缓解：token 只经 SSH 或受保护本地 socket 进入 Manager，永不经过浏览器；Agent 只保存 hash，Manager 使用独立 `0600` credential file，SQLite 只保存 reference，响应/审计脱敏，并支持独立轮换和撤销。Durable enrollment/rotation journal 在远端激活前保存 credential/reference，phase-boundary crash 后恢复或显式报告 residual，不能由 orphan cleanup 提前删除。备份文档必须明确 credential directory 和 journal 必须成组恢复。
 
 ### 24.7 Discovery 退化成通用端口扫描器或 SSRF
 
 风险：任意网络/端口输入可被滥用于探测内网服务。
 
-缓解：只允许本地命名 Scope、private CIDR、固定端口、bounded concurrency/time、精确 fingerprint、无 redirect、DNS 结果复检，并要求 token/TLS 二次验证。
+缓解：只允许本地命名 Scope、private CIDR、固定 endpoint/transport profile、bounded concurrency/time、精确 fingerprint、无 redirect、DNS 结果复检，并要求用户对单个 Candidate 显式执行 SSH enrollment 或 legacy credential 验证。
 
 ### 24.8 Fleet polling 放大负载
 
@@ -1446,6 +1737,24 @@ Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilitie
 风险：维护两套页面会重复逻辑并产生不一致。
 
 缓解：共享 feature 与 App Shell，Runtime Capabilities 只决定路由入口和可见功能；禁止复制 Terminal/Services/Observations 组件。
+
+### 24.10 SSH enrollment 扩大命令执行面
+
+风险：若 Web 输入可以控制 SSH option、identity path、远端命令或 shell quoting，Manager 可能成为本地/远端命令执行入口；若 helper 权限过宽，service key 可能获得完整 Shell。
+
+缓解：使用系统 OpenSSH 但只通过固定 argv builder 调用；严格验证 user/host/port，禁止 `shell=True` 和浏览器 option；以 validated IP/User/Port command-line overrides、禁 ProxyCommand/ProxyJump/LocalCommand 和 `ssh -G` effective-config check 固定目标。远端 helper 使用 versioned stdin/stdout 协议和有界输出。Service key 必须使用 forced command、禁 PTY/forwarding，并在启用前做 Agent 端部署检查。
+
+### 24.11 Local enrollment socket 被冒用
+
+风险：systemd Manager 的本地 socket 若权限过宽，其他本机用户可能提交伪造结果、抢占 enrollment ID 或 replay 旧结果。
+
+缓解：socket parent/owner/group/mode fail closed，验证 Unix peer credentials；job 使用短 TTL、单次状态转换、目标绑定、容量限制和 replay 拒绝。Socket payload、token 和完整 CLI command 不进入日志或审计。
+
+### 24.12 Trusted-LAN HTTP 泄露高权限数据
+
+风险：HTTP/WS 不提供机密性或服务端密码学身份；若内网存在抓包、ARP/DNS 欺骗、恶意网关或边界误配置，Agent token、Terminal 内容和日志可能泄露。
+
+缓解：该 profile 默认关闭，只允许本地配置的 private CIDR，Manager 与 Agent 双方都必须显式启用，UI 持续显示未加密警告。任何不满足“无 Agent 冒充、无主动中间人、无被动抓包”假设的网络必须使用 verified TLS；不能在 UI 中一键忽略 TLS。
 
 ## 25. 已确认设计决策
 
@@ -1462,8 +1771,15 @@ Workstream A 可独立交付 Agent v2；Workstream B 依赖 Agent v2 capabilitie
 11. Prometheus 负责远端数值采集和长期时序历史。
 12. 原始日志内容不进入 SQLite、审计或 Prometheus。
 13. Manager 使用 SQLite 作为动态 Agent Registry 权威源，YAML Agent 列表只做一次性迁移。
-14. Manager 把每个 Agent token 存入独立 `0600` 文件，浏览器永远看不到 Agent token。
-15. Discovery 只扫描管理员本地配置的命名 Scope，并且 Candidate 必须逐个验证后添加。
+14. 默认使用一次性 SSH enrollment 创建 Manager-specific Agent token；Agent 只保存 hash，Manager 把明文存入独立 `0600` 文件，浏览器永远看不到 token。
+15. Discovery 只扫描管理员本地配置的命名 Scope；Candidate 代表真实 Agent 但尚未授权给当前 Manager，必须逐个 enrollment 后添加。
 16. Fleet 页面使用 data-dense table + drill-down；Agent 详情使用 URL 和二级页签，不使用全局 Agent selector 代替导航。
 17. 前端使用 React Router + TanStack Query + feature ownership，不增加 Redux 或大型 UI framework。
 18. 视觉采用中性、数据密集、无障碍优先的企业工具风格，不采用荧光终端主题或装饰性 dashboard。
+19. SSH 只用于 enrollment，不作为长期 HTTP、Terminal WebSocket 或 Prometheus tunnel。
+20. Manager 普通用户模式自动尝试系统 SSH；systemd 模式使用当前用户 CLI 和受保护本地 Unix socket；专用受限 Ed25519 service key 是可选无人值守路径。
+21. OpenSSH 自己选择并验证客户端 key；Agent 不返回 `authorized_keys`/用户公钥，Manager 不读取或匹配个人私钥文件。
+22. Manager 与 Agent SSH 用户可以不同；系统不创建专用远端用户，也不要求相同 UID、NIS、LDAP 或统一用户目录。
+23. 默认 transport 是 verified TLS；显式 trusted-LAN HTTP/WS profile 仅用于满足无 Agent 冒充、无主动中间人和无被动抓包假设的私有网络，并持续显示未加密警告。
+24. 普通内网主机即使能够访问 Agent 端口，也必须持有有效 token 才能读取 Agent 数据、创建 Terminal 或执行管理操作。
+25. Enrollment 和 credential rotation 使用 durable journal；远端 credential 已签发/激活后，本地 token/reference 在完成 Registry commit 或确认撤销前不得删除。
