@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from typing import Annotated, Protocol
 
-from fastapi import APIRouter, Depends, Path, Query, Request
+from fastapi import APIRouter, Depends, Path, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import sessionmaker
 
@@ -16,6 +16,7 @@ from ic_env_guard.logs.models import (
     LogSource,
     LogSourceExpired,
     LogStorageError,
+    validate_log_id,
 )
 from ic_env_guard.logs.service import LogSourceService
 
@@ -29,7 +30,7 @@ class LogTailAuditRecorder(Protocol):
         *,
         actor_id: str,
         log_id: str,
-        requested_lines: int,
+        requested_lines: int | None,
         result: str,
         source_addr: str | None,
         correlation_id: str | None,
@@ -50,16 +51,17 @@ class AgentLogTailAuditRecorder:
         *,
         actor_id: str,
         log_id: str,
-        requested_lines: int,
+        requested_lines: int | None,
         result: str,
         source_addr: str | None,
         correlation_id: str | None,
     ) -> None:
+        safe_lines = requested_lines if requested_lines is not None else "invalid"
         if result == "success":
             audit_result = "success"
         elif result == "log_path_forbidden":
             audit_result = "denied"
-        elif result in {"log_source_not_found", "log_source_stale"}:
+        elif result in {"validation_error", "log_source_not_found", "log_source_stale"}:
             audit_result = "rejected"
         else:
             audit_result = "failed"
@@ -73,7 +75,7 @@ class AgentLogTailAuditRecorder:
                         target_type="log",
                         target_id=log_id,
                         result=audit_result,
-                        failure_reason=f"lines={requested_lines};result={result}",
+                        failure_reason=f"lines={safe_lines};result={result}",
                         correlation_id=correlation_id,
                     )
                 )
@@ -119,6 +121,21 @@ def _storage_error(exc: LogStorageError) -> V2ApiError:
     return V2ApiError(503, "storage_unavailable", "log storage is unavailable")
 
 
+def _parse_tail_lines(request: Request, config: LogsConfig) -> tuple[int | None, int | None]:
+    submitted = request.query_params.getlist("lines")
+    if not submitted:
+        return config.default_tail_lines, config.default_tail_lines
+    if len(submitted) != 1:
+        return None, None
+    raw = submitted[0]
+    if len(raw) > 4 or not raw.isascii() or not raw.isdecimal():
+        return None, None
+    requested = int(raw)
+    if not 1 <= requested <= 1000 or requested > config.max_tail_lines:
+        return requested, None
+    return requested, requested
+
+
 @router.get("/logs")
 def list_log_sources(
     _: Annotated[AuthContext, Depends(require_auth)],
@@ -140,36 +157,43 @@ def get_log_source(
 ) -> dict[str, object]:
     now = datetime.now(UTC)
     try:
-        record = service.get(log_id, now=now)
+        record = service.get(log_id, now=now, include_stale=True)
     except LogStorageError as exc:
         raise _storage_error(exc) from exc
     if record is None:
         raise V2ApiError(404, "log_source_not_found", "log source was not found")
+    if record.is_stale(now):
+        raise V2ApiError(410, "log_source_stale", "log source is stale")
     return log_source_to_dict(record, now=now)
 
 
 @router.get("/logs/{log_id}/tail")
 def tail_log_source(
     request: Request,
-    log_id: LogId,
+    log_id: str,
     actor: Annotated[AuthContext, Depends(require_auth)],
     service: Annotated[LogSourceService, Depends(get_log_source_service)],
     audit: Annotated[LogTailAuditRecorder, Depends(get_log_tail_audit_recorder)],
     config: Annotated[LogsConfig, Depends(get_logs_config)],
-    lines: Annotated[int | None, Query(ge=1, le=1000)] = None,
 ) -> JSONResponse:
     now = datetime.now(UTC)
-    requested_lines = config.default_tail_lines if lines is None else lines
-    if requested_lines > config.max_tail_lines:
-        raise V2ApiError(422, "validation_error", "request validation failed")
+    requested_lines, validated_lines = _parse_tail_lines(request, config)
     source_addr = request.client.host if request.client else None
     correlation_id = getattr(request.state, "correlation_id", None)
+    safe_log_id = "<invalid-log-id>"
+    valid_log_id = False
+    if len(log_id) <= 127:
+        try:
+            safe_log_id = validate_log_id(log_id)
+            valid_log_id = True
+        except ValueError:
+            pass
 
     def audited(result: str) -> None:
         try:
             audit.record(
                 actor_id=actor.actor_id,
-                log_id=log_id,
+                log_id=safe_log_id,
                 requested_lines=requested_lines,
                 result=result,
                 source_addr=source_addr,
@@ -180,26 +204,25 @@ def tail_log_source(
         except Exception as exc:
             raise AuditStorageUnavailable("audit storage is unavailable") from exc
 
-    try:
-        record = service.get(log_id, now=now, include_stale=True)
-    except LogStorageError as exc:
-        audited("storage_unavailable")
-        raise _storage_error(exc) from exc
-    if record is None:
-        audited("log_source_not_found")
-        raise V2ApiError(404, "log_source_not_found", "log source was not found")
-    if record.is_stale(now):
-        audited("log_source_stale")
-        raise V2ApiError(410, "log_source_stale", "log source is stale")
+    if not valid_log_id or validated_lines is None:
+        audited("validation_error")
+        raise V2ApiError(422, "validation_error", "request validation failed")
 
     try:
-        result = service.tail(log_id, lines=requested_lines, now=now)
+        result = service.tail(log_id, lines=validated_lines, now=now)
     except LogPathForbidden as exc:
         audited("log_path_forbidden")
         raise V2ApiError(403, "log_path_forbidden", "log path is not permitted") from exc
     except LogFileUnavailable as exc:
+        if str(exc) == "log_source_not_found":
+            audited("log_source_not_found")
+            raise V2ApiError(
+                404, "log_source_not_found", "log source was not found"
+            ) from exc
         audited("log_file_unavailable")
-        raise V2ApiError(410, "log_file_unavailable", "log file is unavailable") from exc
+        raise V2ApiError(
+            410, "log_file_unavailable", "log file is unavailable"
+        ) from exc
     except LogSourceExpired as exc:
         audited("log_source_stale")
         raise V2ApiError(410, "log_source_stale", "log source is stale") from exc
@@ -208,6 +231,7 @@ def tail_log_source(
         raise _storage_error(exc) from exc
 
     audited("success")
+    record = result.source
     body = {
         "id": record.id,
         "path": str(record.path),

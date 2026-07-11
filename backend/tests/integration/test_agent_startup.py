@@ -105,3 +105,24 @@ services:
 
     with pytest.raises(ConfigLoadError, match="allowed_operations"):
         load_config(config_path)
+
+
+@pytest.mark.integration
+def test_log_tail_default_above_maximum_fails_config_loading(tmp_path):
+    token_file = tmp_path / "token"
+    token_file.write_text("secret-token\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"""
+auth:
+  token_file: {token_file}
+logs:
+  default_tail_lines: 101
+  max_tail_lines: 100
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigLoadError, match="default_tail_lines"):
+        load_config(config_path)

@@ -108,6 +108,12 @@ class LogsConfig(BaseModel):
             raise ValueError("log allowed roots must be absolute paths")
         return list(dict.fromkeys(value.resolve() for value in values))
 
+    @model_validator(mode="after")
+    def validate_tail_line_defaults(self) -> "LogsConfig":
+        if self.default_tail_lines > self.max_tail_lines:
+            raise ValueError("default_tail_lines must not exceed max_tail_lines")
+        return self
+
 
 class EnrollmentConfig(BaseModel):
     socket_path: Path = Path("/run/ic-env-guard/agent-enrollment.sock")

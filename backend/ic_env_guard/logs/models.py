@@ -159,3 +159,10 @@ class LogUpsertResult:
 class TailResult:
     lines: tuple[str, ...]
     truncated: bool
+
+
+@dataclass(frozen=True)
+class LogTailResult:
+    source: LogSource
+    lines: tuple[str, ...]
+    truncated: bool

@@ -61,6 +61,8 @@ def test_new_agent_configuration_models_enforce_documented_bounds():
         ObservationConfig(cleanup_interval_seconds=0)
     with pytest.raises(ValueError, match="absolute paths"):
         LogsConfig(allowed_roots=[Path("relative")])
+    with pytest.raises(ValueError, match="default_tail_lines"):
+        LogsConfig(default_tail_lines=101, max_tail_lines=100)
     with pytest.raises(ValueError):
         EnrollmentConfig(max_pending=129)
 

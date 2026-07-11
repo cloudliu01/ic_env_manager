@@ -7,8 +7,8 @@ from ic_env_guard.logs.models import (
     LogSourceExpired,
     LogSourceInput,
     LogStorageError,
+    LogTailResult,
     LogUpsertResult,
-    TailResult,
     aware_utc,
     validate_log_id,
 )
@@ -96,13 +96,18 @@ class LogSourceService:
             return records
         return tuple(record for record in records if not record.is_stale(current_time))
 
-    def tail(self, log_id: str, *, lines: int, now: datetime) -> TailResult:
+    def tail(self, log_id: str, *, lines: int, now: datetime) -> LogTailResult:
         record = self.get(log_id, now=now, include_stale=True)
         if record is None:
             raise LogFileUnavailable("log_source_not_found")
         if record.is_stale(now):
             raise LogSourceExpired("log_source_stale")
-        return self.tail_reader.read(record.path, lines=lines)
+        result = self.tail_reader.read(record.path, lines=lines)
+        return LogTailResult(
+            source=record,
+            lines=result.lines,
+            truncated=result.truncated,
+        )
 
     def delete_expired(self, cutoff: datetime, *, limit: int) -> int:
         if limit < 1:

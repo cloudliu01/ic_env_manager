@@ -13,14 +13,17 @@ from ic_env_guard.main import create_ingest_app, create_public_app
 AUTH = {"Authorization": "Bearer secret-token", "X-Correlation-ID": "tail-correlation"}
 
 
-def _setup(tmp_path):
+def _setup(tmp_path, **log_settings):
     root = tmp_path / "allowed"
     root.mkdir()
     token_file = tmp_path / "token"
     token_file.write_text("secret-token\n", encoding="utf-8")
     token_file.chmod(0o600)
     container = build_agent_container(
-        AppConfig(auth=AuthConfig(token_file=token_file), logs=LogsConfig(allowed_roots=[root])),
+        AppConfig(
+            auth=AuthConfig(token_file=token_file),
+            logs=LogsConfig(allowed_roots=[root], **log_settings),
+        ),
         tmp_path / "state.db",
     )
     return root, container, create_ingest_app(container), create_public_app(container)
@@ -123,4 +126,74 @@ def test_tail_audit_failure_fails_closed_without_returning_content(tmp_path):
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "audit_storage_unavailable"
     assert "must-not-be-returned" not in response.text
+    container.database_engine.dispose()
+
+
+@pytest.mark.security
+def test_authenticated_tail_validation_failures_are_safely_audited(tmp_path):
+    _, container, _, public_app = _setup(
+        tmp_path, default_tail_lines=10, max_tail_lines=10
+    )
+    unsafe_log_id = "Bad-secret-token-value"
+    with TestClient(public_app) as public:
+        responses = [
+            public.get("/api/v2/logs/run-log/tail?lines=0", headers=AUTH),
+            public.get("/api/v2/logs/run-log/tail?lines=not-a-number", headers=AUTH),
+            public.get("/api/v2/logs/run-log/tail?lines=11", headers=AUTH),
+            public.get(f"/api/v2/logs/{unsafe_log_id}/tail", headers=AUTH),
+            public.get("/api/v2/logs/%3Cinvalid-log-id%3E/tail", headers=AUTH),
+        ]
+
+    assert all(response.status_code == 422 for response in responses)
+    assert all(
+        response.json()["error"]["code"] == "validation_error"
+        for response in responses
+    )
+    with container.database_engine.connect() as connection:
+        audits = connection.execute(
+            text("SELECT * FROM audit_events WHERE operation = 'logs.tail' ORDER BY id")
+        ).mappings().all()
+    assert len(audits) == 5
+    assert [row["failure_reason"] for row in audits] == [
+        "lines=0;result=validation_error",
+        "lines=invalid;result=validation_error",
+        "lines=11;result=validation_error",
+        "lines=10;result=validation_error",
+        "lines=10;result=validation_error",
+    ]
+    assert audits[-1]["target_id"] == "<invalid-log-id>"
+    assert unsafe_log_id not in json.dumps([dict(row) for row in audits])
+    assert all(row["result"] == "rejected" for row in audits)
+    container.database_engine.dispose()
+
+
+@pytest.mark.security
+def test_unauthenticated_tail_validation_failure_is_not_audited(tmp_path):
+    _, container, _, public_app = _setup(tmp_path)
+    with TestClient(public_app) as public:
+        response = public.get("/api/v2/logs/Bad-secret-token/tail?lines=invalid")
+
+    assert response.status_code == 401
+    with container.database_engine.connect() as connection:
+        count = connection.execute(
+            text("SELECT COUNT(*) FROM audit_events WHERE operation = 'logs.tail'")
+        ).scalar_one()
+    assert count == 0
+    container.database_engine.dispose()
+
+
+@pytest.mark.security
+def test_tail_validation_audit_failure_fails_closed(tmp_path):
+    _, container, _, public_app = _setup(tmp_path)
+
+    class FailingRecorder:
+        def record(self, **kwargs):
+            raise RuntimeError("audit offline")
+
+    public_app.dependency_overrides[get_log_tail_audit_recorder] = lambda: FailingRecorder()
+    with TestClient(public_app) as public:
+        response = public.get("/api/v2/logs/run-log/tail?lines=0", headers=AUTH)
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "audit_storage_unavailable"
     container.database_engine.dispose()
