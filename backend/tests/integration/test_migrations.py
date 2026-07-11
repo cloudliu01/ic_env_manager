@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sqlite3
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -260,4 +261,61 @@ def test_sqlite_repository_translates_corrupt_storage_rows(tmp_path):
 
     with pytest.raises(ObservationStorageError, match="observation_storage_unavailable"):
         SQLiteObservationRepository(engine).get("broken")
+    engine.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("column", "corrupt_value"),
+    [
+        ("labels_json", "[]"),
+        ("labels_json", '{"server":1}'),
+        ("details_json", "[]"),
+        ("details_json", json.dumps({"blob": "x" * 16385})),
+        ("kind", "histogram"),
+        ("status", "healthy"),
+        ("numeric_value", float("inf")),
+        ("numeric_value", None),
+        ("producer_id", "remote"),
+        ("identity_key", "0" * 64),
+        ("expires_at", "2026-07-11T10:00:00.000000Z"),
+        ("observed_at", "2026-07-11T10:00:00+00:00"),
+        ("received_at", "2026-07-11T10:00:30+00:00"),
+        ("updated_at", 123),
+    ],
+)
+def test_sqlite_repository_rejects_domain_invalid_storage_rows(
+    tmp_path, column, corrupt_value
+):
+    db_path = tmp_path / "state.db"
+    connection = sqlite3.connect(db_path)
+    initial_migration.upgrade(connection)
+    observability_migration.upgrade(connection)
+    connection.close()
+    engine = create_engine(f"sqlite:///{db_path}")
+    repository = SQLiteObservationRepository(engine)
+    service = ObservationService(repository)
+    record = service.upsert(
+        ObservationInput.model_validate(
+            {
+                "namespace": "eda",
+                "name": "alive",
+                "kind": "gauge",
+                "value": 1,
+                "status": "ok",
+                "observed_at": "2026-07-11T10:00:00Z",
+                "ttl_seconds": 120,
+            }
+        ),
+        now=datetime.fromisoformat("2026-07-11T10:00:30+00:00"),
+    ).record
+    lookup_key = corrupt_value if column == "identity_key" else record.identity_key
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            f"UPDATE observations SET {column} = ? WHERE identity_key = ?",
+            (corrupt_value, record.identity_key),
+        )
+
+    with pytest.raises(ObservationStorageError, match="observation_storage_unavailable"):
+        repository.get(lookup_key)
     engine.dispose()

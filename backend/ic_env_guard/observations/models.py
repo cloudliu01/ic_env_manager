@@ -40,6 +40,12 @@ def _utf8_size(value: str) -> int:
     return len(value.encode("utf-8"))
 
 
+def _aware_utc(value: datetime, field: str) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field} must be timezone-aware")
+    return value.astimezone(UTC)
+
+
 def _validate_json(value: Any, depth: int) -> None:
     if value is None or isinstance(value, bool):
         return
@@ -146,9 +152,7 @@ class ObservationInput(BaseModel):
                 value = datetime.fromisoformat(value.replace("Z", "+00:00"))
             except ValueError as exc:
                 raise ValueError("observed_at must be RFC3339") from exc
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("observed_at must be timezone-aware")
-        return value.astimezone(UTC)
+        return _aware_utc(value, "observed_at")
 
     @model_validator(mode="after")
     def validate_value(self) -> "ObservationInput":
@@ -184,6 +188,71 @@ class Observation:
     expires_at: datetime
     producer_id: str
     updated_at: datetime
+
+    @classmethod
+    def reconstitute(
+        cls,
+        *,
+        identity_key: str,
+        namespace: str,
+        name: str,
+        kind: str,
+        value: int | float | None,
+        unit: str | None,
+        status: str,
+        message: str | None,
+        labels: Any,
+        details: Any,
+        observed_at: datetime,
+        received_at: datetime,
+        expires_at: datetime,
+        producer_id: str,
+        updated_at: datetime,
+    ) -> "Observation":
+        normalized_observed_at = _aware_utc(observed_at, "observed_at")
+        normalized_received_at = _aware_utc(received_at, "received_at")
+        normalized_expires_at = _aware_utc(expires_at, "expires_at")
+        normalized_updated_at = _aware_utc(updated_at, "updated_at")
+        ttl_value = (normalized_expires_at - normalized_observed_at).total_seconds()
+        if not ttl_value.is_integer():
+            raise ValueError("stored observation TTL must be whole seconds")
+        payload = ObservationInput.model_validate(
+            {
+                "namespace": namespace,
+                "name": name,
+                "kind": kind,
+                "value": value,
+                "unit": unit,
+                "status": status,
+                "message": message,
+                "labels": labels,
+                "details": details,
+                "observed_at": normalized_observed_at,
+                "ttl_seconds": int(ttl_value),
+            }
+        )
+        if producer_id != "local":
+            raise ValueError("stored observation producer must be local")
+        if identity_key != payload.identity_key():
+            raise ValueError("stored observation identity mismatch")
+        return cls(
+            identity_key=identity_key,
+            namespace=payload.namespace,
+            name=payload.name,
+            kind=payload.kind,
+            value=payload.value,
+            unit=payload.unit,
+            status=payload.status,
+            message=payload.message,
+            labels=payload.labels,
+            details=payload.details,
+            observed_at=payload.observed_at,
+            ttl_seconds=payload.ttl_seconds,
+            received_at=normalized_received_at,
+            expires_at=normalized_expires_at,
+            producer_id=producer_id,
+            updated_at=normalized_updated_at,
+        )
 
     def is_stale(self, now: datetime) -> bool:
         return now.astimezone(UTC) >= self.expires_at

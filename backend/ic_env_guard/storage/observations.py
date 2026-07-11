@@ -25,7 +25,13 @@ def _format_time(value: datetime) -> str:
 
 
 def _parse_time(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("stored observation time must be timezone-aware")
+    normalized = parsed.astimezone(UTC)
+    if value != _format_time(normalized):
+        raise ValueError("stored observation time is not canonical")
+    return normalized
 
 
 def _values(record: Observation) -> dict[str, Any]:
@@ -49,9 +55,7 @@ def _values(record: Observation) -> dict[str, Any]:
 
 
 def _record(row: Any) -> Observation:
-    observed_at = _parse_time(row.observed_at)
-    expires_at = _parse_time(row.expires_at)
-    return Observation(
+    return Observation.reconstitute(
         identity_key=row.identity_key,
         namespace=row.namespace,
         name=row.name,
@@ -62,11 +66,10 @@ def _record(row: Any) -> Observation:
         message=row.message,
         labels=json.loads(row.labels_json),
         details=json.loads(row.details_json),
-        observed_at=observed_at,
-        ttl_seconds=int((expires_at - observed_at).total_seconds()),
+        observed_at=_parse_time(row.observed_at),
         received_at=_parse_time(row.received_at),
-        expires_at=expires_at,
-        producer_id="local",
+        expires_at=_parse_time(row.expires_at),
+        producer_id=row.producer_id,
         updated_at=_parse_time(row.updated_at),
     )
 
