@@ -1,5 +1,6 @@
 import logging
 import re
+from collections.abc import Mapping
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
@@ -10,6 +11,7 @@ from fastapi.exception_handlers import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
+from starlette.routing import Match
 
 _CORRELATION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 logger = logging.getLogger(__name__)
@@ -33,8 +35,15 @@ def resolve_v2_correlation_id(submitted: str | None) -> str:
 
 
 def v2_error_response(
-    status_code: int, code: str, message: str, correlation_id: str
+    status_code: int,
+    code: str,
+    message: str,
+    correlation_id: str,
+    headers: Mapping[str, str] | None = None,
 ) -> JSONResponse:
+    response_headers = {"X-Correlation-ID": correlation_id}
+    if headers:
+        response_headers.update(headers)
     return JSONResponse(
         status_code=status_code,
         content={
@@ -44,7 +53,7 @@ def v2_error_response(
                 "correlation_id": correlation_id,
             }
         },
-        headers={"X-Correlation-ID": correlation_id},
+        headers=response_headers,
     )
 
 
@@ -66,8 +75,29 @@ async def v2_http_exception_handler(request: Request, exc: HTTPException):
         code, message = "method_not_allowed", "method not allowed"
     else:
         code, message = "request_error", "request failed"
+    headers: dict[str, str] = {}
+    allow = None
+    if exc.headers:
+        allow = next(
+            (value for key, value in exc.headers.items() if key.lower() == "allow"), None
+        )
+    if allow is None and exc.status_code == 405:
+        methods: set[str] = set()
+        for route in request.app.router.routes:
+            match, _ = route.matches(request.scope)
+            if match is Match.PARTIAL:
+                methods.update(getattr(route, "methods", ()) or ())
+        allow = ", ".join(sorted(methods)) or None
+    if allow is not None and len(allow) <= 128 and re.fullmatch(
+        r"[A-Z]+(?:, ?[A-Z]+)*", allow
+    ):
+        headers["Allow"] = allow
     return v2_error_response(
-        exc.status_code, code, message, request.state.correlation_id
+        exc.status_code,
+        code,
+        message,
+        request.state.correlation_id,
+        headers=headers,
     )
 
 

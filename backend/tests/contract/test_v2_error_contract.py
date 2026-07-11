@@ -91,6 +91,7 @@ def test_v2_wrong_method_uses_nested_error_envelope(tmp_path):
 
     assert response.status_code == 405
     assert response.json()["error"]["code"] == "method_not_allowed"
+    assert response.headers["Allow"] == "GET"
     assert response.headers["X-Correlation-ID"] == response.json()["error"]["correlation_id"]
 
 

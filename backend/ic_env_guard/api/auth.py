@@ -174,7 +174,7 @@ async def login(
     try:
         submitted = await request.json()
         payload = LoginRequest.model_validate(submitted)
-    except (JSONDecodeError, UnicodeDecodeError):
+    except (JSONDecodeError, RecursionError, UnicodeDecodeError):
         audit.record_failure(source_addr, correlation_id, "invalid_request")
         raise RequestValidationError(
             [{"type": "json_invalid", "loc": ("body",), "msg": "JSON decode error"}]

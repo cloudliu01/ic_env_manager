@@ -174,6 +174,42 @@ def test_schema_invalid_logins_are_limited_and_durably_audited(tmp_path):
 
 @pytest.mark.contract
 @pytest.mark.security
+def test_deeply_nested_json_is_safely_audited_and_charged(tmp_path):
+    token_file = tmp_path / "token"
+    state_database = tmp_path / "state.db"
+    token_file.write_text("secret-token\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    limiter = LoginRateLimiter(capacity=1, refill_seconds=60, clock=lambda: 0.0)
+    app = create_app(
+        token_file=token_file, state_database=state_database, login_limiter=limiter
+    )
+    client = TestClient(app, raise_server_exceptions=False)
+    deeply_nested = b"[" * 20_000 + b"0" + b"]" * 20_000
+
+    rejected = client.post(
+        "/api/auth/login",
+        content=deeply_nested,
+        headers={"Content-Type": "application/json"},
+    )
+    limited = client.post("/api/auth/login", json={"token": "secret-token"})
+
+    assert rejected.status_code == 422
+    assert rejected.json()["detail"][0]["type"] == "json_invalid"
+    assert limited.status_code == 429
+    with app.state.container.session_factory() as session:
+        events = session.execute(
+            select(AuditEvent).where(AuditEvent.operation == "auth.login").order_by(AuditEvent.id)
+        ).scalars().all()
+    assert [event.result for event in events] == ["denied", "denied"]
+    assert [event.failure_reason for event in events] == [
+        "invalid_request",
+        "rate_limited",
+    ]
+    assert "[" not in " ".join(str(event.to_safe_dict()) for event in events)
+
+
+@pytest.mark.contract
+@pytest.mark.security
 def test_manager_login_success_and_failure_are_durably_audited(tmp_path):
     token_file = tmp_path / "token"
     audit_database = tmp_path / "control-plane.db"
