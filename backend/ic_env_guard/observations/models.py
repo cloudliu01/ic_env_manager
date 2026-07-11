@@ -36,6 +36,10 @@ class ObservationStorageError(ObservationError):
     pass
 
 
+class ObservationSeriesLimit(ObservationError):
+    pass
+
+
 def _utf8_size(value: str) -> int:
     return len(value.encode("utf-8"))
 

@@ -60,6 +60,7 @@ class DevelopmentConfig(BaseModel):
 class MetricsConfig(BaseModel):
     enabled: bool = True
     collect_interval_seconds: int = Field(default=10, ge=1)
+    max_observation_series: int = Field(default=10000, ge=1)
     remote_network_allowlist: list[str] = Field(default_factory=list)
 
     @field_validator("remote_network_allowlist")

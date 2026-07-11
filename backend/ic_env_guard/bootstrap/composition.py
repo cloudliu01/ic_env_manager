@@ -21,12 +21,14 @@ from ic_env_guard.db.session import create_session_factory, create_sqlite_engine
 from ic_env_guard.logs.policy import LogPathPolicy, LogTailReader
 from ic_env_guard.logs.service import LogSourceService
 from ic_env_guard.metrics.collector import MetricsCollector
+from ic_env_guard.metrics.observability import ObservabilityCollector
 from ic_env_guard.metrics.registry import create_registry
 from ic_env_guard.monitoring.machines import MachineRegistry
 from ic_env_guard.observations.service import ObservationService
 from ic_env_guard.services.manager import ServiceManager
 from ic_env_guard.storage.log_sources import SQLiteLogSourceRepository
 from ic_env_guard.storage.observations import SQLiteObservationRepository
+from ic_env_guard.summary.service import SummaryService
 from ic_env_guard.terminal.manager import TerminalManager
 from ic_env_guard.terminal.tickets import TerminalTicketManager
 
@@ -49,6 +51,7 @@ class AgentContainer:
     audit_storage_health: AuditStorageHealth
     agent_registry: AgentRegistry
     observation_service: ObservationService
+    summary_service: SummaryService
     logs_config: LogsConfig
     log_path_policy: LogPathPolicy
     log_source_repository: SQLiteLogSourceRepository
@@ -113,13 +116,26 @@ def build_agent_container(
     metrics_registry = create_registry()
     metrics_collector = MetricsCollector(metrics_registry, terminal_manager, service_manager)
     metrics_collector.refresh()
-    observation_service = ObservationService(SQLiteObservationRepository(database_engine))
+    metrics_config = config.metrics if config else MetricsConfig()
+    observation_repository = SQLiteObservationRepository(
+        database_engine, max_series=metrics_config.max_observation_series
+    )
+    observation_service = ObservationService(observation_repository)
     logs_config = config.logs if config else LogsConfig()
     log_path_policy = LogPathPolicy(logs_config.allowed_roots)
     log_source_repository = SQLiteLogSourceRepository(database_engine)
     log_tail_reader = LogTailReader(log_path_policy, max_bytes=logs_config.max_tail_bytes)
     log_source_service = LogSourceService(
         log_source_repository, log_path_policy, log_tail_reader
+    )
+    metrics_registry.register(
+        ObservabilityCollector(observation_repository, log_source_repository)
+    )
+    summary_service = SummaryService(
+        observation_repository,
+        log_source_repository,
+        service_manager,
+        terminal_manager,
     )
     return AgentContainer(
         config=config,
@@ -134,12 +150,13 @@ def build_agent_container(
         metrics_registry=metrics_registry,
         database_engine=database_engine,
         metrics_collector=metrics_collector,
-        metrics_config=config.metrics if config else MetricsConfig(),
+        metrics_config=metrics_config,
         ticket_manager=TerminalTicketManager(),
         machine_registry=MachineRegistry(),
         audit_storage_health=AuditStorageHealth(),
         agent_registry=AgentRegistry(config.agents if config else []),
         observation_service=observation_service,
+        summary_service=summary_service,
         logs_config=logs_config,
         log_path_policy=log_path_policy,
         log_source_repository=log_source_repository,

@@ -10,6 +10,7 @@ from ic_env_guard.observations.models import (
     Observation,
     ObservationPage,
     ObservationQuery,
+    ObservationSeriesLimit,
     ObservationStorageError,
     compact_json,
 )
@@ -75,8 +76,9 @@ def _record(row: Any) -> Observation:
 
 
 class SQLiteObservationRepository:
-    def __init__(self, engine: Engine) -> None:
+    def __init__(self, engine: Engine, max_series: int = 10000) -> None:
         self.engine = engine
+        self.max_series = max_series
 
     def get(self, identity_key: str) -> Observation | None:
         try:
@@ -100,14 +102,22 @@ class SQLiteObservationRepository:
                         text(
                             "INSERT INTO observations ("
                             + _COLUMNS
-                            + ") VALUES ("
+                            + ") SELECT "
                             ":identity_key, :namespace, :name, :kind, :numeric_value, :unit, "
                             ":status, :message, :labels_json, :details_json, :observed_at, "
                             ":received_at, :expires_at, :producer_id, :updated_at"
-                            ") ON CONFLICT(identity_key) DO NOTHING"
+                            " WHERE (SELECT COUNT(*) FROM observations) < :max_series"
+                            " ON CONFLICT(identity_key) DO NOTHING"
                         ),
-                        values,
+                        {**values, "max_series": self.max_series},
                     )
+                    if result.rowcount == 0:
+                        exists = connection.execute(
+                            text("SELECT 1 FROM observations WHERE identity_key = :identity_key"),
+                            {"identity_key": record.identity_key},
+                        ).first()
+                        if exists is None:
+                            raise ObservationSeriesLimit("observation_series_limit")
                 else:
                     values["expected_observed_at"] = _format_time(expected_observed_at)
                     assignments = ", ".join(
@@ -140,6 +150,40 @@ class SQLiteObservationRepository:
         except SQLAlchemyError as exc:
             raise ObservationStorageError("observation_storage_unavailable") from exc
         return result.rowcount == 1
+
+    def list_all(self) -> tuple[Observation, ...]:
+        try:
+            with self.engine.connect() as connection:
+                rows = connection.execute(
+                    text(f"SELECT {_COLUMNS} FROM observations ORDER BY identity_key")
+                ).fetchall()
+            return tuple(_record(row) for row in rows)
+        except (SQLAlchemyError, TypeError, ValueError) as exc:
+            raise ObservationStorageError("observation_storage_unavailable") from exc
+
+    def counts(self, now: datetime) -> tuple[int, int, int, int]:
+        try:
+            with self.engine.connect() as connection:
+                row = connection.execute(
+                    text(
+                        "SELECT COUNT(*) AS total, "
+                        "SUM(CASE WHEN expires_at > :now AND status = 'warning' "
+                        "THEN 1 ELSE 0 END) AS warning, "
+                        "SUM(CASE WHEN expires_at > :now AND status = 'critical' "
+                        "THEN 1 ELSE 0 END) AS critical, "
+                        "SUM(CASE WHEN expires_at <= :now THEN 1 ELSE 0 END) AS stale "
+                        "FROM observations"
+                    ),
+                    {"now": _format_time(now)},
+                ).one()
+            return (
+                int(row.total),
+                int(row.warning or 0),
+                int(row.critical or 0),
+                int(row.stale or 0),
+            )
+        except SQLAlchemyError as exc:
+            raise ObservationStorageError("observation_storage_unavailable") from exc
 
     def list(self, query: ObservationQuery) -> ObservationPage:
         clauses: list[str] = []

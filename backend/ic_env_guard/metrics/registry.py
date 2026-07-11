@@ -63,4 +63,10 @@ def create_registry() -> CollectorRegistry:
         ["service"],
         registry=registry,
     )
+    Counter(
+        "ic_env_guard_cleanup_failures_total",
+        "Expiration cleanup failures",
+        ["resource"],
+        registry=registry,
+    )
     return registry

@@ -6,7 +6,9 @@ from fastapi import FastAPI
 
 from ic_env_guard.agents.availability import AgentAvailabilityService
 from ic_env_guard.bootstrap.composition import AgentContainer, ManagerContainer
+from ic_env_guard.logs.cleanup import expiration_loop as log_expiration_loop
 from ic_env_guard.metrics.collector import MetricsCollector
+from ic_env_guard.observations.cleanup import expiration_loop as observation_expiration_loop
 
 
 async def _metrics_refresh_loop(collector: MetricsCollector, interval_seconds: int) -> None:
@@ -28,6 +30,8 @@ def create_lifespan(container: AgentContainer | ManagerContainer):
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         refresh_task: asyncio.Task[None] | None = None
         availability_probe_task: asyncio.Task[None] | None = None
+        observation_cleanup_task: asyncio.Task[None] | None = None
+        log_cleanup_task: asyncio.Task[None] | None = None
         metrics_config = container.metrics_config
         if metrics_config.enabled:
             refresh_task = asyncio.create_task(
@@ -45,6 +49,35 @@ def create_lifespan(container: AgentContainer | ManagerContainer):
                 )
             )
             app.state.agent_availability_probe_task = availability_probe_task
+        else:
+            observation_config = container.config.observations if container.config else None
+            interval = observation_config.cleanup_interval_seconds if observation_config else 60
+            retention = (
+                observation_config.expired_retention_seconds
+                if observation_config
+                else 86400
+            )
+            failures = container.metrics_registry._names_to_collectors[
+                "ic_env_guard_cleanup_failures"
+            ]
+            observation_cleanup_task = asyncio.create_task(
+                observation_expiration_loop(
+                    container.observation_service,
+                    interval_seconds=interval,
+                    retention_seconds=retention,
+                    on_error=lambda: failures.labels(resource="observations").inc(),
+                )
+            )
+            log_cleanup_task = asyncio.create_task(
+                log_expiration_loop(
+                    container.log_source_service,
+                    interval_seconds=interval,
+                    retention_seconds=retention,
+                    on_error=lambda: failures.labels(resource="logs").inc(),
+                )
+            )
+            app.state.observation_cleanup_task = observation_cleanup_task
+            app.state.log_cleanup_task = log_cleanup_task
         try:
             yield
         finally:
@@ -56,6 +89,11 @@ def create_lifespan(container: AgentContainer | ManagerContainer):
                 availability_probe_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await availability_probe_task
+            for cleanup_task in (observation_cleanup_task, log_cleanup_task):
+                if cleanup_task is not None:
+                    cleanup_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await cleanup_task
             container.database_engine.dispose()
             if isinstance(container, ManagerContainer):
                 await container.agent_client.aclose()

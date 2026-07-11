@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request
 
 from ic_env_guard.agents.availability import AgentAvailabilityService
 from ic_env_guard.agents.client import AgentHttpClient
-from ic_env_guard.agents.models import LOCAL_CAPABILITIES
+from ic_env_guard.agents.models import V2_LOCAL_CAPABILITIES
 from ic_env_guard.agents.registry import AgentRegistry
 from ic_env_guard.agents.terminal_proxy import GatewayProxyLimiter, GatewayTicketStore
 from ic_env_guard.api import terminal_ws
@@ -68,6 +68,8 @@ from ic_env_guard.api.runtime import router as runtime_router
 from ic_env_guard.api.services import get_service_manager
 from ic_env_guard.api.services import router as services_router
 from ic_env_guard.api.static import mount_static_ui
+from ic_env_guard.api.summary import get_summary_service
+from ic_env_guard.api.summary import router as summary_router
 from ic_env_guard.api.terminals import (
     get_terminal_manager,
     get_ticket_manager,
@@ -234,7 +236,7 @@ def create_app(
             instance_id=container.instance_id,
             name=container.instance_name,
             agent_capabilities=(
-                *LOCAL_CAPABILITIES,
+                *V2_LOCAL_CAPABILITIES,
                 "runtime.v2",
                 *container.capabilities,
             ),
@@ -386,6 +388,7 @@ def create_app(
             lambda: container.log_source_service
         )
         app.dependency_overrides[get_logs_config] = lambda: container.logs_config
+        app.dependency_overrides[get_summary_service] = lambda: container.summary_service
         app.dependency_overrides[get_log_tail_audit_recorder] = lambda: (
             AgentLogTailAuditRecorder(
                 container.session_factory, container.audit_storage_health
@@ -397,6 +400,7 @@ def create_app(
         app.include_router(terminals_router)
         app.include_router(services_router)
         app.include_router(metrics_router)
+        app.include_router(summary_router)
         app.include_router(monitoring_router)
         app.include_router(audit_router)
         app.include_router(terminal_ws.router)

@@ -4,6 +4,12 @@ from uuid import UUID
 API_VERSION = "1"
 AGENT_VERSION = "0.2.0"
 LOCAL_CAPABILITIES = ["services.v1", "terminals.v1", "audit.v1", "monitoring.snapshot.v1"]
+V2_LOCAL_CAPABILITIES = [
+    *LOCAL_CAPABILITIES,
+    "observations.v2",
+    "logs.v2",
+    "summary.v2",
+]
 
 
 @dataclass(frozen=True)

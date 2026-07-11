@@ -118,6 +118,21 @@ class SQLiteLogSourceRepository:
         except (SQLAlchemyError, TypeError, ValueError) as exc:
             raise LogStorageError("log_storage_unavailable") from exc
 
+    def counts(self, now: datetime) -> tuple[int, int]:
+        try:
+            with self.engine.connect() as connection:
+                row = connection.execute(
+                    text(
+                        "SELECT COUNT(*) AS total, "
+                        "SUM(CASE WHEN expires_at <= :now THEN 1 ELSE 0 END) AS stale "
+                        "FROM log_sources"
+                    ),
+                    {"now": _format_time(now)},
+                ).one()
+            return int(row.total), int(row.stale or 0)
+        except SQLAlchemyError as exc:
+            raise LogStorageError("log_storage_unavailable") from exc
+
     def delete_expired(self, cutoff: datetime, limit: int) -> int:
         try:
             with self.engine.begin() as connection:

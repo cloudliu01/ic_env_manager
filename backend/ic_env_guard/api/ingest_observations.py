@@ -11,6 +11,7 @@ from ic_env_guard.observations.models import (
     ObservationConflict,
     ObservationExpired,
     ObservationInput,
+    ObservationSeriesLimit,
     ObservationStorageError,
 )
 from ic_env_guard.observations.service import ObservationService
@@ -40,6 +41,12 @@ def put_observation(
             else "the submitted timestamp conflicts with the stored value"
         )
         raise V2ApiError(409, code, message) from exc
+    except ObservationSeriesLimit as exc:
+        raise V2ApiError(
+            409,
+            "observation_series_limit",
+            "observation series capacity has been reached",
+        ) from exc
     except ObservationStorageError as exc:
         raise V2ApiError(
             503, "storage_unavailable", "observation storage is unavailable"
