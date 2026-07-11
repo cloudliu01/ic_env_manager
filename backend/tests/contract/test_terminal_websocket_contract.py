@@ -1,5 +1,9 @@
+import time
+
+import anyio
 import pytest
 from fastapi.testclient import TestClient
+from starlette.testclient import WebSocketTestSession
 
 from ic_env_guard.main import create_app
 
@@ -15,6 +19,31 @@ def client(tmp_path):
 @pytest.fixture
 def auth_headers():
     return {"Authorization": "Bearer secret-token"}
+
+
+def receive_until(
+    websocket: WebSocketTestSession, needle: str, timeout_seconds: float = 5
+) -> str:
+    deadline = time.monotonic() + timeout_seconds
+    received = ""
+
+    while needle not in received:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            pytest.fail(f"timed out after {timeout_seconds}s waiting for {needle!r}")
+
+        async def receive_message(receive_timeout: float = remaining):
+            with anyio.fail_after(receive_timeout):
+                return await websocket._send_rx.receive()
+
+        try:
+            message = websocket.portal.call(receive_message)
+        except TimeoutError:
+            pytest.fail(f"timed out after {timeout_seconds}s waiting for {needle!r}")
+        websocket._raise_on_close(message)
+        received += message["text"]
+
+    return received
 
 
 @pytest.mark.contract
@@ -78,27 +107,25 @@ def test_terminal_websocket_ticket_is_one_use(client, auth_headers):
 def test_terminal_websocket_reconnect_replays_retained_output(client, auth_headers):
     terminal = client.post("/api/terminals", headers=auth_headers, json={}).json()
     terminal_id = terminal["id"]
-    ticket = client.post(
-        f"/api/terminals/{terminal_id}/connect-token", headers=auth_headers
-    ).json()["ticket"]
 
-    with client.websocket_connect(
-        f"/ws/terminals/{terminal_id}?ticket={ticket}&cursor=0"
-    ) as ws:
-        ws.send_text("printf '__WS_''RECONNECT_OK__\\n'\r")
-        received = ""
-        for _ in range(20):
-            received += ws.receive_text()
-            if "__WS_RECONNECT_OK__" in received:
-                break
-        assert "__WS_RECONNECT_OK__" in received
+    try:
+        ticket = client.post(
+            f"/api/terminals/{terminal_id}/connect-token", headers=auth_headers
+        ).json()["ticket"]
+        with client.websocket_connect(
+            f"/ws/terminals/{terminal_id}?ticket={ticket}&cursor=0"
+        ) as ws:
+            ws.send_text("printf '__WS_''RECONNECT_OK__\\n'\r")
+            assert "__WS_RECONNECT_OK__" in receive_until(ws, "__WS_RECONNECT_OK__")
 
-    reconnect_ticket = client.post(
-        f"/api/terminals/{terminal_id}/connect-token", headers=auth_headers
-    ).json()["ticket"]
-    with client.websocket_connect(
-        f"/ws/terminals/{terminal_id}?ticket={reconnect_ticket}&cursor=0"
-    ) as ws:
-        assert "__WS_RECONNECT_OK__" in ws.receive_text()
-
-    client.delete(f"/api/terminals/{terminal_id}", headers=auth_headers)
+        reconnect_ticket = client.post(
+            f"/api/terminals/{terminal_id}/connect-token", headers=auth_headers
+        ).json()["ticket"]
+        with client.websocket_connect(
+            f"/ws/terminals/{terminal_id}?ticket={reconnect_ticket}&cursor=0"
+        ) as ws:
+            assert "__WS_RECONNECT_OK__" in receive_until(ws, "__WS_RECONNECT_OK__")
+    finally:
+        closed = client.delete(f"/api/terminals/{terminal_id}", headers=auth_headers)
+        assert closed.status_code == 202
+        assert closed.json()["status"] in {"closed", "exited"}

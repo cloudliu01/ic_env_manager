@@ -15,6 +15,7 @@ def agent_client(tmp_path):
 @pytest.mark.contract
 def test_v1_capabilities_and_terminal_routes_remain_available(agent_client):
     headers = {"Authorization": "Bearer secret-token"}
+    terminal_id = None
     capabilities = agent_client.get("/api/capabilities", headers=headers)
     services = agent_client.get("/api/services", headers=headers)
     created = agent_client.post(
@@ -22,19 +23,23 @@ def test_v1_capabilities_and_terminal_routes_remain_available(agent_client):
         headers=headers,
         json={"title": "Compatibility shell", "rows": 24, "cols": 80},
     )
+    if created.status_code == 201:
+        terminal_id = created.json().get("id")
 
-    assert capabilities.status_code == 200
-    assert capabilities.json()["api_version"] == "1"
-    assert "services.v1" in capabilities.json()["capabilities"]
-    assert "terminals.v1" in capabilities.json()["capabilities"]
-    assert services.status_code == 200
-    assert "services" in services.json()
-    assert created.status_code == 201
-    assert created.json()["title"] == "Compatibility shell"
-
-    terminal_id = created.json()["id"]
-    closed = agent_client.delete(f"/api/terminals/{terminal_id}", headers=headers)
-    assert closed.status_code == 202
+    try:
+        assert capabilities.status_code == 200
+        assert capabilities.json()["api_version"] == "1"
+        assert "services.v1" in capabilities.json()["capabilities"]
+        assert "terminals.v1" in capabilities.json()["capabilities"]
+        assert services.status_code == 200
+        assert "services" in services.json()
+        assert created.status_code == 201
+        assert created.json()["title"] == "Compatibility shell"
+    finally:
+        if terminal_id is not None:
+            closed = agent_client.delete(f"/api/terminals/{terminal_id}", headers=headers)
+            assert closed.status_code == 202
+            assert closed.json()["status"] in {"closed", "exited"}
 
 
 @pytest.mark.contract
