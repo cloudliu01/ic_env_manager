@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from prometheus_client import CollectorRegistry, generate_latest
@@ -105,3 +106,46 @@ def test_status_kind_does_not_export_a_numeric_value(tmp_path):
 
     assert "ic_env_observation_value{" not in text
     assert "ic_env_observation_status{" in text
+
+
+def test_status_samples_are_unique_per_namespace_name_and_status(tmp_path):
+    base = _observation()
+    observations = ObservationReader(
+        [
+            base,
+            replace(
+                base,
+                identity_key="b" * 64,
+                labels={"server": "license02"},
+            ),
+            replace(
+                base,
+                identity_key="c" * 64,
+                labels={"server": "license03"},
+                status="critical",
+            ),
+            replace(
+                base,
+                identity_key="d" * 64,
+                labels={"server": "license04"},
+                status="critical",
+                expires_at=NOW,
+            ),
+        ]
+    )
+    registry = CollectorRegistry()
+    registry.register(ObservabilityCollector(observations, LogReader([]), clock=lambda: NOW))
+
+    families = {metric.name: metric for metric in registry.collect()}
+    status_samples = families["ic_env_observation_status"].samples
+    value_samples = families["ic_env_observation_value"].samples
+
+    assert [(sample.labels, sample.value) for sample in status_samples] == [
+        ({"namespace": "eda", "name": "license_alive", "status": "warning"}, 1.0),
+        ({"namespace": "eda", "name": "license_alive", "status": "critical"}, 1.0),
+    ]
+    assert {sample.labels["server"] for sample in value_samples} == {
+        "license01",
+        "license02",
+        "license03",
+    }

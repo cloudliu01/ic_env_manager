@@ -32,6 +32,7 @@ class ObservabilityCollector:
         now = self._clock().astimezone(UTC)
         value = Metric("ic_env_observation_value", "Fresh observation value", "gauge")
         status = Metric("ic_env_observation_status", "Fresh observation status", "gauge")
+        emitted_statuses: set[tuple[str, str, str]] = set()
         for record in self._observations.list_all():
             if record.is_stale(now):
                 continue
@@ -42,11 +43,14 @@ class ObservabilityCollector:
                     value=float(record.value),
                     labels={**record.labels, **base_labels},
                 )
-            status.add_sample(
-                "ic_env_observation_status",
-                value=1.0,
-                labels={**base_labels, "status": record.status},
-            )
+            status_key = (record.namespace, record.name, record.status)
+            if status_key not in emitted_statuses:
+                status.add_sample(
+                    "ic_env_observation_status",
+                    value=1.0,
+                    labels={**base_labels, "status": record.status},
+                )
+                emitted_statuses.add(status_key)
         yield value
         yield status
 
