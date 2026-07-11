@@ -95,20 +95,23 @@ class EnrollmentSocketServer:
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             listener.bind(str(self.path))
-            os.chmod(self.path, self.mode)
-            metadata = os.lstat(self.path)
+            metadata = self._bound_path_metadata()
             self._identity = (metadata.st_dev, metadata.st_ino)
-            if not stat.S_ISSOCK(metadata.st_mode):
-                raise SocketSecurityError("enrollment socket is not a socket")
+            self._validate_bound_path(metadata)
+            os.chmod(self.path, self.mode)
+            metadata = self._bound_path_metadata()
+            if (metadata.st_dev, metadata.st_ino) != self._identity:
+                raise SocketSecurityError("enrollment socket path changed during startup")
             if stat.S_IMODE(metadata.st_mode) & ~self.mode:
                 raise SocketSecurityError("enrollment socket permissions are too broad")
-            if metadata.st_uid != os.geteuid():
-                raise SocketSecurityError("enrollment socket owner is unsafe")
             listener.listen(8)
             listener.settimeout(0.1)
         except Exception:
             listener.close()
+            if self._identity is None:
+                self._adopt_bound_path_for_cleanup()
             self._remove_if_owned()
+            self._identity = None
             raise
         thread = threading.Thread(target=self._serve, daemon=True)
         with self._state_lock:
@@ -170,6 +173,37 @@ class EnrollmentSocketServer:
             raise SocketSecurityError("enrollment socket directory owner is unsafe")
         if stat.S_IMODE(metadata.st_mode) & 0o022:
             raise SocketSecurityError("enrollment socket directory permissions are unsafe")
+
+    def _bound_path_metadata(self) -> os.stat_result:
+        last_error: OSError | None = None
+        for _ in range(3):
+            try:
+                return os.lstat(self.path)
+            except FileNotFoundError:
+                raise
+            except OSError as exc:
+                last_error = exc
+        try:
+            return os.stat(self.path, follow_symlinks=False)
+        except OSError as exc:
+            if last_error is not None:
+                raise last_error from exc
+            raise
+
+    @staticmethod
+    def _validate_bound_path(metadata: os.stat_result) -> None:
+        if not stat.S_ISSOCK(metadata.st_mode):
+            raise SocketSecurityError("enrollment socket is not a socket")
+        if metadata.st_uid != os.geteuid():
+            raise SocketSecurityError("enrollment socket owner is unsafe")
+
+    def _adopt_bound_path_for_cleanup(self) -> None:
+        try:
+            metadata = self._bound_path_metadata()
+            self._validate_bound_path(metadata)
+        except (OSError, SocketSecurityError):
+            return
+        self._identity = (metadata.st_dev, metadata.st_ino)
 
     def _serve(self) -> None:
         try:
@@ -242,8 +276,8 @@ class EnrollmentSocketServer:
         if self._identity is None:
             return
         try:
-            metadata = os.lstat(self.path)
-        except FileNotFoundError:
+            metadata = self._bound_path_metadata()
+        except OSError:
             return
         if (metadata.st_dev, metadata.st_ino) == self._identity and stat.S_ISSOCK(metadata.st_mode):
             self.path.unlink()

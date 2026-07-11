@@ -196,6 +196,7 @@ def test_thread_start_failure_rolls_back_every_published_resource(
     assert not server.healthy
     assert server._socket is None
     assert server._thread is None
+    assert server._identity is None
     assert not path.exists()
     server.stop()
     server.stop()
@@ -232,4 +233,69 @@ def test_thread_that_exits_before_health_publish_is_rolled_back(
     assert not server.healthy
     assert server._socket is None
     assert server._thread is None
+    assert not path.exists()
+
+
+@pytest.mark.security
+def test_post_bind_chmod_failure_removes_only_owned_socket_and_allows_retry(
+    tmp_path, socket_dir, monkeypatch
+):
+    container = build_agent_container(None, tmp_path / "state.db", tmp_path / "instance-id")
+    path = socket_dir / "enroll.sock"
+    server = EnrollmentSocketServer(
+        path, 0o600, container.instance_id, container.enrollment_service
+    )
+    real_chmod = os.chmod
+    failed = False
+
+    def fail_first_chmod(target, mode):
+        nonlocal failed
+        if Path(target) == path and not failed:
+            failed = True
+            raise PermissionError("chmod failed after bind")
+        return real_chmod(target, mode)
+
+    monkeypatch.setattr(os, "chmod", fail_first_chmod)
+
+    with pytest.raises(PermissionError, match="chmod failed after bind"):
+        server.start()
+
+    assert not path.exists()
+    assert not server.healthy
+    assert server._socket is None
+    assert server._thread is None
+    assert server._identity is None
+
+    server.start()
+    assert server.healthy
+    server.stop()
+
+
+@pytest.mark.security
+def test_first_post_bind_lstat_failure_is_retried_before_mutation(
+    tmp_path, socket_dir, monkeypatch
+):
+    container = build_agent_container(None, tmp_path / "state.db", tmp_path / "instance-id")
+    path = socket_dir / "enroll.sock"
+    server = EnrollmentSocketServer(
+        path, 0o600, container.instance_id, container.enrollment_service
+    )
+    real_lstat = os.lstat
+    failed = False
+
+    def fail_first_lstat(target, *args, **kwargs):
+        nonlocal failed
+        if Path(target) == path and not failed:
+            failed = True
+            raise OSError("transient lstat failure")
+        return real_lstat(target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", fail_first_lstat)
+
+    server.start()
+    try:
+        assert server.healthy
+        assert path.exists()
+    finally:
+        server.stop()
     assert not path.exists()
