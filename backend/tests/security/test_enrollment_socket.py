@@ -203,9 +203,7 @@ def test_thread_start_failure_rolls_back_every_published_resource(
 
 
 @pytest.mark.security
-def test_thread_that_exits_before_health_publish_is_rolled_back(
-    tmp_path, socket_dir, monkeypatch
-):
+def test_thread_that_exits_before_health_publish_is_rolled_back(tmp_path, socket_dir, monkeypatch):
     container = build_agent_container(None, tmp_path / "state.db", tmp_path / "instance-id")
     path = socket_dir / "enroll.sock"
 
@@ -378,4 +376,123 @@ def test_atomic_publish_never_overwrites_or_removes_racing_final_path(
     assert path.read_text(encoding="utf-8") == "replacement"
     assert server._socket is None
     assert server._thread is None
+    assert server._identity is None
+
+
+@pytest.mark.security
+@pytest.mark.skipif(sys.platform != "darwin", reason="tests the macOS sun_path limit")
+def test_temporary_name_never_breaks_a_legal_near_limit_final_path(tmp_path, socket_dir):
+    container = build_agent_container(None, tmp_path / "state.db", tmp_path / "instance-id")
+    maximum_path_bytes = 103
+    child_length = maximum_path_bytes - len(os.fsencode(socket_dir)) - 3
+    parent = socket_dir / ("p" * child_length)
+    parent.mkdir(mode=0o700)
+    path = parent / "s"
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.bind(str(path))
+    path.unlink()
+
+    server = EnrollmentSocketServer(
+        path, 0o600, container.instance_id, container.enrollment_service
+    )
+    server.start()
+    try:
+        assert server.healthy
+        assert parse_response(_exchange(path, _request())).token
+    finally:
+        server.stop()
+    assert not path.exists()
+
+
+@pytest.mark.security
+def test_post_publish_metadata_outage_retains_ownership_until_retry_cleanup(
+    tmp_path, socket_dir, monkeypatch
+):
+    container = build_agent_container(None, tmp_path / "state.db", tmp_path / "instance-id")
+    path = socket_dir / "enroll.sock"
+    server = EnrollmentSocketServer(
+        path, 0o600, container.instance_id, container.enrollment_service
+    )
+    real_link = os.link
+    real_lstat = os.lstat
+    real_stat = os.stat
+    metadata_unavailable = False
+    failed_first_publication = False
+
+    def publish_then_fail_metadata(source, destination, *args, **kwargs):
+        nonlocal metadata_unavailable, failed_first_publication
+        result = real_link(source, destination, *args, **kwargs)
+        if not failed_first_publication:
+            failed_first_publication = True
+            metadata_unavailable = True
+        return result
+
+    def failing_lstat(target, *args, **kwargs):
+        if metadata_unavailable and Path(target).parent == socket_dir:
+            raise OSError("metadata unavailable after publication")
+        return real_lstat(target, *args, **kwargs)
+
+    def failing_stat(target, *args, **kwargs):
+        if metadata_unavailable and Path(target).parent == socket_dir:
+            raise OSError("metadata unavailable after publication")
+        return real_stat(target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", publish_then_fail_metadata)
+    monkeypatch.setattr(os, "lstat", failing_lstat)
+    monkeypatch.setattr(os, "stat", failing_stat)
+
+    server.start()
+    assert server.healthy
+    server.stop()
+
+    assert not server.healthy
+    assert path.name in os.listdir(socket_dir)
+    assert server._identity is not None
+
+    metadata_unavailable = False
+    server.start()
+    try:
+        assert server.healthy
+        assert parse_response(_exchange(path, _request("01J2W4ABCDEFGHJKMNPQRSTVW0"))).token
+    finally:
+        server.stop()
+    assert not path.exists()
+
+
+@pytest.mark.security
+def test_pending_cleanup_abandons_replaced_final_without_deleting_it(
+    tmp_path, socket_dir, monkeypatch
+):
+    container = build_agent_container(None, tmp_path / "state.db", tmp_path / "instance-id")
+    path = socket_dir / "enroll.sock"
+    server = EnrollmentSocketServer(
+        path, 0o600, container.instance_id, container.enrollment_service
+    )
+    server.start()
+    path.unlink()
+    path.write_text("replacement", encoding="utf-8")
+    real_lstat = os.lstat
+    real_stat = os.stat
+    metadata_unavailable = True
+
+    def failing_lstat(target, *args, **kwargs):
+        if metadata_unavailable and Path(target) == path:
+            raise OSError("metadata unavailable during stop")
+        return real_lstat(target, *args, **kwargs)
+
+    def failing_stat(target, *args, **kwargs):
+        if metadata_unavailable and Path(target) == path:
+            raise OSError("metadata unavailable during stop")
+        return real_stat(target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", failing_lstat)
+    monkeypatch.setattr(os, "stat", failing_stat)
+
+    server.stop()
+    assert server._identity is not None
+    metadata_unavailable = False
+    server.stop()
+
+    assert path.read_text(encoding="utf-8") == "replacement"
     assert server._identity is None

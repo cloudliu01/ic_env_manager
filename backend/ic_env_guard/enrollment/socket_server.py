@@ -1,4 +1,5 @@
 import ctypes
+import errno
 import json
 import os
 import secrets
@@ -27,6 +28,8 @@ class SocketSecurityError(RuntimeError):
 
 
 PeerCredentials = Callable[[socket.socket], tuple[int, int]]
+_TEMPORARY_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+_TEMPORARY_ATTEMPTS = 16
 
 
 def peer_credentials(connection: socket.socket) -> tuple[int, int]:
@@ -74,6 +77,7 @@ class EnrollmentSocketServer:
         self._thread_started = False
         self._identity: tuple[int, int] | None = None
         self._temporary_path: Path | None = None
+        self._owned_paths: dict[Path, tuple[int, int]] = {}
         self._healthy = False
         self._state_lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -92,15 +96,17 @@ class EnrollmentSocketServer:
         if self._socket is not None:
             raise SocketSecurityError("enrollment socket is already running")
         self._validate_parent()
+        self._cleanup_owned_paths()
+        if self._owned_paths:
+            raise SocketSecurityError("previous enrollment socket cleanup is pending")
         if self.path.exists() or self.path.is_symlink():
             raise SocketSecurityError("enrollment socket path already exists")
-        temporary_path = self.path.parent / f".e-{secrets.token_hex(8)}"
+        listener, temporary_path = self._bind_temporary_socket()
         self._temporary_path = temporary_path
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            listener.bind(str(temporary_path))
             metadata = self._bound_path_metadata(temporary_path)
             self._identity = (metadata.st_dev, metadata.st_ino)
+            self._owned_paths[temporary_path] = self._identity
             self._validate_bound_path(metadata)
             os.chmod(temporary_path, self.mode)
             metadata = self._bound_path_metadata(temporary_path)
@@ -111,13 +117,14 @@ class EnrollmentSocketServer:
             listener.listen(8)
             listener.settimeout(0.1)
             os.link(temporary_path, self.path, follow_symlinks=False)
+            self._owned_paths[self.path] = self._identity
             if self._remove_path_if_owned(temporary_path):
                 self._temporary_path = None
         except Exception:
             listener.close()
             self._remove_if_owned()
             self._remove_temporary_if_owned()
-            self._identity = None
+            self._sync_identity()
             raise
         thread = threading.Thread(target=self._serve, daemon=True)
         with self._state_lock:
@@ -156,7 +163,7 @@ class EnrollmentSocketServer:
             thread.join(timeout=2)
         self._remove_if_owned()
         self._remove_temporary_if_owned()
-        self._identity = None
+        self._sync_identity()
 
     def _rollback_start(self, listener: socket.socket) -> None:
         with self._state_lock:
@@ -168,7 +175,33 @@ class EnrollmentSocketServer:
         listener.close()
         self._remove_if_owned()
         self._remove_temporary_if_owned()
-        self._identity = None
+        self._sync_identity()
+
+    def _bind_temporary_socket(self) -> tuple[socket.socket, Path]:
+        basename_bytes = len(os.fsencode(self.path.name))
+        if basename_bytes < 1:
+            raise SocketSecurityError("enrollment socket filename is invalid")
+        length = min(basename_bytes, 16)
+        alphabet = _TEMPORARY_ALPHABET
+        if length == 1:
+            alphabet = alphabet.replace(self.path.name, "")
+        last_error: OSError | None = None
+        for _ in range(_TEMPORARY_ATTEMPTS):
+            name = "".join(secrets.choice(alphabet) for _ in range(length))
+            temporary_path = self.path.parent / name
+            if temporary_path == self.path:
+                continue
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                listener.bind(str(temporary_path))
+            except OSError as exc:
+                listener.close()
+                if exc.errno in {errno.EADDRINUSE, errno.EEXIST}:
+                    last_error = exc
+                    continue
+                raise
+            return listener, temporary_path
+        raise SocketSecurityError("cannot allocate temporary enrollment socket") from last_error
 
     def _validate_parent(self) -> None:
         try:
@@ -276,21 +309,34 @@ class EnrollmentSocketServer:
         self._remove_path_if_owned(self.path)
 
     def _remove_temporary_if_owned(self) -> None:
-        if self._temporary_path is not None and self._remove_path_if_owned(
-            self._temporary_path
-        ):
+        if self._temporary_path is not None and self._remove_path_if_owned(self._temporary_path):
             self._temporary_path = None
 
     def _remove_path_if_owned(self, path: Path) -> bool:
-        if self._identity is None:
+        identity = self._owned_paths.get(path)
+        if identity is None:
             return False
         try:
             metadata = self._bound_path_metadata(path)
         except FileNotFoundError:
+            self._owned_paths.pop(path, None)
             return True
         except OSError:
             return False
-        if (metadata.st_dev, metadata.st_ino) == self._identity and stat.S_ISSOCK(metadata.st_mode):
-            path.unlink()
+        if (metadata.st_dev, metadata.st_ino) != identity or not stat.S_ISSOCK(metadata.st_mode):
+            self._owned_paths.pop(path, None)
             return True
-        return False
+        try:
+            path.unlink()
+        except OSError:
+            return False
+        self._owned_paths.pop(path, None)
+        return True
+
+    def _cleanup_owned_paths(self) -> None:
+        for path in tuple(self._owned_paths):
+            self._remove_path_if_owned(path)
+        self._sync_identity()
+
+    def _sync_identity(self) -> None:
+        self._identity = next(iter(self._owned_paths.values()), None)
