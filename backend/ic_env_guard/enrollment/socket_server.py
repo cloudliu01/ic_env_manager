@@ -70,12 +70,21 @@ class EnrollmentSocketServer:
         self._peer_credentials = peer_credentials
         self._socket: socket.socket | None = None
         self._thread: threading.Thread | None = None
+        self._thread_started = False
         self._identity: tuple[int, int] | None = None
         self._healthy = False
+        self._state_lock = threading.Lock()
+        self._stop_event = threading.Event()
 
     @property
     def healthy(self) -> bool:
-        return self._healthy
+        with self._state_lock:
+            return (
+                self._healthy
+                and self._thread_started
+                and self._thread is not None
+                and self._thread.is_alive()
+            )
 
     def start(self) -> None:
         if self._socket is not None:
@@ -101,19 +110,52 @@ class EnrollmentSocketServer:
             listener.close()
             self._remove_if_owned()
             raise
-        self._socket = listener
-        self._healthy = True
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-        self._thread.start()
+        thread = threading.Thread(target=self._serve, daemon=True)
+        with self._state_lock:
+            self._stop_event.clear()
+            self._socket = listener
+            self._thread = thread
+            self._thread_started = False
+            self._healthy = False
+        try:
+            thread.start()
+        except Exception:
+            self._rollback_start(listener)
+            raise
+        with self._state_lock:
+            if not thread.is_alive():
+                startup_failed = True
+            else:
+                self._thread_started = True
+                self._healthy = True
+                startup_failed = False
+        if startup_failed:
+            thread.join(timeout=2)
+            self._rollback_start(listener)
+            raise SocketSecurityError("enrollment socket thread failed to start")
 
     def stop(self) -> None:
-        self._healthy = False
-        listener, self._socket = self._socket, None
+        with self._state_lock:
+            self._healthy = False
+            self._stop_event.set()
+            listener, self._socket = self._socket, None
+            thread, self._thread = self._thread, None
+            thread_started, self._thread_started = self._thread_started, False
         if listener is not None:
             listener.close()
-        if self._thread is not None:
-            self._thread.join(timeout=2)
+        if thread is not None and thread_started:
+            thread.join(timeout=2)
+        self._remove_if_owned()
+        self._identity = None
+
+    def _rollback_start(self, listener: socket.socket) -> None:
+        with self._state_lock:
+            self._healthy = False
+            self._stop_event.set()
+            self._socket = None
             self._thread = None
+            self._thread_started = False
+        listener.close()
         self._remove_if_owned()
         self._identity = None
 
@@ -131,7 +173,7 @@ class EnrollmentSocketServer:
 
     def _serve(self) -> None:
         try:
-            while self._healthy:
+            while not self._stop_event.is_set():
                 listener = self._socket
                 if listener is None:
                     return
@@ -145,7 +187,8 @@ class EnrollmentSocketServer:
                     connection.settimeout(2.0)
                     self._handle(connection)
         finally:
-            self._healthy = False
+            with self._state_lock:
+                self._healthy = False
 
     def _handle(self, connection: socket.socket) -> None:
         try:

@@ -4,6 +4,7 @@ import stat
 import struct
 import sys
 import tempfile
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from shutil import rmtree
@@ -164,3 +165,71 @@ def test_linux_peer_credentials_never_degrade_when_kernel_support_is_missing(mon
     monkeypatch.delattr(socket, "SO_PEERCRED")
     with pytest.raises(SocketSecurityError, match="unavailable"):
         peer_credentials(Connection())  # type: ignore[arg-type]
+
+
+@pytest.mark.security
+def test_thread_start_failure_rolls_back_every_published_resource(
+    tmp_path, socket_dir, monkeypatch
+):
+    container = build_agent_container(None, tmp_path / "state.db", tmp_path / "instance-id")
+    path = socket_dir / "enroll.sock"
+
+    class FailingThread:
+        def __init__(self, **_kwargs):
+            self.joined = False
+
+        def start(self):
+            raise RuntimeError("thread start failed")
+
+        def join(self, **_kwargs):
+            self.joined = True
+            raise AssertionError("an unstarted thread must not be joined")
+
+    monkeypatch.setattr(threading, "Thread", FailingThread)
+    server = EnrollmentSocketServer(
+        path, 0o600, container.instance_id, container.enrollment_service
+    )
+
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        server.start()
+
+    assert not server.healthy
+    assert server._socket is None
+    assert server._thread is None
+    assert not path.exists()
+    server.stop()
+    server.stop()
+
+
+@pytest.mark.security
+def test_thread_that_exits_before_health_publish_is_rolled_back(
+    tmp_path, socket_dir, monkeypatch
+):
+    container = build_agent_container(None, tmp_path / "state.db", tmp_path / "instance-id")
+    path = socket_dir / "enroll.sock"
+
+    class ExitedThread:
+        def __init__(self, **_kwargs):
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+        def is_alive(self):
+            return False
+
+        def join(self, **_kwargs):
+            assert self.started
+
+    monkeypatch.setattr(threading, "Thread", ExitedThread)
+    server = EnrollmentSocketServer(
+        path, 0o600, container.instance_id, container.enrollment_service
+    )
+
+    with pytest.raises(SocketSecurityError, match="thread failed to start"):
+        server.start()
+
+    assert not server.healthy
+    assert server._socket is None
+    assert server._thread is None
+    assert not path.exists()

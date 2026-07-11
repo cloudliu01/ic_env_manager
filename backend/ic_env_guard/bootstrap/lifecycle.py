@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
@@ -25,6 +25,18 @@ async def _agent_availability_probe_loop(
         await availability.probe_all()
 
 
+async def _cancel_tasks(*tasks: asyncio.Task[None] | None) -> None:
+    active = tuple(task for task in tasks if task is not None)
+    for task in active:
+        task.cancel()
+    results = await asyncio.gather(*active, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException) and not isinstance(
+            result, asyncio.CancelledError
+        ):
+            raise result
+
+
 def create_lifespan(container: AgentContainer | ManagerContainer):
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -33,75 +45,76 @@ def create_lifespan(container: AgentContainer | ManagerContainer):
         observation_cleanup_task: asyncio.Task[None] | None = None
         log_cleanup_task: asyncio.Task[None] | None = None
         enrollment_socket_server = None
-        metrics_config = container.metrics_config
-        if metrics_config.enabled:
-            refresh_task = asyncio.create_task(
-                _metrics_refresh_loop(
-                    container.metrics_collector,
-                    metrics_config.collect_interval_seconds,
-                )
-            )
-            app.state.metrics_refresh_task = refresh_task
-        if isinstance(container, ManagerContainer):
-            availability_probe_task = asyncio.create_task(
-                _agent_availability_probe_loop(
-                    container.agent_availability,
-                    container.config.control_plane.poll_interval_seconds,
-                )
-            )
-            app.state.agent_availability_probe_task = availability_probe_task
-        else:
-            enrollment_socket_server = container.enrollment_socket_server
-            observation_config = container.config.observations if container.config else None
-            interval = observation_config.cleanup_interval_seconds if observation_config else 60
-            retention = (
-                observation_config.expired_retention_seconds
-                if observation_config
-                else 86400
-            )
-            failures = container.metrics_registry._names_to_collectors[
-                "ic_env_guard_cleanup_failures"
-            ]
-            observation_cleanup_task = asyncio.create_task(
-                observation_expiration_loop(
-                    container.observation_service,
-                    interval_seconds=interval,
-                    retention_seconds=retention,
-                    on_error=lambda: failures.labels(resource="observations").inc(),
-                )
-            )
-            log_cleanup_task = asyncio.create_task(
-                log_expiration_loop(
-                    container.log_source_service,
-                    interval_seconds=interval,
-                    retention_seconds=retention,
-                    on_error=lambda: failures.labels(resource="logs").inc(),
-                )
-            )
-            app.state.observation_cleanup_task = observation_cleanup_task
-            app.state.log_cleanup_task = log_cleanup_task
-        if enrollment_socket_server is not None:
-            enrollment_socket_server.start()
         try:
+            metrics_config = container.metrics_config
+            if metrics_config.enabled:
+                refresh_task = asyncio.create_task(
+                    _metrics_refresh_loop(
+                        container.metrics_collector,
+                        metrics_config.collect_interval_seconds,
+                    )
+                )
+                app.state.metrics_refresh_task = refresh_task
+            if isinstance(container, ManagerContainer):
+                availability_probe_task = asyncio.create_task(
+                    _agent_availability_probe_loop(
+                        container.agent_availability,
+                        container.config.control_plane.poll_interval_seconds,
+                    )
+                )
+                app.state.agent_availability_probe_task = availability_probe_task
+            else:
+                enrollment_socket_server = container.enrollment_socket_server
+                observation_config = container.config.observations if container.config else None
+                interval = (
+                    observation_config.cleanup_interval_seconds if observation_config else 60
+                )
+                retention = (
+                    observation_config.expired_retention_seconds
+                    if observation_config
+                    else 86400
+                )
+                failures = container.metrics_registry._names_to_collectors[
+                    "ic_env_guard_cleanup_failures"
+                ]
+                observation_cleanup_task = asyncio.create_task(
+                    observation_expiration_loop(
+                        container.observation_service,
+                        interval_seconds=interval,
+                        retention_seconds=retention,
+                        on_error=lambda: failures.labels(resource="observations").inc(),
+                    )
+                )
+                log_cleanup_task = asyncio.create_task(
+                    log_expiration_loop(
+                        container.log_source_service,
+                        interval_seconds=interval,
+                        retention_seconds=retention,
+                        on_error=lambda: failures.labels(resource="logs").inc(),
+                    )
+                )
+                app.state.observation_cleanup_task = observation_cleanup_task
+                app.state.log_cleanup_task = log_cleanup_task
+            if enrollment_socket_server is not None:
+                enrollment_socket_server.start()
             yield
         finally:
-            if enrollment_socket_server is not None:
-                enrollment_socket_server.stop()
-            if refresh_task is not None:
-                refresh_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await refresh_task
-            if availability_probe_task is not None:
-                availability_probe_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await availability_probe_task
-            for cleanup_task in (observation_cleanup_task, log_cleanup_task):
-                if cleanup_task is not None:
-                    cleanup_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await cleanup_task
-            container.database_engine.dispose()
-            if isinstance(container, ManagerContainer):
-                await container.agent_client.aclose()
+            try:
+                if enrollment_socket_server is not None:
+                    enrollment_socket_server.stop()
+            finally:
+                try:
+                    await _cancel_tasks(
+                        refresh_task,
+                        availability_probe_task,
+                        observation_cleanup_task,
+                        log_cleanup_task,
+                    )
+                finally:
+                    try:
+                        container.database_engine.dispose()
+                    finally:
+                        if isinstance(container, ManagerContainer):
+                            await container.agent_client.aclose()
 
     return lifespan
