@@ -306,7 +306,7 @@ git commit -m "feat: add agent v2 runtime identity"
 - Modify: `backend/tests/contract/test_migration_contract.py`
 - Modify: `backend/tests/integration/test_migrations.py`
 
-**Interfaces:** `ObservationInput`, `Observation`, `ObservationRepository` Protocol, `ObservationService.upsert/get/list/delete_expired`; stable SHA-256 `identity_key` over namespace, name, and compact sorted labels JSON.
+**Interfaces:** `ObservationInput`, `Observation`, `ObservationRepository` Protocol, `ObservationService.upsert/get/list/delete_expired`; repository writes use atomic `compare_and_swap(record, expected_observed_at)`; stable SHA-256 `identity_key` over namespace, name, and compact sorted labels JSON.
 
 - [ ] **Step 1: Write validation and identity tests**
 
@@ -339,6 +339,8 @@ with pytest.raises(ObservationConflict, match="stale_observation"):
     service.upsert(input_at("2026-07-11T09:59:59Z"), now=NOW)
 ```
 
+Add a fake Repository case that forces one CAS miss, changes the current record, and proves the Service re-reads and re-applies ordering/conflict rules rather than allowing the stale candidate to overwrite it.
+
 - [ ] **Step 3: Run the unit/migration tests and verify failure**
 
 Run: `cd backend && pytest -q tests/unit/test_observation_model.py tests/unit/test_observation_service.py tests/contract/test_migration_contract.py tests/integration/test_migrations.py`
@@ -350,7 +352,11 @@ Expected: FAIL because the domain and migration do not exist.
 ```python
 class ObservationRepository(Protocol):
     def get(self, identity_key: str) -> Observation | None: ...
-    def upsert(self, record: Observation) -> Observation: ...
+    def compare_and_swap(
+        self,
+        record: Observation,
+        expected_observed_at: datetime | None,
+    ) -> bool: ...
     def list(self, query: ObservationQuery) -> ObservationPage: ...
     def delete_expired(self, cutoff: datetime, limit: int) -> int: ...
 
@@ -361,11 +367,11 @@ class UpsertResult:
     created: bool
 ```
 
-Pydantic may validate the transport input, but the service owns ordering/idempotency/TTL rules. Compare normalized complete content for same-timestamp retries.
+Pydantic may validate the transport input, but the Service owns ordering/idempotency/TTL rules. Compare normalized complete content for same-timestamp retries. A CAS miss must trigger a bounded re-read/re-evaluation loop; exhausting the bound returns a stable storage-contention error. For inserts, `expected_observed_at=None` means insert only if the identity is still absent. For updates, the SQLite predicate matches the previously read `observed_at`, which is sufficient because different content at the same timestamp is already a domain conflict.
 
 - [ ] **Step 5: Add SQLite migration and adapter**
 
-Create exactly the spec's `observations` columns and indexes. The adapter serializes labels with `json.dumps(labels, sort_keys=True, separators=(",", ":"))`, serializes details compactly, forces `producer_id="local"`, uses one short transaction, and translates integrity/storage errors into domain storage errors.
+Create exactly the spec's `observations` columns and indexes. The adapter serializes labels with `json.dumps(labels, sort_keys=True, separators=(",", ":"))`, serializes details compactly, forces `producer_id="local"`, uses one short transaction, and translates integrity/storage errors into domain storage errors. Implement create CAS with `INSERT ... ON CONFLICT DO NOTHING`; implement update CAS with `UPDATE ... WHERE identity_key = ? AND observed_at = ?`. Return whether exactly one row changed and never duplicate ordering rules in SQL.
 
 ```python
 connection.execute(
