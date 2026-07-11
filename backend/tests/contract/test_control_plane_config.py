@@ -3,7 +3,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from ic_env_guard.config.models import AppConfig, AuthConfig, ControlPlaneConfig
+from ic_env_guard.config.models import (
+    AppConfig,
+    AuthConfig,
+    ControlPlaneConfig,
+    ServerConfig,
+    TrustedLanHttpServerConfig,
+)
 from ic_env_guard.main import create_app
 
 
@@ -40,3 +46,42 @@ def test_control_plane_mode_does_not_create_agent_state_database(tmp_path):
     create_app(config=config, state_database=state_database)
 
     assert not state_database.exists()
+
+
+@pytest.mark.contract
+def test_trusted_lan_http_requires_private_clients_and_explicit_remote_bind(tmp_path):
+    token_file = _token_file(tmp_path)
+
+    with pytest.raises(ValidationError, match="private client CIDRs"):
+        AppConfig(
+            auth=AuthConfig(token_file=token_file),
+            server=ServerConfig(
+                bind="10.20.30.10",
+                remote_bind_enabled=True,
+                trusted_lan_http=TrustedLanHttpServerConfig(enabled=True),
+            ),
+        )
+
+    with pytest.raises(ValidationError, match="private client CIDRs"):
+        AppConfig(
+            auth=AuthConfig(token_file=token_file),
+            server=ServerConfig(
+                bind="10.20.30.10",
+                remote_bind_enabled=True,
+                trusted_lan_http=TrustedLanHttpServerConfig(
+                    enabled=True,
+                    client_cidrs=["8.8.8.0/24"],
+                ),
+            ),
+        )
+
+    with pytest.raises(ValidationError, match="explicit remote bind"):
+        AppConfig(
+            auth=AuthConfig(token_file=token_file),
+            server=ServerConfig(
+                trusted_lan_http=TrustedLanHttpServerConfig(
+                    enabled=True,
+                    client_cidrs=["10.20.30.0/24"],
+                ),
+            ),
+        )

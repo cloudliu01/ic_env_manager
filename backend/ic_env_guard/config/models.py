@@ -4,19 +4,43 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, IPvAnyNetwork, field_validator, model_validator
 
 from ic_env_guard.auth.token import validate_token_file_permissions
+
+
+class TrustedLanHttpServerConfig(BaseModel):
+    enabled: bool = False
+    client_cidrs: list[IPvAnyNetwork] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_private_clients(self) -> "TrustedLanHttpServerConfig":
+        if self.enabled and (
+            not self.client_cidrs or any(not network.is_private for network in self.client_cidrs)
+        ):
+            raise ValueError("trusted LAN HTTP requires non-empty private client CIDRs")
+        return self
 
 
 class ServerConfig(BaseModel):
     bind: str = "127.0.0.1"
     port: int = Field(default=8765, ge=1, le=65535)
     remote_bind_enabled: bool = False
+    trusted_lan_http: TrustedLanHttpServerConfig = Field(
+        default_factory=TrustedLanHttpServerConfig
+    )
 
     @property
     def is_local_only(self) -> bool:
         return self.bind in {"127.0.0.1", "localhost", "::1"}
+
+    @model_validator(mode="after")
+    def validate_trusted_lan_bind(self) -> "ServerConfig":
+        if self.trusted_lan_http.enabled and (
+            self.is_local_only or not self.remote_bind_enabled
+        ):
+            raise ValueError("trusted LAN HTTP requires an explicit remote bind")
+        return self
 
 
 class AuthConfig(BaseModel):
@@ -45,6 +69,46 @@ class TerminalConfig(BaseModel):
     idle_timeout_minutes: int = Field(default=60, ge=30, le=120)
     replay_buffer_bytes: int = Field(default=2 * 1024 * 1024, ge=1024 * 1024, le=10 * 1024 * 1024)
     exited_retention_minutes: int = Field(default=30, ge=1, le=120)
+
+
+class IngestConfig(BaseModel):
+    bind: Literal["127.0.0.1", "::1"] = "127.0.0.1"
+    port: int = Field(default=8766, ge=1, le=65535)
+    max_request_bytes: int = Field(default=32768, ge=1024, le=1024 * 1024)
+    max_concurrent_requests: int = Field(default=16, ge=1, le=128)
+
+    @field_validator("bind", mode="before")
+    @classmethod
+    def validate_loopback_bind(cls, value: str) -> str:
+        if value not in {"127.0.0.1", "::1"}:
+            raise ValueError("ingest bind must be loopback")
+        return value
+
+
+class ObservationConfig(BaseModel):
+    expired_retention_seconds: int = Field(default=86400, ge=0, le=604800)
+    cleanup_interval_seconds: int = Field(default=60, ge=1, le=3600)
+
+
+class LogsConfig(BaseModel):
+    allowed_roots: list[Path] = Field(default_factory=list)
+    max_tail_lines: int = Field(default=1000, ge=1, le=1000)
+    default_tail_lines: int = Field(default=100, ge=1, le=1000)
+    max_tail_bytes: int = Field(default=983040, ge=1024, le=983040)
+
+    @field_validator("allowed_roots")
+    @classmethod
+    def validate_allowed_roots(cls, values: list[Path]) -> list[Path]:
+        if any(not value.is_absolute() for value in values):
+            raise ValueError("log allowed roots must be absolute paths")
+        return list(dict.fromkeys(value.resolve() for value in values))
+
+
+class EnrollmentConfig(BaseModel):
+    socket_path: Path = Path("/run/ic-env-guard/agent-enrollment.sock")
+    socket_mode: Literal["0600", "0660"] = "0600"
+    pending_ttl_seconds: int = Field(default=600, ge=60, le=900)
+    max_pending: int = Field(default=16, ge=1, le=128)
 
 
 class HealthCheckConfig(BaseModel):
@@ -216,10 +280,16 @@ class AppConfig(BaseModel):
     agents: list[AgentConfig] = Field(default_factory=list)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     terminal: TerminalConfig = Field(default_factory=TerminalConfig)
+    enrollment: EnrollmentConfig = Field(default_factory=EnrollmentConfig)
+    ingest: IngestConfig = Field(default_factory=IngestConfig)
+    observations: ObservationConfig = Field(default_factory=ObservationConfig)
+    logs: LogsConfig = Field(default_factory=LogsConfig)
     services: list[ServiceConfig] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_security(self) -> "AppConfig":
+        if self.mode == "agent" and self.server.port == self.ingest.port:
+            raise ValueError("public and ingest ports must differ")
         if not self.server.is_local_only:
             if not self.server.remote_bind_enabled:
                 raise ValueError("remote bind requires remote_bind_enabled=true")

@@ -1,6 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
+from ic_env_guard.bootstrap.composition import AgentContainer
 from ic_env_guard.config.loader import ConfigLoadError, load_config
 from ic_env_guard.main import create_app
 
@@ -11,9 +12,11 @@ def test_agent_starts_with_valid_token_file(tmp_path):
     token_file.write_text("secret-token\n", encoding="utf-8")
     token_file.chmod(0o600)
 
-    client = TestClient(create_app(token_file=token_file))
+    app = create_app(token_file=token_file)
+    client = TestClient(app)
 
     assert client.get("/readyz").status_code == 200
+    assert isinstance(app.state.container, AgentContainer)
 
 
 @pytest.mark.integration

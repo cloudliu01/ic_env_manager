@@ -1,7 +1,5 @@
-import asyncio
 import os
-from collections.abc import AsyncIterator, Iterator
-from contextlib import asynccontextmanager, suppress
+from collections.abc import Iterator
 from pathlib import Path
 from uuid import uuid4
 
@@ -57,17 +55,18 @@ from ic_env_guard.api.terminals import (
     router as terminals_router,
 )
 from ic_env_guard.auth.dependencies import AuthState, get_auth_state
+from ic_env_guard.bootstrap.composition import (
+    AgentContainer,
+    ManagerContainer,
+    build_agent_container,
+    build_manager_container,
+)
+from ic_env_guard.bootstrap.lifecycle import create_lifespan
 from ic_env_guard.config.loader import load_config
-from ic_env_guard.config.models import AppConfig, MetricsConfig, ServiceConfig
+from ic_env_guard.config.models import AppConfig
 from ic_env_guard.db.audit import AuditRepository
 from ic_env_guard.db.audit_queries import AuditQueryRepository
 from ic_env_guard.db.control_plane_audit import ControlPlaneAuditRepository
-from ic_env_guard.db.control_plane_migrations import run_control_plane_migrations
-from ic_env_guard.db.migrations import run_migrations
-from ic_env_guard.db.services import ServiceRuntime
-from ic_env_guard.db.session import create_session_factory, create_sqlite_engine
-from ic_env_guard.metrics.collector import MetricsCollector
-from ic_env_guard.metrics.registry import create_registry
 from ic_env_guard.monitoring.machines import MachineRegistry
 from ic_env_guard.services.manager import ServiceManager
 from ic_env_guard.terminal.manager import TerminalManager
@@ -96,37 +95,6 @@ def _resolve_state_db(state_database: Path | None, config: AppConfig | None) -> 
     return DEFAULT_STATE_DB
 
 
-def _service_runtime(service: ServiceConfig) -> ServiceRuntime:
-    return ServiceRuntime(
-        id=service.id,
-        name=service.name,
-        command=service.command,
-        systemd_unit=service.systemd_unit,
-        allowed_operations=list(service.allowed_operations),
-        description=service.description,
-        cwd=service.cwd,
-        env=dict(service.env),
-        autostart=service.autostart,
-        restart_policy=service.restart,
-        start_timeout_seconds=service.start_timeout_seconds,
-        stop_timeout_seconds=service.stop_timeout_seconds,
-    )
-
-
-async def _metrics_refresh_loop(collector: MetricsCollector, interval_seconds: int) -> None:
-    while True:
-        await asyncio.sleep(interval_seconds)
-        collector.refresh()
-
-
-async def _agent_availability_probe_loop(
-    availability: AgentAvailabilityService, interval_seconds: int
-) -> None:
-    while True:
-        await asyncio.sleep(interval_seconds)
-        await availability.probe_all()
-
-
 def create_app(
     token_file: Path | None = None,
     token: str | None = None,
@@ -136,94 +104,47 @@ def create_app(
 ) -> FastAPI:
     app_config = _resolve_config(config_path, config)
     mode = app_config.mode if app_config else "agent"
-    metrics_config = app_config.metrics if app_config else MetricsConfig()
     auth_token_file = token_file or (app_config.auth.token_file if app_config else None)
 
     auth_state = AuthState(token_file=auth_token_file, token=token)
-    terminal_manager = TerminalManager()
-    service_manager = ServiceManager(
-        [_service_runtime(service) for service in app_config.services] if app_config else []
-    )
-    machine_registry = MachineRegistry()
-    agent_registry = AgentRegistry(app_config.agents if app_config else [])
-    audit_storage_health = AuditStorageHealth()
-    agent_client = AgentHttpClient() if mode == "control-plane" else None
-    agent_availability = (
-        AgentAvailabilityService(
-            agent_registry,
-            agent_client,
-            stale_after_seconds=app_config.control_plane.status_stale_after_seconds,
-            max_parallel_probes=app_config.control_plane.max_parallel_probes,
-        )
-        if app_config is not None and agent_client is not None
-        else None
-    )
-    ticket_manager = TerminalTicketManager()
-    gateway_ticket_store = (
-        GatewayTicketStore(app_config.control_plane.max_outstanding_tickets)
-        if app_config is not None and mode == "control-plane"
-        else None
-    )
-    gateway_proxy_limiter = (
-        GatewayProxyLimiter(app_config.control_plane.max_active_terminal_proxies)
-        if app_config is not None and mode == "control-plane"
-        else None
-    )
-    metrics_registry = create_registry()
-    metrics_collector = MetricsCollector(metrics_registry, terminal_manager, service_manager)
-    metrics_collector.refresh()
-
-    audit_engine = None
-    audit_session_factory = None
-    control_plane_audit_engine = None
-    control_plane_audit_session_factory = None
     if mode == "agent":
         db_path = _resolve_state_db(state_database, app_config)
-        run_migrations(db_path)
-        audit_engine = create_sqlite_engine(db_path)
-        audit_session_factory = create_session_factory(audit_engine)
-    elif app_config is not None:
-        run_control_plane_migrations(app_config.control_plane.audit_database)
-        control_plane_audit_engine = create_sqlite_engine(app_config.control_plane.audit_database)
-        control_plane_audit_session_factory = create_session_factory(control_plane_audit_engine)
+        container: AgentContainer | ManagerContainer = build_agent_container(
+            app_config, db_path
+        )
+        audit_session_factory = container.session_factory
+        control_plane_audit_session_factory = None
+        agent_client = None
+        agent_availability = None
+        gateway_ticket_store = None
+        gateway_proxy_limiter = None
+    else:
+        if app_config is None:
+            raise RuntimeError("manager mode requires configuration")
+        container = build_manager_container(app_config)
+        audit_session_factory = None
+        control_plane_audit_session_factory = container.control_plane_session_factory
+        agent_client = container.agent_client
+        agent_availability = container.agent_availability
+        gateway_ticket_store = container.gateway_ticket_store
+        gateway_proxy_limiter = container.gateway_proxy_limiter
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        refresh_task: asyncio.Task[None] | None = None
-        availability_probe_task: asyncio.Task[None] | None = None
-        if metrics_config.enabled:
-            refresh_task = asyncio.create_task(
-                _metrics_refresh_loop(metrics_collector, metrics_config.collect_interval_seconds)
-            )
-            app.state.metrics_refresh_task = refresh_task
-        if agent_availability is not None and app_config is not None:
-            availability_probe_task = asyncio.create_task(
-                _agent_availability_probe_loop(
-                    agent_availability,
-                    app_config.control_plane.poll_interval_seconds,
-                )
-            )
-            app.state.agent_availability_probe_task = availability_probe_task
-        try:
-            yield
-        finally:
-            if refresh_task is not None:
-                refresh_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await refresh_task
-            if availability_probe_task is not None:
-                availability_probe_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await availability_probe_task
-            if audit_engine is not None:
-                audit_engine.dispose()
-            if control_plane_audit_engine is not None:
-                control_plane_audit_engine.dispose()
-            if agent_client is not None:
-                await agent_client.aclose()
+    terminal_manager = container.terminal_manager
+    service_manager = container.service_manager
+    ticket_manager = container.ticket_manager
+    machine_registry = container.machine_registry
+    audit_storage_health = container.audit_storage_health
+    agent_registry = container.agent_registry
+    metrics_registry = container.metrics_registry
+    metrics_config = container.metrics_config
 
-    app = FastAPI(title="IC Design Environment Guard", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(
+        title="IC Design Environment Guard",
+        version="0.1.0",
+        lifespan=create_lifespan(container),
+    )
     app.state.config = app_config
+    app.state.container = container
     register_error_handlers(app)
 
     @app.middleware("http")

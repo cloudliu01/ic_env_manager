@@ -1,0 +1,147 @@
+from dataclasses import dataclass
+from pathlib import Path
+
+from prometheus_client import CollectorRegistry
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import sessionmaker
+
+from ic_env_guard.agents.availability import AgentAvailabilityService
+from ic_env_guard.agents.client import AgentHttpClient
+from ic_env_guard.agents.registry import AgentRegistry
+from ic_env_guard.agents.terminal_proxy import GatewayProxyLimiter, GatewayTicketStore
+from ic_env_guard.api.audit_health import AuditStorageHealth
+from ic_env_guard.config.models import AppConfig, MetricsConfig, ServiceConfig
+from ic_env_guard.db.control_plane_migrations import run_control_plane_migrations
+from ic_env_guard.db.migrations import run_migrations
+from ic_env_guard.db.services import ServiceRuntime
+from ic_env_guard.db.session import create_session_factory, create_sqlite_engine
+from ic_env_guard.metrics.collector import MetricsCollector
+from ic_env_guard.metrics.registry import create_registry
+from ic_env_guard.monitoring.machines import MachineRegistry
+from ic_env_guard.services.manager import ServiceManager
+from ic_env_guard.terminal.manager import TerminalManager
+from ic_env_guard.terminal.tickets import TerminalTicketManager
+
+
+@dataclass
+class AgentContainer:
+    config: AppConfig | None
+    terminal_manager: TerminalManager
+    service_manager: ServiceManager
+    session_factory: sessionmaker
+    metrics_registry: CollectorRegistry
+    database_engine: Engine
+    metrics_collector: MetricsCollector
+    metrics_config: MetricsConfig
+    ticket_manager: TerminalTicketManager
+    machine_registry: MachineRegistry
+    audit_storage_health: AuditStorageHealth
+    agent_registry: AgentRegistry
+
+
+@dataclass
+class ManagerContainer:
+    config: AppConfig
+    agent_registry: AgentRegistry
+    agent_client: AgentHttpClient
+    agent_availability: AgentAvailabilityService
+    gateway_ticket_store: GatewayTicketStore
+    gateway_proxy_limiter: GatewayProxyLimiter
+    control_plane_session_factory: sessionmaker
+    metrics_registry: CollectorRegistry
+    database_engine: Engine
+    metrics_collector: MetricsCollector
+    metrics_config: MetricsConfig
+    terminal_manager: TerminalManager
+    service_manager: ServiceManager
+    ticket_manager: TerminalTicketManager
+    machine_registry: MachineRegistry
+    audit_storage_health: AuditStorageHealth
+
+
+def _service_runtime(service: ServiceConfig) -> ServiceRuntime:
+    return ServiceRuntime(
+        id=service.id,
+        name=service.name,
+        command=service.command,
+        systemd_unit=service.systemd_unit,
+        allowed_operations=list(service.allowed_operations),
+        description=service.description,
+        cwd=service.cwd,
+        env=dict(service.env),
+        autostart=service.autostart,
+        restart_policy=service.restart,
+        start_timeout_seconds=service.start_timeout_seconds,
+        stop_timeout_seconds=service.stop_timeout_seconds,
+    )
+
+
+def configured_agent_capabilities(config: AppConfig) -> tuple[str, ...]:
+    if config.server.trusted_lan_http.enabled:
+        return ("trusted-lan-http.v1",)
+    return ()
+
+
+def build_agent_container(config: AppConfig | None, state_database: Path) -> AgentContainer:
+    run_migrations(state_database)
+    database_engine = create_sqlite_engine(state_database)
+    terminal_manager = TerminalManager()
+    service_manager = ServiceManager(
+        [_service_runtime(service) for service in config.services] if config else []
+    )
+    metrics_registry = create_registry()
+    metrics_collector = MetricsCollector(metrics_registry, terminal_manager, service_manager)
+    metrics_collector.refresh()
+    return AgentContainer(
+        config=config,
+        terminal_manager=terminal_manager,
+        service_manager=service_manager,
+        session_factory=create_session_factory(database_engine),
+        metrics_registry=metrics_registry,
+        database_engine=database_engine,
+        metrics_collector=metrics_collector,
+        metrics_config=config.metrics if config else MetricsConfig(),
+        ticket_manager=TerminalTicketManager(),
+        machine_registry=MachineRegistry(),
+        audit_storage_health=AuditStorageHealth(),
+        agent_registry=AgentRegistry(config.agents if config else []),
+    )
+
+
+def build_manager_container(config: AppConfig) -> ManagerContainer:
+    run_control_plane_migrations(config.control_plane.audit_database)
+    database_engine = create_sqlite_engine(config.control_plane.audit_database)
+    agent_registry = AgentRegistry(config.agents)
+    agent_client = AgentHttpClient()
+    metrics_registry = create_registry()
+    terminal_manager = TerminalManager()
+    service_manager = ServiceManager([])
+    metrics_collector = MetricsCollector(metrics_registry, terminal_manager, service_manager)
+    metrics_collector.refresh()
+    return ManagerContainer(
+        config=config,
+        agent_registry=agent_registry,
+        agent_client=agent_client,
+        agent_availability=AgentAvailabilityService(
+            agent_registry,
+            agent_client,
+            stale_after_seconds=config.control_plane.status_stale_after_seconds,
+            max_parallel_probes=config.control_plane.max_parallel_probes,
+        ),
+        gateway_ticket_store=GatewayTicketStore(
+            config.control_plane.max_outstanding_tickets
+        ),
+        gateway_proxy_limiter=GatewayProxyLimiter(
+            config.control_plane.max_active_terminal_proxies
+        ),
+        control_plane_session_factory=create_session_factory(database_engine),
+        metrics_registry=metrics_registry,
+        database_engine=database_engine,
+        metrics_collector=metrics_collector,
+        metrics_config=config.metrics,
+        terminal_manager=terminal_manager,
+        service_manager=service_manager,
+        ticket_manager=TerminalTicketManager(),
+        machine_registry=MachineRegistry(),
+        audit_storage_health=AuditStorageHealth(),
+    )
