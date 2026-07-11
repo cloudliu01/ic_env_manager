@@ -85,3 +85,20 @@ def test_trusted_lan_http_requires_private_clients_and_explicit_remote_bind(tmp_
                 ),
             ),
         )
+
+
+@pytest.mark.contract
+@pytest.mark.parametrize("bind", ["127.0.0.2", "0:0:0:0:0:0:0:1"])
+def test_trusted_lan_http_rejects_all_ip_loopback_bind_spellings(tmp_path, bind):
+    with pytest.raises(ValidationError, match="explicit remote bind"):
+        AppConfig(
+            auth=AuthConfig(token_file=_token_file(tmp_path)),
+            server=ServerConfig(
+                bind=bind,
+                remote_bind_enabled=True,
+                trusted_lan_http=TrustedLanHttpServerConfig(
+                    enabled=True,
+                    client_cidrs=["10.20.30.0/24"],
+                ),
+            ),
+        )

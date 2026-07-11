@@ -32,7 +32,12 @@ class ServerConfig(BaseModel):
 
     @property
     def is_local_only(self) -> bool:
-        return self.bind in {"127.0.0.1", "localhost", "::1"}
+        if self.bind.lower() == "localhost":
+            return True
+        try:
+            return ip_address(self.bind).is_loopback
+        except ValueError:
+            return False
 
     @model_validator(mode="after")
     def validate_trusted_lan_bind(self) -> "ServerConfig":
