@@ -21,7 +21,9 @@ from ic_env_guard.db.session import create_session_factory, create_sqlite_engine
 from ic_env_guard.metrics.collector import MetricsCollector
 from ic_env_guard.metrics.registry import create_registry
 from ic_env_guard.monitoring.machines import MachineRegistry
+from ic_env_guard.observations.service import ObservationService
 from ic_env_guard.services.manager import ServiceManager
+from ic_env_guard.storage.observations import SQLiteObservationRepository
 from ic_env_guard.terminal.manager import TerminalManager
 from ic_env_guard.terminal.tickets import TerminalTicketManager
 
@@ -43,6 +45,7 @@ class AgentContainer:
     machine_registry: MachineRegistry
     audit_storage_health: AuditStorageHealth
     agent_registry: AgentRegistry
+    observation_service: ObservationService
 
 
 @dataclass
@@ -102,6 +105,7 @@ def build_agent_container(
     metrics_registry = create_registry()
     metrics_collector = MetricsCollector(metrics_registry, terminal_manager, service_manager)
     metrics_collector.refresh()
+    observation_service = ObservationService(SQLiteObservationRepository(database_engine))
     return AgentContainer(
         config=config,
         instance_id=load_or_create_instance_id(
@@ -120,6 +124,7 @@ def build_agent_container(
         machine_registry=MachineRegistry(),
         audit_storage_health=AuditStorageHealth(),
         agent_registry=AgentRegistry(config.agents if config else []),
+        observation_service=observation_service,
     )
 
 

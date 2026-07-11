@@ -40,6 +40,8 @@ from ic_env_guard.api.control_plane_audit import router as control_plane_audit_r
 from ic_env_guard.api.errors import register_error_handlers
 from ic_env_guard.api.fleet import router as fleet_router
 from ic_env_guard.api.health import router as health_router
+from ic_env_guard.api.ingest_guard import IngestCapacityMiddleware
+from ic_env_guard.api.ingest_observations import router as ingest_observations_router
 from ic_env_guard.api.metrics import (
     MetricsAccessPolicy,
     get_metrics_access_policy,
@@ -50,6 +52,8 @@ from ic_env_guard.api.metrics import (
 )
 from ic_env_guard.api.monitoring import get_machine_registry
 from ic_env_guard.api.monitoring import router as monitoring_router
+from ic_env_guard.api.observations import get_observation_service
+from ic_env_guard.api.observations import router as observations_router
 from ic_env_guard.api.risk import classify_route
 from ic_env_guard.api.runtime import RuntimeMetadata, get_runtime_metadata
 from ic_env_guard.api.runtime import router as runtime_router
@@ -68,6 +72,7 @@ from ic_env_guard.api.v2_errors import (
     register_v2_error_handlers,
     resolve_v2_correlation_id,
     unexpected_v2_error_response,
+    v2_error_response,
 )
 from ic_env_guard.auth.dependencies import AuthState, get_auth_state
 from ic_env_guard.auth.rate_limit import LoginRateLimiter
@@ -143,21 +148,32 @@ def create_app(
     state_database: Path | None = None,
     instance_id_path: Path | None = None,
     login_limiter: LoginRateLimiter | None = None,
+    _container: AgentContainer | ManagerContainer | None = None,
 ) -> FastAPI:
-    app_config = _resolve_config(config_path, config)
+    app_config = (
+        _container.config
+        if _container is not None
+        else _resolve_config(config_path, config)
+    )
     mode = app_config.mode if app_config else "agent"
     auth_token_file = token_file or (app_config.auth.token_file if app_config else None)
 
     auth_state = AuthState(token_file=auth_token_file, token=token)
     if mode == "agent":
         db_path = _resolve_state_db(state_database, app_config)
-        container: AgentContainer | ManagerContainer = build_agent_container(
-            app_config,
-            db_path,
-            _resolve_instance_id_path(
-                instance_id_path, state_database, token_file, config_path, app_config
-            ),
-        )
+        container: AgentContainer | ManagerContainer
+        if _container is not None:
+            if not isinstance(_container, AgentContainer):
+                raise TypeError("agent mode requires an AgentContainer")
+            container = _container
+        else:
+            container = build_agent_container(
+                app_config,
+                db_path,
+                _resolve_instance_id_path(
+                    instance_id_path, state_database, token_file, config_path, app_config
+                ),
+            )
         audit_session_factory = container.session_factory
         control_plane_audit_session_factory = None
         agent_client = None
@@ -168,7 +184,12 @@ def create_app(
     else:
         if app_config is None:
             raise RuntimeError("manager mode requires configuration")
-        container = build_manager_container(app_config)
+        if _container is not None:
+            if not isinstance(_container, ManagerContainer):
+                raise TypeError("manager mode requires a ManagerContainer")
+            container = _container
+        else:
+            container = build_manager_container(app_config)
         audit_session_factory = None
         control_plane_audit_session_factory = container.control_plane_session_factory
         agent_client = container.agent_client
@@ -224,7 +245,16 @@ def create_app(
             correlation_id = request.headers.get("X-Correlation-ID") or str(uuid4())
         request.state.correlation_id = correlation_id
         try:
-            response = await call_next(request)
+            if (
+                mode == "agent"
+                and request.method == "PUT"
+                and request.url.path == "/api/v2/observations"
+            ):
+                response = v2_error_response(
+                    404, "not_found", "resource not found", correlation_id
+                )
+            else:
+                response = await call_next(request)
         except Exception as exc:
             if not is_v2_path(request.url.path):
                 raise
@@ -338,7 +368,11 @@ def create_app(
     app.include_router(auth_router)
     app.include_router(runtime_router)
     if mode == "agent":
+        app.dependency_overrides[get_observation_service] = (
+            lambda: container.observation_service
+        )
         app.include_router(local_capabilities_router)
+        app.include_router(observations_router)
         app.include_router(terminals_router)
         app.include_router(services_router)
         app.include_router(metrics_router)
@@ -357,6 +391,60 @@ def create_app(
 
     mount_static_ui(app)
 
+    return app
+
+
+def create_public_app(container: AgentContainer | ManagerContainer) -> FastAPI:
+    if container.config is None:
+        raise ValueError("a configured container is required for the public app")
+    return create_app(config=container.config, _container=container)
+
+
+def create_ingest_app(container: AgentContainer) -> FastAPI:
+    if container.config is None:
+        raise ValueError("a configured AgentContainer is required for the ingest app")
+    app = FastAPI(
+        title="IC Env Guard Local Ingest",
+        version="0.1.0",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    app.state.config = container.config
+    app.state.container = container
+    register_error_handlers(app)
+    register_v2_error_handlers(app)
+
+    @app.middleware("http")
+    async def correlation_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
+        correlation_id = resolve_v2_correlation_id(
+            request.headers.get("X-Correlation-ID")
+        )
+        request.state.correlation_id = correlation_id
+        try:
+            if (
+                request.url.path == "/api/v2/observations"
+                and request.method != "PUT"
+            ):
+                response = v2_error_response(
+                    404, "not_found", "resource not found", correlation_id
+                )
+            else:
+                response = await call_next(request)
+        except Exception as exc:
+            response = unexpected_v2_error_response(request, exc)
+        response.headers.setdefault("X-Correlation-ID", correlation_id)
+        return response
+
+    app.dependency_overrides[get_observation_service] = (
+        lambda: container.observation_service
+    )
+    app.include_router(ingest_observations_router)
+    app.add_middleware(
+        IngestCapacityMiddleware,
+        maximum=container.config.ingest.max_concurrent_requests,
+        max_request_bytes=container.config.ingest.max_request_bytes,
+    )
     return app
 
 
