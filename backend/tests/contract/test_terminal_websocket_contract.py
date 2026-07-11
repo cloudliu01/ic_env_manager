@@ -72,3 +72,33 @@ def test_terminal_websocket_ticket_is_one_use(client, auth_headers):
     with pytest.raises(Exception):
         with client.websocket_connect(f"/ws/terminals/{terminal['id']}?ticket={ticket}&cursor=0"):
             pass
+
+
+@pytest.mark.contract
+def test_terminal_websocket_reconnect_replays_retained_output(client, auth_headers):
+    terminal = client.post("/api/terminals", headers=auth_headers, json={}).json()
+    terminal_id = terminal["id"]
+    ticket = client.post(
+        f"/api/terminals/{terminal_id}/connect-token", headers=auth_headers
+    ).json()["ticket"]
+
+    with client.websocket_connect(
+        f"/ws/terminals/{terminal_id}?ticket={ticket}&cursor=0"
+    ) as ws:
+        ws.send_text("printf '__WS_''RECONNECT_OK__\\n'\r")
+        received = ""
+        for _ in range(20):
+            received += ws.receive_text()
+            if "__WS_RECONNECT_OK__" in received:
+                break
+        assert "__WS_RECONNECT_OK__" in received
+
+    reconnect_ticket = client.post(
+        f"/api/terminals/{terminal_id}/connect-token", headers=auth_headers
+    ).json()["ticket"]
+    with client.websocket_connect(
+        f"/ws/terminals/{terminal_id}?ticket={reconnect_ticket}&cursor=0"
+    ) as ws:
+        assert "__WS_RECONNECT_OK__" in ws.receive_text()
+
+    client.delete(f"/api/terminals/{terminal_id}", headers=auth_headers)

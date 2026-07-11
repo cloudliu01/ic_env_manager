@@ -25,6 +25,10 @@ def test_terminal_create_list_detail_history_resize_and_close_contract(client, a
     assert created.status_code == 201
     terminal = created.json()
     terminal_id = terminal["id"]
+    assert terminal["owner"] == "local-admin"
+    assert terminal["title"] == "demo"
+    assert terminal["rows"] == 24
+    assert terminal["cols"] == 80
     assert terminal["status"] in {"running", "exited"}
     assert terminal["idle_timeout_minutes"] == 60
 
@@ -39,6 +43,7 @@ def test_terminal_create_list_detail_history_resize_and_close_contract(client, a
     history = client.get(f"/api/terminals/{terminal_id}/history?cursor=0", headers=auth_headers)
     assert history.status_code == 200
     assert history.json()["terminal_id"] == terminal_id
+    assert history.json()["from_cursor"] == 0
     assert "truncated" in history.json()
 
     resized = client.post(

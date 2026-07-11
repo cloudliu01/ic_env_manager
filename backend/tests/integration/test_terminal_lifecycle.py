@@ -41,3 +41,24 @@ def test_terminal_idle_cleanup_times_out_session():
     manager.cleanup_idle_sessions()
 
     assert manager.get(session.id).status == "timed_out"
+
+
+@pytest.mark.integration
+def test_terminal_pty_inherits_runtime_user_permissions():
+    manager = TerminalManager(shell="/bin/sh")
+    session = manager.create_terminal(
+        owner="local-admin", title="identity", rows=24, cols=80
+    )
+
+    try:
+        manager.write(session.id, "id -u\n")
+        output = manager.read_until(session.id, str(os.getuid()), timeout=5)
+        manager.write(session.id, "printf '__PTY_''OK__\\n'\n")
+        manager.read_until(session.id, "__PTY_OK__", timeout=5)
+        history = manager.history(session.id, cursor=0)
+
+        assert session.owner == "local-admin"
+        assert str(os.getuid()) in {line.strip() for line in output.splitlines()}
+        assert "__PTY_OK__" in history.output
+    finally:
+        manager.close(session.id)

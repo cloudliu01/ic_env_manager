@@ -42,3 +42,25 @@ def test_terminal_reconnect_future_cursor_streams_only_new_output():
     assert history.output == ""
     assert history.from_cursor == manager.get(session.id).output_cursor
     assert history.truncated is False
+
+
+@pytest.mark.integration
+def test_terminal_reconnect_from_retained_cursor_returns_only_new_output():
+    manager = TerminalManager(shell="/bin/sh")
+    session = manager.create_terminal(title="cursor")
+
+    try:
+        manager.write(session.id, "printf '__BEFORE_''CURSOR__\\n'\n")
+        manager.read_until(session.id, "__BEFORE_CURSOR__", timeout=5)
+        cursor = manager.history(session.id, cursor=0).to_cursor
+
+        manager.write(session.id, "printf '__AFTER_''CURSOR__\\n'\n")
+        manager.read_until(session.id, "__AFTER_CURSOR__", timeout=5)
+        history = manager.history(session.id, cursor=cursor)
+
+        assert "__BEFORE_CURSOR__" not in history.output
+        assert "__AFTER_CURSOR__" in history.output
+        assert history.from_cursor == cursor
+        assert history.truncated is False
+    finally:
+        manager.close(session.id)
