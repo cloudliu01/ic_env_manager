@@ -35,7 +35,7 @@ def require_v2_auth(
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise V2ApiError(401, "unauthorized", "missing bearer token")
     try:
-        return auth_state.authenticate(credentials.credentials)
+        return auth_state.authenticate(credentials.credentials, allow_pending=True)
     except ApiError as exc:
         raise V2ApiError(401, "unauthorized", "invalid bearer token") from exc
 

@@ -13,11 +13,19 @@ from ic_env_guard.agents.registry import AgentRegistry
 from ic_env_guard.agents.terminal_proxy import GatewayProxyLimiter, GatewayTicketStore
 from ic_env_guard.api.audit_health import AuditStorageHealth
 from ic_env_guard.bootstrap.identity import load_or_create_instance_id
-from ic_env_guard.config.models import AppConfig, LogsConfig, MetricsConfig, ServiceConfig
+from ic_env_guard.config.models import (
+    AppConfig,
+    EnrollmentConfig,
+    LogsConfig,
+    MetricsConfig,
+    ServiceConfig,
+)
 from ic_env_guard.db.control_plane_migrations import run_control_plane_migrations
 from ic_env_guard.db.migrations import run_migrations
 from ic_env_guard.db.services import ServiceRuntime
 from ic_env_guard.db.session import create_session_factory, create_sqlite_engine
+from ic_env_guard.enrollment.audit import AgentEnrollmentAudit
+from ic_env_guard.enrollment.service import EnrollmentService
 from ic_env_guard.logs.policy import LogPathPolicy, LogTailReader
 from ic_env_guard.logs.service import LogSourceService
 from ic_env_guard.metrics.collector import MetricsCollector
@@ -27,6 +35,7 @@ from ic_env_guard.monitoring.machines import MachineRegistry
 from ic_env_guard.observations.service import ObservationService
 from ic_env_guard.services.manager import ServiceManager
 from ic_env_guard.storage.log_sources import SQLiteLogSourceRepository
+from ic_env_guard.storage.manager_credentials import SQLiteManagerCredentialRepository
 from ic_env_guard.storage.observations import SQLiteObservationRepository
 from ic_env_guard.summary.service import SummaryService
 from ic_env_guard.terminal.manager import TerminalManager
@@ -57,6 +66,8 @@ class AgentContainer:
     log_source_repository: SQLiteLogSourceRepository
     log_tail_reader: LogTailReader
     log_source_service: LogSourceService
+    manager_credential_repository: SQLiteManagerCredentialRepository
+    enrollment_service: EnrollmentService
 
 
 @dataclass
@@ -109,6 +120,7 @@ def build_agent_container(
 ) -> AgentContainer:
     run_migrations(state_database)
     database_engine = create_sqlite_engine(state_database)
+    session_factory = create_session_factory(database_engine)
     terminal_manager = TerminalManager()
     service_manager = ServiceManager(
         [_service_runtime(service) for service in config.services] if config else []
@@ -137,6 +149,14 @@ def build_agent_container(
         service_manager,
         terminal_manager,
     )
+    manager_credential_repository = SQLiteManagerCredentialRepository(database_engine)
+    enrollment_config = config.enrollment if config else EnrollmentConfig()
+    enrollment_service = EnrollmentService(
+        manager_credential_repository,
+        AgentEnrollmentAudit(session_factory),
+        pending_ttl_seconds=enrollment_config.pending_ttl_seconds,
+        max_pending=enrollment_config.max_pending,
+    )
     return AgentContainer(
         config=config,
         instance_id=load_or_create_instance_id(
@@ -146,7 +166,7 @@ def build_agent_container(
         capabilities=configured_agent_capabilities(config) if config else (),
         terminal_manager=terminal_manager,
         service_manager=service_manager,
-        session_factory=create_session_factory(database_engine),
+        session_factory=session_factory,
         metrics_registry=metrics_registry,
         database_engine=database_engine,
         metrics_collector=metrics_collector,
@@ -162,6 +182,8 @@ def build_agent_container(
         log_source_repository=log_source_repository,
         log_tail_reader=log_tail_reader,
         log_source_service=log_source_service,
+        manager_credential_repository=manager_credential_repository,
+        enrollment_service=enrollment_service,
     )
 
 

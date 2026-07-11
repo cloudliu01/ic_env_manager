@@ -50,6 +50,8 @@ from ic_env_guard.api.logs import (
     get_logs_config,
 )
 from ic_env_guard.api.logs import router as logs_router
+from ic_env_guard.api.manager_credentials import get_enrollment_service
+from ic_env_guard.api.manager_credentials import router as manager_credentials_router
 from ic_env_guard.api.metrics import (
     MetricsAccessPolicy,
     get_metrics_access_policy,
@@ -168,7 +170,6 @@ def create_app(
     mode = app_config.mode if app_config else "agent"
     auth_token_file = token_file or (app_config.auth.token_file if app_config else None)
 
-    auth_state = AuthState(token_file=auth_token_file, token=token)
     if mode == "agent":
         db_path = _resolve_state_db(state_database, app_config)
         container: AgentContainer | ManagerContainer
@@ -191,6 +192,11 @@ def create_app(
         gateway_ticket_store = None
         gateway_proxy_limiter = None
         login_audit_recorder = AgentLoginAuditRecorder(container.session_factory)
+        auth_state = AuthState(
+            token_file=auth_token_file,
+            token=token,
+            manager_verifier=container.enrollment_service,
+        )
     else:
         if app_config is None:
             raise RuntimeError("manager mode requires configuration")
@@ -209,6 +215,7 @@ def create_app(
         login_audit_recorder = ManagerLoginAuditRecorder(
             container.control_plane_session_factory
         )
+        auth_state = AuthState(token_file=auth_token_file, token=token)
 
     terminal_manager = container.terminal_manager
     service_manager = container.service_manager
@@ -389,6 +396,9 @@ def create_app(
         )
         app.dependency_overrides[get_logs_config] = lambda: container.logs_config
         app.dependency_overrides[get_summary_service] = lambda: container.summary_service
+        app.dependency_overrides[get_enrollment_service] = (
+            lambda: container.enrollment_service
+        )
         app.dependency_overrides[get_log_tail_audit_recorder] = lambda: (
             AgentLogTailAuditRecorder(
                 container.session_factory, container.audit_storage_health
@@ -401,6 +411,7 @@ def create_app(
         app.include_router(services_router)
         app.include_router(metrics_router)
         app.include_router(summary_router)
+        app.include_router(manager_credentials_router)
         app.include_router(monitoring_router)
         app.include_router(audit_router)
         app.include_router(terminal_ws.router)

@@ -4,8 +4,9 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
+from ic_env_guard.api.runtime import require_v2_auth
 from ic_env_guard.api.v2_errors import V2ApiError
-from ic_env_guard.auth.dependencies import AuthContext, require_auth
+from ic_env_guard.auth.dependencies import AuthContext
 from ic_env_guard.logs.models import LogStorageError
 from ic_env_guard.observations.models import ObservationStorageError
 from ic_env_guard.summary.service import SummaryService
@@ -19,7 +20,7 @@ def get_summary_service() -> SummaryService:
 
 @router.get("/summary")
 def summary(
-    _: Annotated[AuthContext, Depends(require_auth)],
+    _: Annotated[AuthContext, Depends(require_v2_auth)],
     service: Annotated[SummaryService, Depends(get_summary_service)],
 ) -> JSONResponse:
     try:

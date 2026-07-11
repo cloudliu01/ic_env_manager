@@ -34,6 +34,14 @@ assert _OBSERVABILITY_SPEC is not None and _OBSERVABILITY_SPEC.loader is not Non
 observability_migration = importlib.util.module_from_spec(_OBSERVABILITY_SPEC)
 _OBSERVABILITY_SPEC.loader.exec_module(observability_migration)
 
+_CREDENTIAL_PATH = MIGRATIONS_DIR / "0004_manager_credentials.py"
+_CREDENTIAL_SPEC = importlib.util.spec_from_file_location(
+    "migration_0004_manager_credentials", _CREDENTIAL_PATH
+)
+assert _CREDENTIAL_SPEC is not None and _CREDENTIAL_SPEC.loader is not None
+credential_migration = importlib.util.module_from_spec(_CREDENTIAL_SPEC)
+_CREDENTIAL_SPEC.loader.exec_module(credential_migration)
+
 
 @pytest.mark.integration
 def test_initial_migration_creates_required_tables(tmp_path):
@@ -155,6 +163,49 @@ def test_observability_migration_is_additive_exact_and_idempotent(tmp_path):
     assert connection.execute(
         "SELECT name FROM sqlite_master WHERE name='existing_user_table'"
     ).fetchone()
+    assert len(versions) == 1
+
+
+@pytest.mark.integration
+def test_manager_credential_migration_is_additive_exact_and_idempotent(tmp_path):
+    connection = sqlite3.connect(tmp_path / "state.db")
+    initial_migration.upgrade(connection)
+    connection.execute("CREATE TABLE existing_user_table (id TEXT PRIMARY KEY)")
+
+    credential_migration.upgrade(connection)
+    credential_migration.upgrade(connection)
+
+    columns = [
+        (row[1], row[2], row[3], row[5])
+        for row in connection.execute("PRAGMA table_info(manager_credentials)")
+    ]
+    indexes = {
+        row[1] for row in connection.execute("PRAGMA index_list(manager_credentials)")
+    }
+    assert columns == [
+        ("credential_id", "TEXT", 0, 1),
+        ("manager_id", "TEXT", 1, 0),
+        ("enrollment_id", "TEXT", 1, 0),
+        ("token_hash", "TEXT", 1, 0),
+        ("state", "TEXT", 1, 0),
+        ("pending_expires_at", "TEXT", 0, 0),
+        ("created_at", "TEXT", 1, 0),
+        ("activated_at", "TEXT", 0, 0),
+        ("last_used_at", "TEXT", 0, 0),
+        ("revoked_at", "TEXT", 0, 0),
+    ]
+    assert {
+        "sqlite_autoindex_manager_credentials_1",
+        "sqlite_autoindex_manager_credentials_2",
+        "sqlite_autoindex_manager_credentials_3",
+    } <= indexes
+    assert connection.execute(
+        "SELECT name FROM sqlite_master WHERE name='existing_user_table'"
+    ).fetchone()
+    versions = connection.execute(
+        "SELECT version FROM schema_versions WHERE version = ?",
+        (credential_migration.VERSION,),
+    ).fetchall()
     assert len(versions) == 1
 
 

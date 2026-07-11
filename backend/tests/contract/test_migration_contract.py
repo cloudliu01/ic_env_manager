@@ -23,6 +23,7 @@ def test_migration_runner_records_forward_only_metadata(tmp_path):
     assert ("0001_initial", "upgrade", "success") in rows
     assert ("0002_state_audit_indexes", "upgrade", "success") in rows
     assert rows.count(("0003_observability", "upgrade", "success")) == 1
+    assert rows.count(("0004_manager_credentials", "upgrade", "success")) == 1
 
 
 @pytest.mark.contract
