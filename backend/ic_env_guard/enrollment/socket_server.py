@@ -1,8 +1,6 @@
 import ctypes
-import errno
 import json
 import os
-import secrets
 import socket
 import stat
 import struct
@@ -28,8 +26,6 @@ class SocketSecurityError(RuntimeError):
 
 
 PeerCredentials = Callable[[socket.socket], tuple[int, int]]
-_TEMPORARY_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
-_TEMPORARY_ATTEMPTS = 16
 
 
 def peer_credentials(connection: socket.socket) -> tuple[int, int]:
@@ -181,27 +177,40 @@ class EnrollmentSocketServer:
         basename_bytes = len(os.fsencode(self.path.name))
         if basename_bytes < 1:
             raise SocketSecurityError("enrollment socket filename is invalid")
-        length = min(basename_bytes, 16)
-        alphabet = _TEMPORARY_ALPHABET
-        if length == 1:
-            alphabet = alphabet.replace(self.path.name, "")
-        last_error: OSError | None = None
-        for _ in range(_TEMPORARY_ATTEMPTS):
-            name = "".join(secrets.choice(alphabet) for _ in range(length))
-            temporary_path = self.path.parent / name
-            if temporary_path == self.path:
-                continue
-            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            try:
-                listener.bind(str(temporary_path))
-            except OSError as exc:
-                listener.close()
-                if exc.errno in {errno.EADDRINUSE, errno.EEXIST}:
-                    last_error = exc
-                    continue
-                raise
-            return listener, temporary_path
-        raise SocketSecurityError("cannot allocate temporary enrollment socket") from last_error
+        names = ("_" * basename_bytes, "-" * basename_bytes, "~" * basename_bytes)
+        temporary_path = next(
+            self.path.parent / name
+            for name in names
+            if os.fsencode(name) != os.fsencode(self.path.name)
+        )
+        self._prepare_reserved_temporary_path(temporary_path)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(str(temporary_path))
+        except OSError as exc:
+            listener.close()
+            raise SocketSecurityError("reserved temporary socket is unavailable") from exc
+        return listener, temporary_path
+
+    def _prepare_reserved_temporary_path(self, path: Path) -> None:
+        try:
+            metadata = self._bound_path_metadata(path)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise SocketSecurityError("reserved temporary socket metadata is unavailable") from exc
+        self._validate_parent()
+        try:
+            self._validate_bound_path(metadata)
+        except SocketSecurityError as exc:
+            raise SocketSecurityError("reserved temporary socket is unsafe") from exc
+        self._identity = (metadata.st_dev, metadata.st_ino)
+        self._owned_paths[path] = self._identity
+        self._temporary_path = path
+        if not self._remove_path_if_owned(path):
+            raise SocketSecurityError("reserved temporary socket cleanup is pending")
+        self._temporary_path = None
+        self._sync_identity()
 
     def _validate_parent(self) -> None:
         try:

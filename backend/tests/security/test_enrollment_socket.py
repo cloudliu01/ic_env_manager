@@ -1,4 +1,5 @@
 import os
+import secrets
 import socket
 import stat
 import struct
@@ -496,3 +497,96 @@ def test_pending_cleanup_abandons_replaced_final_without_deleting_it(
 
     assert path.read_text(encoding="utf-8") == "replacement"
     assert server._identity is None
+
+
+@pytest.mark.security
+def test_reserved_temp_name_cannot_case_alias_a_single_character_final(
+    tmp_path, socket_dir, monkeypatch
+):
+    container = build_agent_container(None, tmp_path / "state.db", tmp_path / "instance-id")
+    path = socket_dir / "s"
+    monkeypatch.setattr(secrets, "choice", lambda _alphabet: "S")
+    server = EnrollmentSocketServer(
+        path, 0o600, container.instance_id, container.enrollment_service
+    )
+
+    server.start()
+    try:
+        bound_name = Path(server._socket.getsockname()).name
+        assert bound_name not in {"s", "S"}
+        assert parse_response(_exchange(path, _request())).token
+    finally:
+        server.stop()
+
+
+@pytest.mark.security
+@pytest.mark.parametrize("reuse_server", [True, False])
+def test_preidentity_metadata_outage_uses_one_reserved_temp_and_recovers(
+    tmp_path, socket_dir, monkeypatch, reuse_server
+):
+    container = build_agent_container(None, tmp_path / "state.db", tmp_path / "instance-id")
+    path = socket_dir / "enroll.sock"
+    server = EnrollmentSocketServer(
+        path, 0o600, container.instance_id, container.enrollment_service
+    )
+    real_lstat = os.lstat
+    real_stat = os.stat
+    metadata_unavailable = True
+
+    def is_candidate(target) -> bool:
+        candidate = Path(target)
+        return (
+            candidate.parent == socket_dir
+            and candidate != path
+            and candidate.name in os.listdir(socket_dir)
+        )
+
+    def failing_lstat(target, *args, **kwargs):
+        if metadata_unavailable and is_candidate(target):
+            raise OSError("reserved temp metadata unavailable")
+        return real_lstat(target, *args, **kwargs)
+
+    def failing_stat(target, *args, **kwargs):
+        if metadata_unavailable and is_candidate(target):
+            raise OSError("reserved temp metadata unavailable")
+        return real_stat(target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", failing_lstat)
+    monkeypatch.setattr(os, "stat", failing_stat)
+
+    for _ in range(6):
+        with pytest.raises((OSError, SocketSecurityError)):
+            server.start()
+        assert path.name not in os.listdir(socket_dir)
+        assert len(os.listdir(socket_dir)) <= 1
+        assert len(server._owned_paths) <= 2
+
+    metadata_unavailable = False
+    if not reuse_server:
+        server = EnrollmentSocketServer(
+            path, 0o600, container.instance_id, container.enrollment_service
+        )
+    server.start()
+    try:
+        assert server.healthy
+        assert parse_response(_exchange(path, _request())).token
+    finally:
+        server.stop()
+    assert os.listdir(socket_dir) == []
+
+
+@pytest.mark.security
+def test_reserved_temp_regular_replacement_is_never_deleted(tmp_path, socket_dir):
+    container = build_agent_container(None, tmp_path / "state.db", tmp_path / "instance-id")
+    path = socket_dir / "enroll.sock"
+    reserved = socket_dir / ("_" * len(os.fsencode(path.name)))
+    reserved.write_text("replacement", encoding="utf-8")
+    server = EnrollmentSocketServer(
+        path, 0o600, container.instance_id, container.enrollment_service
+    )
+
+    with pytest.raises(SocketSecurityError, match="reserved temporary"):
+        server.start()
+
+    assert reserved.read_text(encoding="utf-8") == "replacement"
+    assert not path.exists()
