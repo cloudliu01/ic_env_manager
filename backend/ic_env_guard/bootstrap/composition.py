@@ -1,5 +1,7 @@
+import socket
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import UUID
 
 from prometheus_client import CollectorRegistry
 from sqlalchemy.engine import Engine
@@ -10,6 +12,7 @@ from ic_env_guard.agents.client import AgentHttpClient
 from ic_env_guard.agents.registry import AgentRegistry
 from ic_env_guard.agents.terminal_proxy import GatewayProxyLimiter, GatewayTicketStore
 from ic_env_guard.api.audit_health import AuditStorageHealth
+from ic_env_guard.bootstrap.identity import load_or_create_instance_id
 from ic_env_guard.config.models import AppConfig, MetricsConfig, ServiceConfig
 from ic_env_guard.db.control_plane_migrations import run_control_plane_migrations
 from ic_env_guard.db.migrations import run_migrations
@@ -26,6 +29,9 @@ from ic_env_guard.terminal.tickets import TerminalTicketManager
 @dataclass
 class AgentContainer:
     config: AppConfig | None
+    instance_id: UUID
+    instance_name: str
+    capabilities: tuple[str, ...]
     terminal_manager: TerminalManager
     service_manager: ServiceManager
     session_factory: sessionmaker
@@ -82,7 +88,11 @@ def configured_agent_capabilities(config: AppConfig) -> tuple[str, ...]:
     return ()
 
 
-def build_agent_container(config: AppConfig | None, state_database: Path) -> AgentContainer:
+def build_agent_container(
+    config: AppConfig | None,
+    state_database: Path,
+    instance_id_path: Path | None = None,
+) -> AgentContainer:
     run_migrations(state_database)
     database_engine = create_sqlite_engine(state_database)
     terminal_manager = TerminalManager()
@@ -94,6 +104,11 @@ def build_agent_container(config: AppConfig | None, state_database: Path) -> Age
     metrics_collector.refresh()
     return AgentContainer(
         config=config,
+        instance_id=load_or_create_instance_id(
+            instance_id_path or state_database.with_name("instance-id"), allow_create=True
+        ),
+        instance_name=socket.gethostname(),
+        capabilities=configured_agent_capabilities(config) if config else (),
         terminal_manager=terminal_manager,
         service_manager=service_manager,
         session_factory=create_session_factory(database_engine),

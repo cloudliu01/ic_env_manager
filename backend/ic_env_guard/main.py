@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request
 
 from ic_env_guard.agents.availability import AgentAvailabilityService
 from ic_env_guard.agents.client import AgentHttpClient
+from ic_env_guard.agents.models import LOCAL_CAPABILITIES
 from ic_env_guard.agents.registry import AgentRegistry
 from ic_env_guard.agents.terminal_proxy import GatewayProxyLimiter, GatewayTicketStore
 from ic_env_guard.api import terminal_ws
@@ -27,6 +28,12 @@ from ic_env_guard.api.agents import (
 from ic_env_guard.api.audit import get_audit_query_repository
 from ic_env_guard.api.audit import router as audit_router
 from ic_env_guard.api.audit_health import AuditStorageHealth, get_audit_storage_health
+from ic_env_guard.api.auth import (
+    AgentLoginAuditRecorder,
+    ManagerLoginAuditRecorder,
+    get_login_audit_recorder,
+    get_login_rate_limiter,
+)
 from ic_env_guard.api.auth import router as auth_router
 from ic_env_guard.api.control_plane_audit import get_control_plane_audit_repository
 from ic_env_guard.api.control_plane_audit import router as control_plane_audit_router
@@ -44,6 +51,8 @@ from ic_env_guard.api.metrics import (
 from ic_env_guard.api.monitoring import get_machine_registry
 from ic_env_guard.api.monitoring import router as monitoring_router
 from ic_env_guard.api.risk import classify_route
+from ic_env_guard.api.runtime import RuntimeMetadata, get_runtime_metadata
+from ic_env_guard.api.runtime import router as runtime_router
 from ic_env_guard.api.services import get_service_manager
 from ic_env_guard.api.services import router as services_router
 from ic_env_guard.api.static import mount_static_ui
@@ -54,7 +63,14 @@ from ic_env_guard.api.terminals import (
 from ic_env_guard.api.terminals import (
     router as terminals_router,
 )
+from ic_env_guard.api.v2_errors import (
+    V2ApiError,
+    resolve_v2_correlation_id,
+    unexpected_v2_error_response,
+    v2_error_handler,
+)
 from ic_env_guard.auth.dependencies import AuthState, get_auth_state
+from ic_env_guard.auth.rate_limit import LoginRateLimiter
 from ic_env_guard.bootstrap.composition import (
     AgentContainer,
     ManagerContainer,
@@ -73,6 +89,7 @@ from ic_env_guard.terminal.manager import TerminalManager
 from ic_env_guard.terminal.tickets import TerminalTicketManager
 
 DEFAULT_STATE_DB = Path("/var/lib/ic-env-guard/state.db")
+DEFAULT_INSTANCE_ID = Path("/var/lib/ic-env-guard/instance-id")
 
 
 def _resolve_config(config_path: Path | None, config: AppConfig | None) -> AppConfig | None:
@@ -95,12 +112,37 @@ def _resolve_state_db(state_database: Path | None, config: AppConfig | None) -> 
     return DEFAULT_STATE_DB
 
 
+def _resolve_instance_id_path(
+    instance_id_path: Path | None,
+    state_database: Path | None,
+    token_file: Path | None,
+    config_path: Path | None,
+    config: AppConfig | None,
+) -> Path:
+    if instance_id_path is not None:
+        return instance_id_path
+    environment_path = os.environ.get("IC_ENV_GUARD_INSTANCE_ID")
+    if environment_path:
+        return Path(environment_path)
+    if state_database is not None:
+        return state_database.with_name("instance-id")
+    if config is not None and config.state_database is not None:
+        return config.state_database.with_name("instance-id")
+    if config_path is not None:
+        return config_path.with_name("instance-id")
+    if token_file is not None and config is None:
+        return token_file.with_name("instance-id")
+    return DEFAULT_INSTANCE_ID
+
+
 def create_app(
     token_file: Path | None = None,
     token: str | None = None,
     config_path: Path | None = None,
     config: AppConfig | None = None,
     state_database: Path | None = None,
+    instance_id_path: Path | None = None,
+    login_limiter: LoginRateLimiter | None = None,
 ) -> FastAPI:
     app_config = _resolve_config(config_path, config)
     mode = app_config.mode if app_config else "agent"
@@ -110,7 +152,11 @@ def create_app(
     if mode == "agent":
         db_path = _resolve_state_db(state_database, app_config)
         container: AgentContainer | ManagerContainer = build_agent_container(
-            app_config, db_path
+            app_config,
+            db_path,
+            _resolve_instance_id_path(
+                instance_id_path, state_database, token_file, config_path, app_config
+            ),
         )
         audit_session_factory = container.session_factory
         control_plane_audit_session_factory = None
@@ -118,6 +164,7 @@ def create_app(
         agent_availability = None
         gateway_ticket_store = None
         gateway_proxy_limiter = None
+        login_audit_recorder = AgentLoginAuditRecorder(container.session_factory)
     else:
         if app_config is None:
             raise RuntimeError("manager mode requires configuration")
@@ -128,6 +175,9 @@ def create_app(
         agent_availability = container.agent_availability
         gateway_ticket_store = container.gateway_ticket_store
         gateway_proxy_limiter = container.gateway_proxy_limiter
+        login_audit_recorder = ManagerLoginAuditRecorder(
+            container.control_plane_session_factory
+        )
 
     terminal_manager = container.terminal_manager
     service_manager = container.service_manager
@@ -146,12 +196,39 @@ def create_app(
     app.state.config = app_config
     app.state.container = container
     register_error_handlers(app)
+    app.add_exception_handler(V2ApiError, v2_error_handler)
+
+    if mode == "agent":
+        runtime_metadata = RuntimeMetadata(
+            mode="agent",
+            capabilities=("runtime.v2", *container.capabilities),
+            instance_id=container.instance_id,
+            name=container.instance_name,
+            agent_capabilities=(
+                *LOCAL_CAPABILITIES,
+                "runtime.v2",
+                *container.capabilities,
+            ),
+        )
+    else:
+        runtime_metadata = RuntimeMetadata(mode="manager", capabilities=())
+    configured_login_limiter = login_limiter or LoginRateLimiter()
 
     @app.middleware("http")
     async def metrics_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
-        correlation_id = request.headers.get("X-Correlation-ID") or str(uuid4())
+        if request.url.path.startswith("/api/v2/"):
+            correlation_id = resolve_v2_correlation_id(
+                request.headers.get("X-Correlation-ID")
+            )
+        else:
+            correlation_id = request.headers.get("X-Correlation-ID") or str(uuid4())
         request.state.correlation_id = correlation_id
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            if not request.url.path.startswith("/api/v2/"):
+                raise
+            response = unexpected_v2_error_response(request, exc)
         response.headers.setdefault("X-Correlation-ID", correlation_id)
         collector = metrics_registry._names_to_collectors["ic_env_guard_api_requests"]
         collector.labels(
@@ -163,6 +240,15 @@ def create_app(
 
     def configured_auth_state() -> AuthState:
         return auth_state
+
+    def configured_runtime_metadata() -> RuntimeMetadata:
+        return runtime_metadata
+
+    def configured_login_rate_limiter() -> LoginRateLimiter:
+        return configured_login_limiter
+
+    def configured_login_audit_recorder():
+        return login_audit_recorder
 
     def configured_terminal_manager() -> TerminalManager:
         return terminal_manager
@@ -227,6 +313,9 @@ def create_app(
             session.close()
 
     app.dependency_overrides[get_auth_state] = configured_auth_state
+    app.dependency_overrides[get_runtime_metadata] = configured_runtime_metadata
+    app.dependency_overrides[get_login_rate_limiter] = configured_login_rate_limiter
+    app.dependency_overrides[get_login_audit_recorder] = configured_login_audit_recorder
     app.dependency_overrides[get_terminal_manager] = configured_terminal_manager
     app.dependency_overrides[get_ticket_manager] = configured_ticket_manager
     app.dependency_overrides[get_service_manager] = configured_service_manager
@@ -247,6 +336,7 @@ def create_app(
 
     app.include_router(health_router)
     app.include_router(auth_router)
+    app.include_router(runtime_router)
     if mode == "agent":
         app.include_router(local_capabilities_router)
         app.include_router(terminals_router)
@@ -273,4 +363,10 @@ def create_app(
 def main() -> None:
     import uvicorn
 
-    uvicorn.run("ic_env_guard.main:create_app", factory=True, host="127.0.0.1", port=8765)
+    uvicorn.run(
+        "ic_env_guard.main:create_app",
+        factory=True,
+        host="127.0.0.1",
+        port=8765,
+        proxy_headers=False,
+    )
