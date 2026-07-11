@@ -208,6 +208,7 @@ uvicorn.run(
     app,
     host=os.environ.get("IC_ENV_GUARD_HOST", "127.0.0.1"),
     port=int(os.environ.get("IC_ENV_GUARD_PORT", "8765")),
+    proxy_headers=False,
 )
 PY
 }

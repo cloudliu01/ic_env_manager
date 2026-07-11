@@ -64,10 +64,10 @@ from ic_env_guard.api.terminals import (
     router as terminals_router,
 )
 from ic_env_guard.api.v2_errors import (
-    V2ApiError,
+    is_v2_path,
+    register_v2_error_handlers,
     resolve_v2_correlation_id,
     unexpected_v2_error_response,
-    v2_error_handler,
 )
 from ic_env_guard.auth.dependencies import AuthState, get_auth_state
 from ic_env_guard.auth.rate_limit import LoginRateLimiter
@@ -196,7 +196,7 @@ def create_app(
     app.state.config = app_config
     app.state.container = container
     register_error_handlers(app)
-    app.add_exception_handler(V2ApiError, v2_error_handler)
+    register_v2_error_handlers(app)
 
     if mode == "agent":
         runtime_metadata = RuntimeMetadata(
@@ -216,7 +216,7 @@ def create_app(
 
     @app.middleware("http")
     async def metrics_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
-        if request.url.path.startswith("/api/v2/"):
+        if is_v2_path(request.url.path):
             correlation_id = resolve_v2_correlation_id(
                 request.headers.get("X-Correlation-ID")
             )
@@ -226,7 +226,7 @@ def create_app(
         try:
             response = await call_next(request)
         except Exception as exc:
-            if not request.url.path.startswith("/api/v2/"):
+            if not is_v2_path(request.url.path):
                 raise
             response = unexpected_v2_error_response(request, exc)
         response.headers.setdefault("X-Correlation-ID", correlation_id)

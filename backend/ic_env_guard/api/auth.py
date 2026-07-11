@@ -1,7 +1,10 @@
+from json import JSONDecodeError
 from typing import Protocol
 
 from fastapi import APIRouter, Depends, Request, Response
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy.orm import sessionmaker
 
 from ic_env_guard.api.errors import ApiError
@@ -135,9 +138,18 @@ def get_login_audit_recorder() -> LoginAuditRecorder:
     raise RuntimeError("LoginAuditRecorder dependency was not configured")
 
 
+def _has_json_content_type(request: Request) -> bool:
+    content_type = request.headers.get("content-type")
+    if content_type is None:
+        return True
+    media_type = content_type.partition(";")[0].strip().lower()
+    return media_type == "application/json" or (
+        media_type.startswith("application/") and media_type.endswith("+json")
+    )
+
+
 @router.post("/login", response_model=LoginResponse)
-def login(
-    payload: LoginRequest,
+async def login(
     request: Request,
     auth_state: AuthState = Depends(get_auth_state),
     limiter: LoginRateLimiter = Depends(get_login_rate_limiter),
@@ -148,6 +160,36 @@ def login(
     if not limiter.allow(source_addr or "<unknown>"):
         audit.record_failure(source_addr, correlation_id, "rate_limited")
         raise ApiError(429, "too_many_login_attempts", "too many login attempts")
+    if not _has_json_content_type(request):
+        audit.record_failure(source_addr, correlation_id, "invalid_request")
+        raise RequestValidationError(
+            [
+                {
+                    "type": "model_attributes_type",
+                    "loc": ("body",),
+                    "msg": "Input should be a valid dictionary or object",
+                }
+            ]
+        )
+    try:
+        submitted = await request.json()
+        payload = LoginRequest.model_validate(submitted)
+    except (JSONDecodeError, UnicodeDecodeError):
+        audit.record_failure(source_addr, correlation_id, "invalid_request")
+        raise RequestValidationError(
+            [{"type": "json_invalid", "loc": ("body",), "msg": "JSON decode error"}]
+        ) from None
+    except PydanticValidationError as exc:
+        audit.record_failure(source_addr, correlation_id, "invalid_request")
+        safe_errors = [
+            {
+                "type": error["type"],
+                "loc": ("body", *error["loc"]),
+                "msg": error["msg"],
+            }
+            for error in exc.errors()
+        ]
+        raise RequestValidationError(safe_errors) from None
     try:
         context = auth_state.authenticate(payload.token)
     except ApiError:

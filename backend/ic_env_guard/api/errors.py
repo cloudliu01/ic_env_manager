@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from ic_env_guard.api.audit_health import AuditStorageUnavailable
+from ic_env_guard.api.v2_errors import is_v2_path, v2_error_response
 
 
 class ApiError(Exception):
@@ -13,6 +14,13 @@ class ApiError(Exception):
 
 async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
     correlation_id = getattr(request.state, "correlation_id", None)
+    if is_v2_path(request.url.path):
+        return v2_error_response(
+            exc.status_code,
+            exc.error,
+            exc.message,
+            correlation_id,
+        )
     content = {"error": exc.error, "message": exc.message}
     if correlation_id is not None:
         content["correlation_id"] = correlation_id
@@ -27,6 +35,13 @@ async def audit_storage_error_handler(
     request: Request, exc: AuditStorageUnavailable
 ) -> JSONResponse:
     correlation_id = getattr(request.state, "correlation_id", None)
+    if is_v2_path(request.url.path):
+        return v2_error_response(
+            503,
+            "audit_storage_unavailable",
+            "audit storage is unavailable",
+            correlation_id,
+        )
     content = {"error": "audit_storage_unavailable", "message": str(exc)}
     if correlation_id is not None:
         content["correlation_id"] = correlation_id

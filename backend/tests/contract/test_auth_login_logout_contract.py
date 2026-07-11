@@ -2,8 +2,11 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from ic_env_guard.api.auth import get_login_audit_recorder
 from ic_env_guard.auth.rate_limit import LoginRateLimiter
+from ic_env_guard.config.models import AppConfig, AuthConfig, ControlPlaneConfig
 from ic_env_guard.db.audit import AuditEvent
+from ic_env_guard.db.control_plane_audit import ControlPlaneAuditEvent
 from ic_env_guard.main import create_app, main
 
 
@@ -113,3 +116,114 @@ def test_production_launcher_does_not_trust_proxy_headers(monkeypatch):
     main()
 
     assert captured["proxy_headers"] is False
+
+
+@pytest.mark.contract
+@pytest.mark.security
+def test_schema_invalid_logins_are_limited_and_durably_audited(tmp_path):
+    token_file = tmp_path / "token"
+    state_database = tmp_path / "state.db"
+    token_file.write_text("secret-token\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    limiter = LoginRateLimiter(capacity=5, refill_seconds=60, clock=lambda: 0.0)
+    app = create_app(
+        token_file=token_file, state_database=state_database, login_limiter=limiter
+    )
+    client = TestClient(app)
+
+    missing = client.post("/api/auth/login", json={})
+    empty = client.post("/api/auth/login", json={"token": ""})
+    malformed = client.post(
+        "/api/auth/login", content=b'{"token":', headers={"Content-Type": "application/json"}
+    )
+    invalid_utf8 = client.post(
+        "/api/auth/login",
+        content=b'{"token":"\xff"}',
+        headers={"Content-Type": "application/json"},
+    )
+    wrong_content_type = client.post(
+        "/api/auth/login",
+        content=b'{"token":"secret-token"}',
+        headers={"Content-Type": "text/plain"},
+    )
+    limited = client.post("/api/auth/login", json={})
+
+    assert [
+        missing.status_code,
+        empty.status_code,
+        malformed.status_code,
+        invalid_utf8.status_code,
+        wrong_content_type.status_code,
+    ] == [422, 422, 422, 422, 422]
+    assert limited.status_code == 429
+    with app.state.container.session_factory() as session:
+        events = session.execute(
+            select(AuditEvent).where(AuditEvent.operation == "auth.login").order_by(AuditEvent.id)
+        ).scalars().all()
+    assert [event.result for event in events] == ["denied"] * 6
+    assert [event.failure_reason for event in events] == [
+        "invalid_request",
+        "invalid_request",
+        "invalid_request",
+        "invalid_request",
+        "invalid_request",
+        "rate_limited",
+    ]
+    assert "token" not in " ".join(str(event.to_safe_dict()) for event in events).lower()
+
+
+@pytest.mark.contract
+@pytest.mark.security
+def test_manager_login_success_and_failure_are_durably_audited(tmp_path):
+    token_file = tmp_path / "token"
+    audit_database = tmp_path / "control-plane.db"
+    token_file.write_text("secret-token\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    config = AppConfig(
+        mode="control-plane",
+        auth=AuthConfig(token_file=token_file),
+        control_plane=ControlPlaneConfig(audit_database=audit_database),
+    )
+    app = create_app(config=config)
+    client = TestClient(app)
+
+    denied = client.post("/api/auth/login", json={"token": "submitted-wrong-token"})
+    accepted = client.post("/api/auth/login", json={"token": "secret-token"})
+
+    assert denied.status_code == 401
+    assert accepted.status_code == 200
+    with app.state.container.control_plane_session_factory() as session:
+        events = session.execute(
+            select(ControlPlaneAuditEvent)
+            .where(ControlPlaneAuditEvent.operation == "auth.login")
+            .order_by(ControlPlaneAuditEvent.id)
+        ).scalars().all()
+    assert [event.result for event in events] == ["denied", "success"]
+    assert all(event.source_addr == "testclient" for event in events)
+    assert "submitted-wrong-token" not in " ".join(
+        str(event.to_safe_dict()) for event in events
+    )
+
+
+@pytest.mark.contract
+@pytest.mark.security
+def test_login_fails_closed_when_audit_write_fails(tmp_path):
+    class FailingAuditRecorder:
+        def record_success(self, actor_id, source_addr, correlation_id):
+            raise RuntimeError("audit write failed")
+
+        def record_failure(self, source_addr, correlation_id, reason):
+            raise RuntimeError("audit write failed")
+
+    token_file = tmp_path / "token"
+    token_file.write_text("secret-token\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    app = create_app(token_file=token_file)
+    app.dependency_overrides[get_login_audit_recorder] = FailingAuditRecorder
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/api/auth/login", json={"token": "secret-token"}
+    )
+
+    assert response.status_code == 500
+    assert response.text != '{"actor":"local-admin","token_type":"bearer"}'
