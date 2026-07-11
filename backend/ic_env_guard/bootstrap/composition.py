@@ -26,6 +26,7 @@ from ic_env_guard.db.services import ServiceRuntime
 from ic_env_guard.db.session import create_session_factory, create_sqlite_engine
 from ic_env_guard.enrollment.audit import AgentEnrollmentAudit
 from ic_env_guard.enrollment.service import EnrollmentService
+from ic_env_guard.enrollment.socket_server import EnrollmentSocketServer
 from ic_env_guard.logs.policy import LogPathPolicy, LogTailReader
 from ic_env_guard.logs.service import LogSourceService
 from ic_env_guard.metrics.collector import MetricsCollector
@@ -68,6 +69,7 @@ class AgentContainer:
     log_source_service: LogSourceService
     manager_credential_repository: SQLiteManagerCredentialRepository
     enrollment_service: EnrollmentService
+    enrollment_socket_server: EnrollmentSocketServer | None
 
 
 @dataclass
@@ -157,11 +159,22 @@ def build_agent_container(
         pending_ttl_seconds=enrollment_config.pending_ttl_seconds,
         max_pending=enrollment_config.max_pending,
     )
+    instance_id = load_or_create_instance_id(
+        instance_id_path or state_database.with_name("instance-id"), allow_create=True
+    )
+    enrollment_socket_server = (
+        EnrollmentSocketServer(
+            enrollment_config.socket_path,
+            int(enrollment_config.socket_mode, 8),
+            instance_id,
+            enrollment_service,
+        )
+        if config is not None and "enrollment" in config.model_fields_set
+        else None
+    )
     return AgentContainer(
         config=config,
-        instance_id=load_or_create_instance_id(
-            instance_id_path or state_database.with_name("instance-id"), allow_create=True
-        ),
+        instance_id=instance_id,
         instance_name=socket.gethostname(),
         capabilities=configured_agent_capabilities(config) if config else (),
         terminal_manager=terminal_manager,
@@ -184,6 +197,7 @@ def build_agent_container(
         log_source_service=log_source_service,
         manager_credential_repository=manager_credential_repository,
         enrollment_service=enrollment_service,
+        enrollment_socket_server=enrollment_socket_server,
     )
 
 

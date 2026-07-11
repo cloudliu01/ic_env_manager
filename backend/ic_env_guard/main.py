@@ -292,7 +292,21 @@ def create_app(
         return auth_state
 
     def configured_runtime_metadata() -> RuntimeMetadata:
-        return runtime_metadata
+        if not isinstance(container, AgentContainer):
+            return runtime_metadata
+        enrollment_socket = container.enrollment_socket_server
+        if enrollment_socket is None or not enrollment_socket.healthy:
+            return runtime_metadata
+        return RuntimeMetadata(
+            mode=runtime_metadata.mode,
+            capabilities=(*runtime_metadata.capabilities, "manager-enrollment.v1"),
+            instance_id=runtime_metadata.instance_id,
+            name=runtime_metadata.name,
+            agent_capabilities=(
+                *runtime_metadata.agent_capabilities,
+                "manager-enrollment.v1",
+            ),
+        )
 
     def configured_login_rate_limiter() -> LoginRateLimiter:
         return configured_login_limiter

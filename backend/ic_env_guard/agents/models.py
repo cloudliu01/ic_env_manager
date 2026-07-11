@@ -9,7 +9,6 @@ V2_LOCAL_CAPABILITIES = [
     "observations.v2",
     "logs.v2",
     "summary.v2",
-    "manager-enrollment.v1",
 ]
 
 

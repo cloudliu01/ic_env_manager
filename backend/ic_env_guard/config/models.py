@@ -122,6 +122,13 @@ class EnrollmentConfig(BaseModel):
     pending_ttl_seconds: int = Field(default=600, ge=60, le=900)
     max_pending: int = Field(default=16, ge=1, le=128)
 
+    @field_validator("socket_path")
+    @classmethod
+    def validate_socket_path(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("enrollment socket path must be absolute")
+        return value
+
 
 class HealthCheckConfig(BaseModel):
     type: Literal["none", "http", "tcp", "process"] = "none"

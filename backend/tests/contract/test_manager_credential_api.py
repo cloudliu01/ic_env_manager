@@ -36,7 +36,7 @@ def test_pending_has_minimum_permissions_then_active_gets_manager_actor(app_clie
 
     capabilities = client.get("/api/v2/capabilities", headers=headers)
     assert capabilities.status_code == 200
-    assert "manager-enrollment.v1" in capabilities.json()["capabilities"]
+    assert "manager-enrollment.v1" not in capabilities.json()["capabilities"]
     assert client.get("/api/v2/summary", headers=headers).status_code == 200
     assert client.get("/api/v2/manager-credentials", headers=headers).status_code == 403
     assert client.get("/api/terminals", headers=headers).status_code == 401

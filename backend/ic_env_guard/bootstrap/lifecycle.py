@@ -32,6 +32,7 @@ def create_lifespan(container: AgentContainer | ManagerContainer):
         availability_probe_task: asyncio.Task[None] | None = None
         observation_cleanup_task: asyncio.Task[None] | None = None
         log_cleanup_task: asyncio.Task[None] | None = None
+        enrollment_socket_server = None
         metrics_config = container.metrics_config
         if metrics_config.enabled:
             refresh_task = asyncio.create_task(
@@ -50,6 +51,7 @@ def create_lifespan(container: AgentContainer | ManagerContainer):
             )
             app.state.agent_availability_probe_task = availability_probe_task
         else:
+            enrollment_socket_server = container.enrollment_socket_server
             observation_config = container.config.observations if container.config else None
             interval = observation_config.cleanup_interval_seconds if observation_config else 60
             retention = (
@@ -78,9 +80,13 @@ def create_lifespan(container: AgentContainer | ManagerContainer):
             )
             app.state.observation_cleanup_task = observation_cleanup_task
             app.state.log_cleanup_task = log_cleanup_task
+        if enrollment_socket_server is not None:
+            enrollment_socket_server.start()
         try:
             yield
         finally:
+            if enrollment_socket_server is not None:
+                enrollment_socket_server.stop()
             if refresh_task is not None:
                 refresh_task.cancel()
                 with suppress(asyncio.CancelledError):
