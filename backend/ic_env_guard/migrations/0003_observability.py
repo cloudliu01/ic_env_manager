@@ -38,8 +38,28 @@ def upgrade(connection: sqlite3.Connection) -> None:
     )
     connection.execute(
         """
+        CREATE TABLE IF NOT EXISTS log_sources (
+            id TEXT PRIMARY KEY,
+            path TEXT NOT NULL,
+            last_updated TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            producer_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_log_sources_expires_at ON log_sources(expires_at)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_log_sources_last_updated ON log_sources(last_updated)"
+    )
+    connection.execute(
+        """
         INSERT OR IGNORE INTO schema_versions(version, applied_at, description, direction, result)
-        VALUES (?, datetime('now'), 'observation latest-value storage', 'upgrade', 'success')
+        VALUES (?, datetime('now'), 'observability latest-value storage', 'upgrade', 'success')
         """,
         (VERSION,),
     )
@@ -47,6 +67,7 @@ def upgrade(connection: sqlite3.Connection) -> None:
 
 
 def downgrade(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP TABLE IF EXISTS log_sources")
     connection.execute("DROP TABLE IF EXISTS observations")
     connection.execute("DELETE FROM schema_versions WHERE version = ?", (VERSION,))
     connection.commit()

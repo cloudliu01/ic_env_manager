@@ -8,12 +8,16 @@ import pytest
 from sqlalchemy import create_engine
 
 from ic_env_guard.db.migrations import MIGRATIONS_DIR
+from ic_env_guard.logs.models import LogSourceInput, LogStorageError
+from ic_env_guard.logs.policy import LogPathPolicy, LogTailReader
+from ic_env_guard.logs.service import LogSourceService
 from ic_env_guard.observations.models import (
     ObservationInput,
     ObservationQuery,
     ObservationStorageError,
 )
 from ic_env_guard.observations.service import ObservationService
+from ic_env_guard.storage.log_sources import SQLiteLogSourceRepository
 from ic_env_guard.storage.observations import SQLiteObservationRepository
 
 _MIGRATION_PATH = MIGRATIONS_DIR / "0001_initial.py"
@@ -103,6 +107,11 @@ def test_observability_migration_is_additive_exact_and_idempotent(tmp_path):
     indexes = {
         row[1] for row in connection.execute("PRAGMA index_list(observations)")
     }
+    log_columns = [
+        (row[1], row[2], row[3], row[5])
+        for row in connection.execute("PRAGMA table_info(log_sources)")
+    ]
+    log_indexes = {row[1] for row in connection.execute("PRAGMA index_list(log_sources)")}
     versions = connection.execute(
         "SELECT version FROM schema_versions WHERE version = ?",
         (observability_migration.VERSION,),
@@ -129,6 +138,20 @@ def test_observability_migration_is_additive_exact_and_idempotent(tmp_path):
         "idx_observations_status_expiry",
         "idx_observations_expires_at",
     }.issubset(indexes)
+    assert log_columns == [
+        ("id", "TEXT", 0, 1),
+        ("path", "TEXT", 1, 0),
+        ("last_updated", "TEXT", 1, 0),
+        ("observed_at", "TEXT", 1, 0),
+        ("received_at", "TEXT", 1, 0),
+        ("expires_at", "TEXT", 1, 0),
+        ("producer_id", "TEXT", 1, 0),
+        ("updated_at", "TEXT", 1, 0),
+    ]
+    assert {
+        "idx_log_sources_expires_at",
+        "idx_log_sources_last_updated",
+    }.issubset(log_indexes)
     assert connection.execute(
         "SELECT name FROM sqlite_master WHERE name='existing_user_table'"
     ).fetchone()
@@ -178,6 +201,91 @@ def test_sqlite_repository_round_trip_query_cleanup_and_cas(tmp_path):
     ).items == (created,)
     assert repository.delete_expired(created.expires_at, limit=1) == 1
     assert repository.get(created.identity_key) is None
+    engine.dispose()
+
+
+@pytest.mark.integration
+def test_log_source_repository_round_trip_cas_and_metadata_only_storage(tmp_path):
+    db_path = tmp_path / "state.db"
+    connection = sqlite3.connect(db_path)
+    initial_migration.upgrade(connection)
+    observability_migration.upgrade(connection)
+    connection.close()
+    log_path = tmp_path / "run.log"
+    log_path.write_text("secret log content", encoding="utf-8")
+    engine = create_engine(f"sqlite:///{db_path}")
+    repository = SQLiteLogSourceRepository(engine)
+    policy = LogPathPolicy([tmp_path])
+    service = LogSourceService(repository, policy, LogTailReader(policy))
+    now = datetime.fromisoformat("2026-07-11T10:00:30+00:00")
+
+    created = service.upsert(
+        "innovus-run",
+        LogSourceInput.model_validate(
+            {
+                "path": str(log_path),
+                "last_updated": "2026-07-11T09:59:58Z",
+                "observed_at": "2026-07-11T10:00:00Z",
+                "ttl_seconds": 120,
+            }
+        ),
+        now=now,
+    ).record
+    updated = service.upsert(
+        "innovus-run",
+        LogSourceInput.model_validate(
+            {
+                "path": str(log_path),
+                "last_updated": "2026-07-11T10:00:08Z",
+                "observed_at": "2026-07-11T10:00:10Z",
+                "ttl_seconds": 120,
+            }
+        ),
+        now=now,
+    ).record
+
+    assert updated.observed_at > created.observed_at
+    assert repository.get("innovus-run") == updated
+    assert repository.list() == (updated,)
+    assert repository.delete_expired(updated.expires_at, 1) == 1
+    with sqlite3.connect(db_path) as raw:
+        schema = raw.execute("SELECT sql FROM sqlite_master WHERE name='log_sources'").fetchone()[0]
+        values = raw.execute("SELECT * FROM log_sources").fetchall()
+    assert "content" not in schema.lower()
+    assert all("secret log content" not in str(value) for value in values)
+    engine.dispose()
+
+
+@pytest.mark.integration
+def test_log_source_repository_rejects_non_normalized_stored_path(tmp_path):
+    db_path = tmp_path / "state.db"
+    connection = sqlite3.connect(db_path)
+    initial_migration.upgrade(connection)
+    observability_migration.upgrade(connection)
+    connection.execute(
+        """
+        INSERT INTO log_sources (
+            id, path, last_updated, observed_at, received_at, expires_at,
+            producer_id, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "run",
+            "/var/log/../secret",
+            "2026-07-11T09:59:58.000000Z",
+            "2026-07-11T10:00:00.000000Z",
+            "2026-07-11T10:00:30.000000Z",
+            "2026-07-11T10:02:00.000000Z",
+            "local",
+            "2026-07-11T10:00:30.000000Z",
+        ),
+    )
+    connection.commit()
+    connection.close()
+    engine = create_engine(f"sqlite:///{db_path}")
+
+    with pytest.raises(LogStorageError, match="log_storage_unavailable"):
+        SQLiteLogSourceRepository(engine).get("run")
     engine.dispose()
 
 
