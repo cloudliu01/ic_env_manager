@@ -38,18 +38,13 @@ def runtime_main(argv: list[str] | None = None) -> int:
             sys.stderr,
         )
 
-    import uvicorn
+    import asyncio
 
-    from ic_env_guard.main import create_app
+    from ic_env_guard.main import serve_config
 
     config_path = args.config or Path(os.environ.get("IC_ENV_GUARD_CONFIG", DEFAULT_CONFIG))
     config = load_config(config_path)
-    uvicorn.run(
-        create_app(config_path=config_path, config=config),
-        host=config.server.bind,
-        port=config.server.port,
-        proxy_headers=False,
-    )
+    asyncio.run(serve_config(config))
     return 0
 
 

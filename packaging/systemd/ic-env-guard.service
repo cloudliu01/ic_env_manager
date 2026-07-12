@@ -1,5 +1,7 @@
+# Deprecated compatibility unit. Prefer ic-env-guard@<existing-user>.service.
+# Keep the explicit User/Group: omitting them would run the Agent as root.
 [Unit]
-Description=IC Design Environment Guard Agent
+Description=DEPRECATED compatibility IC Design Environment Guard Agent
 Documentation=file:/usr/share/doc/ic-env-guard/lifecycle.md
 Wants=network-online.target
 After=network-online.target
@@ -9,6 +11,8 @@ Type=simple
 User=ic-env-guard
 Group=ic-env-guard
 WorkingDirectory=/var/lib/ic-env-guard
+RuntimeDirectory=ic-env-guard
+RuntimeDirectoryMode=0700
 EnvironmentFile=-/etc/ic-env-guard/env
 ExecStart=/usr/local/bin/ic-env-guard --config /etc/ic-env-guard/config.yaml
 ExecReload=/usr/local/bin/ic-env-guard-config validate /etc/ic-env-guard/config.yaml

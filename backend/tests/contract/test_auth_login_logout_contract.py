@@ -1,3 +1,5 @@
+from unittest.mock import AsyncMock
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -105,17 +107,27 @@ def test_login_success_and_failure_are_durably_audited_without_token(tmp_path):
     )
 
 
-def test_production_launcher_does_not_trust_proxy_headers(monkeypatch):
-    captured = {}
-
-    def fake_run(*args, **kwargs):
-        captured.update(kwargs)
-
-    monkeypatch.setattr("uvicorn.run", fake_run)
+def test_production_launcher_uses_configured_coordinated_servers(tmp_path, monkeypatch):
+    token_file = tmp_path / "token"
+    token_file.write_text("secret-token\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "mode: agent\n"
+        f"auth:\n  token_file: {token_file}\n"
+        f"state_database: {tmp_path / 'state.db'}\n",
+        encoding="utf-8",
+    )
+    launcher = AsyncMock()
+    monkeypatch.setenv("IC_ENV_GUARD_CONFIG", str(config_path))
+    monkeypatch.setattr("ic_env_guard.main.serve_config", launcher)
 
     main()
 
-    assert captured["proxy_headers"] is False
+    config = launcher.await_args.args[0]
+    assert config.mode == "agent"
+    assert config.server.port == 8765
+    assert config.ingest.port == 8766
 
 
 @pytest.mark.contract

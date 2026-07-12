@@ -1,0 +1,26 @@
+[Unit]
+Description=IC Design Environment Guard Agent (%i)
+Documentation=file:/usr/share/doc/ic-env-guard/agent-v2-operations.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=~
+RuntimeDirectory=ic-env-guard
+RuntimeDirectoryMode=0700
+EnvironmentFile=-/etc/ic-env-guard/%i.env
+ExecStart=/usr/local/bin/ic-env-guard --config /etc/ic-env-guard/%i.yaml
+ExecReload=/usr/local/bin/ic-env-guard-config validate /etc/ic-env-guard/%i.yaml
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target

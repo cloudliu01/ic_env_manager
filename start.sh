@@ -14,6 +14,7 @@ DEV_CONFIG_MODE="${IC_ENV_GUARD_MODE:-agent}"
 BACKEND_HOST="${IC_ENV_GUARD_HOST:-127.0.0.1}"
 BACKEND_PORT="${IC_ENV_GUARD_PORT:-8765}"
 AGENT_PORT="${IC_ENV_GUARD_AGENT_PORT:-8766}"
+AGENT_INGEST_PORT="${IC_ENV_GUARD_AGENT_INGEST_PORT:-8766}"
 FRONTEND_HOST="${IC_ENV_GUARD_FRONTEND_HOST:-127.0.0.1}"
 FRONTEND_PORT="${IC_ENV_GUARD_FRONTEND_PORT:-5173}"
 
@@ -40,6 +41,7 @@ Environment overrides:
   IC_ENV_GUARD_HOST              Backend host. Default: 127.0.0.1
   IC_ENV_GUARD_PORT              Backend port. Default: 8765
   IC_ENV_GUARD_AGENT_PORT        Loopback target agent port for control-plane dev. Default: 8766
+  IC_ENV_GUARD_AGENT_INGEST_PORT Agent Local Ingest port. Default: 8766 standalone, 8767 with all
   IC_ENV_GUARD_FRONTEND_HOST     Frontend host. Default: 127.0.0.1
   IC_ENV_GUARD_FRONTEND_PORT     Frontend port. Default: 5173
   SKIP_INSTALL=1                 Skip automatic pip/npm dependency installation checks.
@@ -129,6 +131,9 @@ metrics:
   enabled: true
   collect_interval_seconds: 10
 state_database: ${DEV_DIR}/state.db
+ingest:
+  bind: 127.0.0.1
+  port: ${AGENT_INGEST_PORT}
 terminal:
   idle_timeout_minutes: 60
   replay_buffer_bytes: 2097152
@@ -145,12 +150,24 @@ state_database: ${DEV_DIR}/state.db
 YAML
   fi
 
+  if [[ "${DEV_CONFIG_MODE}" == "agent" ]] && ! grep -q '^ingest:' "${CONFIG_FILE}"; then
+    cat >> "${CONFIG_FILE}" <<YAML
+ingest:
+  bind: 127.0.0.1
+  port: ${AGENT_INGEST_PORT}
+YAML
+  fi
+
   echo "Dev mode:   ${DEV_CONFIG_MODE}"
   echo "Dev token:  ${TOKEN_FILE}"
   if [[ "${DEV_CONFIG_MODE}" == "control-plane" ]]; then
     echo "Agent token: ${AGENT_TOKEN_FILE}"
   fi
   echo "Dev config: ${CONFIG_FILE}"
+  echo "Public listener: ${BACKEND_HOST}:${BACKEND_PORT}"
+  if [[ "${DEV_CONFIG_MODE}" == "agent" ]]; then
+    echo "Ingest listener: 127.0.0.1:${AGENT_INGEST_PORT}"
+  fi
 }
 
 ensure_backend_deps() {
@@ -194,22 +211,17 @@ start_backend() {
   export IC_ENV_GUARD_PORT="${BACKEND_PORT}"
 
   cd "${BACKEND_DIR}"
-  echo "Starting backend on http://${BACKEND_HOST}:${BACKEND_PORT}"
+  echo "Starting Public listener on http://${BACKEND_HOST}:${BACKEND_PORT}"
+  if [[ "${DEV_CONFIG_MODE}" == "agent" ]]; then
+    echo "Starting Local Ingest listener on http://127.0.0.1:${AGENT_INGEST_PORT}"
+  fi
   python - <<'PY'
 import os
 from pathlib import Path
 
-import uvicorn
+from ic_env_guard.systemd.cli import runtime_main
 
-from ic_env_guard.main import create_app
-
-app = create_app(config_path=Path(os.environ["IC_ENV_GUARD_CONFIG"]))
-uvicorn.run(
-    app,
-    host=os.environ.get("IC_ENV_GUARD_HOST", "127.0.0.1"),
-    port=int(os.environ.get("IC_ENV_GUARD_PORT", "8765")),
-    proxy_headers=False,
-)
+raise SystemExit(runtime_main(["--config", str(Path(os.environ["IC_ENV_GUARD_CONFIG"]))]))
 PY
 }
 
@@ -270,6 +282,9 @@ start_all() {
 
   use_mode_defaults agent
   BACKEND_PORT="${AGENT_PORT}"
+  if [[ -z "${IC_ENV_GUARD_AGENT_INGEST_PORT:-}" ]]; then
+    AGENT_INGEST_PORT=8767
+  fi
   start_backend &
   agent_pid=$!
   wait_for_backend

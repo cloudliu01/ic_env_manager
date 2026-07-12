@@ -39,11 +39,11 @@ specs/002-multi-agent-control-plane/  Multi-agent spec, architecture, contracts,
 Use [start.sh](start.sh) from the repository root for common local development workflows. The wrapper initializes the needed environment before starting the selected process.
 
 ```bash
-./start.sh agent     # activate Conda, create/validate agent-mode dev config, start FastAPI on 127.0.0.1:8765
+./start.sh agent     # Agent Public 127.0.0.1:8765 + Local Ingest 127.0.0.1:8766
 ./start.sh control-plane  # create/validate control-plane dev config, start the gateway on 127.0.0.1:8765
 ./start.sh backend   # activate Conda, create/validate dev config, start FastAPI on 127.0.0.1:8765
 ./start.sh frontend  # install npm dependencies if needed, start Vite on 127.0.0.1:5173
-./start.sh all       # start local agent, control-plane, then frontend for multi-agent dev
+./start.sh all       # Manager 8765 + Agent Public 8766 + Agent Ingest 8767 + frontend
 ./start.sh config    # create/validate the local agent-mode dev token and config only
 ./start.sh config control-plane  # create/validate the local control-plane dev token and config only
 ./start.sh help      # show wrapper options
@@ -64,6 +64,7 @@ Useful overrides:
 CONDA_ENV_NAME=venv312 ./start.sh backend
 IC_ENV_GUARD_PORT=9000 ./start.sh backend
 IC_ENV_GUARD_AGENT_PORT=8766 ./start.sh control-plane
+IC_ENV_GUARD_AGENT_INGEST_PORT=9001 ./start.sh agent
 IC_ENV_GUARD_FRONTEND_PORT=3000 ./start.sh frontend
 SKIP_INSTALL=1 ./start.sh all
 ```
@@ -127,6 +128,9 @@ server:
   bind: 127.0.0.1
   port: 8765
   remote_bind_enabled: false
+ingest:
+  bind: 127.0.0.1
+  port: 8766
 auth:
   mode: bearer_token
   token_file: /tmp/ic-env-guard-dev/token
@@ -186,18 +190,12 @@ Preferred local command:
 
 `./start.sh backend` remains available as the generic backend command and uses `IC_ENV_GUARD_MODE` or the existing config path when supplied.
 
-The current development app factory requires a bearer token file or token to be supplied. If you need to start it manually instead of using the wrapper, run:
+If you need to start it manually instead of using the wrapper, use the packaged
+launcher so Agent mode starts both listeners:
 
 ```bash
 cd backend
-python - <<'PY'
-from pathlib import Path
-import uvicorn
-from ic_env_guard.main import create_app
-
-app = create_app(token_file=Path('/tmp/ic-env-guard-dev/token'))
-uvicorn.run(app, host='127.0.0.1', port=8765)
-PY
+ic-env-guard --config /tmp/ic-env-guard-dev/agent.yaml
 ```
 
 Useful backend endpoints:
@@ -292,7 +290,8 @@ frontend/dist/
 
 Packaging artifacts are under [packaging/](packaging/):
 
-- [packaging/systemd/ic-env-guard.service](packaging/systemd/ic-env-guard.service) — systemd unit
+- [packaging/systemd/ic-env-guard@.service](packaging/systemd/ic-env-guard@.service) — recommended existing-user template unit
+- [packaging/systemd/ic-env-guard.service](packaging/systemd/ic-env-guard.service) — deprecated compatibility unit with an explicit non-root user
 - [packaging/install/install.sh](packaging/install/install.sh) — install directories, token, config, and unit
 - [packaging/install/upgrade.sh](packaging/install/upgrade.sh) — preserve config, token, and state during upgrade
 - [packaging/install/uninstall.sh](packaging/install/uninstall.sh) — stop/disable service and optionally retain state
@@ -315,6 +314,10 @@ sudo packaging/install/uninstall.sh
 ```
 
 See [docs/operations/lifecycle.md](docs/operations/lifecycle.md), [docs/operations/recovery.md](docs/operations/recovery.md), and [docs/operations/platform-validation.md](docs/operations/platform-validation.md) for full operator workflows and Linux validation commands.
+
+Agent v2 listener isolation, local producer examples, selected-user PTY/sudo
+authority, enrollment forced-command policy, and exact backup/rollback guidance
+are documented in [docs/agent-v2-operations.md](docs/agent-v2-operations.md).
 
 ## Metrics
 

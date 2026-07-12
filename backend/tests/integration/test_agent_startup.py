@@ -126,3 +126,26 @@ logs:
 
     with pytest.raises(ConfigLoadError, match="default_tail_lines"):
         load_config(config_path)
+
+
+@pytest.mark.integration
+def test_agent_rejects_public_and_ingest_port_collision(tmp_path):
+    token_file = tmp_path / "token"
+    token_file.write_text("secret-token\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"""
+mode: agent
+server:
+  port: 8765
+ingest:
+  port: 8765
+auth:
+  token_file: {token_file}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigLoadError, match="public and ingest ports must differ"):
+        load_config(config_path)

@@ -37,9 +37,19 @@ async def _cancel_tasks(*tasks: asyncio.Task[None] | None) -> None:
             raise result
 
 
+async def close_container(container: AgentContainer | ManagerContainer) -> None:
+    try:
+        container.database_engine.dispose()
+    finally:
+        if isinstance(container, ManagerContainer):
+            await container.agent_client.aclose()
+
+
 def create_lifespan(container: AgentContainer | ManagerContainer):
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        app.state.lifecycle_started = True
+        app.state.lifecycle_cleanup_complete = False
         refresh_task: asyncio.Task[None] | None = None
         availability_probe_task: asyncio.Task[None] | None = None
         observation_cleanup_task: asyncio.Task[None] | None = None
@@ -112,9 +122,8 @@ def create_lifespan(container: AgentContainer | ManagerContainer):
                     )
                 finally:
                     try:
-                        container.database_engine.dispose()
+                        await close_container(container)
                     finally:
-                        if isinstance(container, ManagerContainer):
-                            await container.agent_client.aclose()
+                        app.state.lifecycle_cleanup_complete = True
 
     return lifespan

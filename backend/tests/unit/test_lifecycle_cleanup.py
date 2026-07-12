@@ -8,7 +8,7 @@ from ic_env_guard.bootstrap.composition import (
     build_agent_container,
     build_manager_container,
 )
-from ic_env_guard.bootstrap.lifecycle import create_lifespan
+from ic_env_guard.bootstrap.lifecycle import close_container, create_lifespan
 from ic_env_guard.config.models import (
     AppConfig,
     AuthConfig,
@@ -95,4 +95,23 @@ async def test_manager_partial_startup_failure_closes_created_resources(tmp_path
     assert created[0].done()
     assert created[0].cancelled()
     dispose.assert_called_once_with()
+    close_client.assert_awaited_once_with()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_manager_client_closes_when_database_disposal_fails(tmp_path):
+    config = AppConfig(
+        mode="control-plane",
+        auth=AuthConfig(token_file=_token(tmp_path)),
+        control_plane=ControlPlaneConfig(audit_database=tmp_path / "manager.db"),
+    )
+    container = build_manager_container(config)
+    close_client = AsyncMock(wraps=container.agent_client.aclose)
+    container.database_engine.dispose = Mock(side_effect=RuntimeError("dispose failed"))
+    container.agent_client.aclose = close_client
+
+    with pytest.raises(RuntimeError, match="dispose failed"):
+        await close_container(container)
+
     close_client.assert_awaited_once_with()
