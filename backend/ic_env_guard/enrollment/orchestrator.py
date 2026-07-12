@@ -1638,7 +1638,7 @@ class EnrollmentOrchestrator:
             transport_profile_id=current.transport_profile_id,
             enrollment_method=current.enrollment_method,
             enabled=True,
-            source="manual",
+            source="discovery" if current.discovery_result_id is not None else "manual",
             revision=1,
             created_at=self._clock(),
             updated_at=self._clock(),

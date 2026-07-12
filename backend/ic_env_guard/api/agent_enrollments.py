@@ -51,6 +51,7 @@ class CreateEnrollmentRequest(BaseModel):
     display_name: str | None = Field(default=None, max_length=128)
     transport_profile_id: str = Field(min_length=1, max_length=64)
     ssh: SshRequest
+    discovery_result_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class LegacyValidateBody(BaseModel):
@@ -84,6 +85,7 @@ async def create_enrollment(
                 ssh_host=body.ssh.host,
                 ssh_port=body.ssh.port,
                 enrollment_method=EnrollmentMethod.SSH_AUTO,
+                discovery_result_id=body.discovery_result_id,
             ),
             AutoEnrollmentAuditContext(
                 actor_id=actor.actor_id,

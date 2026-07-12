@@ -382,6 +382,91 @@ class EnrollmentJournalRepository(_SQLiteRepository):
         except (SQLAlchemyError, sqlite3.Error) as exc:
             raise RegistryError("enrollment journal storage is unavailable") from exc
 
+    def create_discovery_with_capacity(
+        self,
+        job: EnrollmentJob,
+        *,
+        now: datetime,
+        max_active: int,
+        retention_seconds: int,
+    ) -> EnrollmentJob:
+        if job.discovery_result_id is None or job.replace_agent_id is not None:
+            raise RegistryInvariantError("discovery enrollment target is invalid")
+        _validate_job(job)
+        terminal = tuple(state.value for state in EnrollmentState if state.terminal)
+        terminal_placeholders = ",".join("?" for _ in terminal)
+        expirable = tuple(state.value for state in _EXPIRABLE_STATES)
+        expirable_placeholders = ",".join("?" for _ in expirable)
+        retained_after = now - timedelta(seconds=retention_seconds)
+        try:
+            with self._write() as connection:
+                connection.execute(
+                    f"UPDATE agent_enrollment_jobs SET state=?, updated_at=? "
+                    f"WHERE state IN ({expirable_placeholders}) AND expires_at<=?",
+                    (
+                        EnrollmentState.EXPIRED.value,
+                        _format_time(now),
+                        *expirable,
+                        _format_time(now),
+                    ),
+                )
+                active = connection.execute(
+                    f"SELECT COUNT(*) FROM agent_enrollment_jobs "
+                    f"WHERE state NOT IN ({terminal_placeholders})",
+                    terminal,
+                ).fetchone()[0]
+                if active >= max_active:
+                    raise RegistryConflict("agent_enrollment_capacity")
+                row = connection.execute(
+                    "SELECT r.canonical_url,r.ip,r.transport_profile_id,r.found,"
+                    "r.safe_error_code,r.linked_enrollment_id,j.state,j.completed_at "
+                    "FROM discovery_results r JOIN discovery_jobs j ON j.job_id=r.job_id "
+                    "WHERE r.result_id=?",
+                    (job.discovery_result_id,),
+                ).fetchone()
+                if (
+                    row is None
+                    or not bool(row[3])
+                    or row[4] is not None
+                    or row[5] is not None
+                    or row[6] != "completed"
+                    or _parse_time(row[7]) < retained_after
+                ):
+                    raise RegistryConflict("agent_validation_changed")
+                if job.transport_profile_id != row[2]:
+                    raise RegistryConflict("transport_profile_mismatch")
+                try:
+                    ssh_ip = ip_address(job.ssh_host or "").compressed
+                except ValueError as exc:
+                    raise RegistryConflict("agent_validation_changed") from exc
+                if job.normalized_endpoint != row[0] or ssh_ip != row[1]:
+                    raise RegistryConflict("agent_validation_changed")
+                duplicate = connection.execute(
+                    "SELECT 1 FROM agents WHERE normalized_endpoint=? LIMIT 1",
+                    (row[0],),
+                ).fetchone()
+                if duplicate is not None:
+                    raise RegistryConflict("agent_validation_changed")
+                connection.execute(
+                    f"INSERT INTO agent_enrollment_jobs ({_COLUMNS}) "
+                    f"VALUES ({','.join('?' * 39)})",
+                    self._values(job),
+                )
+                claimed = connection.execute(
+                    "UPDATE discovery_results SET linked_enrollment_id=? "
+                    "WHERE result_id=? AND linked_enrollment_id IS NULL",
+                    (job.enrollment_id, job.discovery_result_id),
+                )
+                if claimed.rowcount != 1:
+                    raise RegistryConflict("agent_validation_changed")
+            return job
+        except RegistryConflict:
+            raise
+        except sqlite3.IntegrityError as exc:
+            raise RegistryConflict("agent_validation_changed") from exc
+        except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise RegistryError("enrollment journal storage is unavailable") from exc
+
     def create_rotation_with_capacity(
         self,
         job: EnrollmentJob,

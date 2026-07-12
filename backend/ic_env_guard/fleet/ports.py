@@ -56,6 +56,15 @@ class AgentStatusRepository(Protocol):
 class EnrollmentJournalRepository(Protocol):
     def create(self, job: EnrollmentJob) -> EnrollmentJob: ...
 
+    def create_discovery_with_capacity(
+        self,
+        job: EnrollmentJob,
+        *,
+        now: datetime,
+        max_active: int,
+        retention_seconds: int,
+    ) -> EnrollmentJob: ...
+
     def get(self, enrollment_id: str) -> EnrollmentJob | None: ...
 
     def set_state(

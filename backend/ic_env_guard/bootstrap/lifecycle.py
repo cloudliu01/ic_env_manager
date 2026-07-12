@@ -70,6 +70,7 @@ def create_lifespan(container: AgentContainer | ManagerContainer):
                 if container.service_key_enrollment_adapter is not None:
                     await container.service_key_enrollment_adapter.check_available()
                 await container.enrollment_orchestrator.recover_and_cleanup()
+                await container.discovery_service.recover_and_cleanup()
                 manager_enrollment_socket = container.manager_enrollment_socket
                 if manager_enrollment_socket is not None:
                     await manager_enrollment_socket.start()
@@ -121,6 +122,7 @@ def create_lifespan(container: AgentContainer | ManagerContainer):
                 if isinstance(container, ManagerContainer):
                     if manager_enrollment_socket is not None:
                         await manager_enrollment_socket.stop()
+                    await container.discovery_service.shutdown()
                     await container.enrollment_orchestrator.shutdown()
                 if enrollment_socket_server is not None:
                     enrollment_socket_server.stop()

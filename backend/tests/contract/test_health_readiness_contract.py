@@ -2,6 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ic_env_guard.api.audit_health import AuditStorageHealth, get_audit_storage_health
+from ic_env_guard.config.models import AppConfig, AuthConfig, ControlPlaneConfig
 from ic_env_guard.main import create_app
 
 
@@ -18,6 +19,28 @@ def test_healthz_returns_liveness(client):
     response = client.get("/healthz")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+    assert response.headers["X-IC-Env-Guard-Agent"] == "2"
+
+
+@pytest.mark.contract
+def test_manager_healthz_cannot_be_fingerprinted_as_agent(tmp_path):
+    token = tmp_path / "manager.token"
+    token.write_text("manager-secret\n", encoding="utf-8")
+    token.chmod(0o600)
+    manager = TestClient(
+        create_app(
+            config=AppConfig(
+                mode="control-plane",
+                auth=AuthConfig(token_file=token),
+                control_plane=ControlPlaneConfig(
+                    audit_database=tmp_path / "manager.db"
+                ),
+            )
+        )
+    )
+    response = manager.get("/healthz")
+    assert response.status_code == 200
+    assert "X-IC-Env-Guard-Agent" not in response.headers
 
 
 @pytest.mark.contract

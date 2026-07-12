@@ -76,11 +76,13 @@ class EnrollmentJobs:
         manager_id: str,
         pending_ttl_seconds: int,
         max_active: int,
+        discovery_retention_seconds: int = 86_400,
     ) -> None:
         self.repository = repository
         self.manager_id = manager_id
         self.pending_ttl_seconds = pending_ttl_seconds
         self.max_active = max_active
+        self.discovery_retention_seconds = discovery_retention_seconds
 
     def create(
         self,
@@ -115,12 +117,21 @@ class EnrollmentJobs:
             updated_at=now,
         )
         try:
-            return self.repository.create_with_capacity(
-                job, now=now, max_active=self.max_active
-            )
+            if request.discovery_result_id is not None:
+                return self.repository.create_discovery_with_capacity(
+                    job,
+                    now=now,
+                    max_active=self.max_active,
+                    retention_seconds=self.discovery_retention_seconds,
+                )
+            return self.repository.create_with_capacity(job, now=now, max_active=self.max_active)
         except RegistryConflict as exc:
             code = str(exc)
-            if code == "agent_enrollment_capacity":
+            if code in {
+                "agent_enrollment_capacity",
+                "agent_validation_changed",
+                "transport_profile_mismatch",
+            }:
                 raise EnrollmentConflict(code) from exc
             raise EnrollmentConflict("agent_enrollment_conflict") from exc
 

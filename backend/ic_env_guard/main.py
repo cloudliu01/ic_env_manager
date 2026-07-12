@@ -52,6 +52,8 @@ from ic_env_guard.api.auth import (
 from ic_env_guard.api.auth import router as auth_router
 from ic_env_guard.api.control_plane_audit import get_control_plane_audit_repository
 from ic_env_guard.api.control_plane_audit import router as control_plane_audit_router
+from ic_env_guard.api.discovery import get_discovery_service
+from ic_env_guard.api.discovery import router as discovery_router
 from ic_env_guard.api.errors import register_error_handlers
 from ic_env_guard.api.fleet import router as fleet_router
 from ic_env_guard.api.fleet_v2 import router as fleet_v2_router
@@ -278,6 +280,11 @@ def create_app(
                 "fleet.v2",
                 "agent-registry.v2",
                 *(
+                    ("discovery.v2",)
+                    if container.discovery_service.scopes()
+                    else ()
+                ),
+                *(
                     ("trusted-lan-http.v1",)
                     if container.fleet_probe_service is not None
                     and any(
@@ -443,6 +450,11 @@ def create_app(
             raise RuntimeError("Enrollment orchestrator is not configured in Agent mode")
         return container.enrollment_orchestrator
 
+    def configured_discovery_service():
+        if not isinstance(container, ManagerContainer):
+            raise RuntimeError("Discovery service is not configured in Agent mode")
+        return container.discovery_service
+
     def configured_audit_query_repository() -> Iterator[AuditQueryRepository]:
         if audit_session_factory is None:
             raise RuntimeError("agent audit repository is not configured in control-plane mode")
@@ -486,6 +498,7 @@ def create_app(
     app.dependency_overrides[get_registry_enrollment_orchestrator] = (
         configured_enrollment_orchestrator
     )
+    app.dependency_overrides[get_discovery_service] = configured_discovery_service
     app.dependency_overrides[get_audit_query_repository] = configured_audit_query_repository
     app.dependency_overrides[get_control_plane_audit_repository] = (
         configured_control_plane_audit_repository
@@ -535,6 +548,7 @@ def create_app(
         app.include_router(agent_terminals_router)
         app.include_router(agent_terminal_ws_router)
         app.include_router(control_plane_audit_router)
+        app.include_router(discovery_router)
 
     mount_static_ui(app)
 

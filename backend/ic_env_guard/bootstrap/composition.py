@@ -31,6 +31,9 @@ from ic_env_guard.db.control_plane_migrations import run_control_plane_migration
 from ic_env_guard.db.migrations import run_migrations
 from ic_env_guard.db.services import ServiceRuntime
 from ic_env_guard.db.session import create_session_factory, create_sqlite_engine
+from ic_env_guard.discovery.audit import DiscoveryAuditOutcomeRecorder
+from ic_env_guard.discovery.fingerprint import HttpHealthFingerprinter
+from ic_env_guard.discovery.service import DiscoveryService
 from ic_env_guard.enrollment.agent_client import EnrollmentAgentClient
 from ic_env_guard.enrollment.audit import AgentEnrollmentAudit, ManagerAutoEnrollmentAudit
 from ic_env_guard.enrollment.credential_store import CredentialStore
@@ -57,6 +60,7 @@ from ic_env_guard.metrics.registry import create_registry
 from ic_env_guard.monitoring.machines import MachineRegistry
 from ic_env_guard.observations.service import ObservationService
 from ic_env_guard.services.manager import ServiceManager
+from ic_env_guard.storage.discovery import DiscoveryRepository
 from ic_env_guard.storage.enrollment_journal import EnrollmentJournalRepository
 from ic_env_guard.storage.log_sources import SQLiteLogSourceRepository
 from ic_env_guard.storage.manager_credentials import SQLiteManagerCredentialRepository
@@ -131,6 +135,8 @@ class ManagerContainer:
     fleet_probe_service: FleetProbeService | None
     enrollment_jobs: EnrollmentJobs
     enrollment_orchestrator: EnrollmentOrchestrator
+    discovery_repository: DiscoveryRepository
+    discovery_service: DiscoveryService
     ssh_enrollment_adapter: SshEnrollmentAdapter | None
     service_key_enrollment_adapter: SshEnrollmentAdapter | None
     manager_enrollment_socket: ManagerEnrollmentSocket | None
@@ -283,6 +289,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
     registry_repository = SQLiteManagerRegistryRepository(database_engine)
     status_repository = AgentStatusRepository(database_engine)
     enrollment_journal_repository = EnrollmentJournalRepository(database_engine)
+    discovery_repository = DiscoveryRepository(database_engine)
     removal_repository = AgentRemovalRepository(database_engine)
     manager_id = registry_repository.get_or_create_manager_id()
     # One ManagerContainer owns one Store/coordinator; enrollment mutations and startup cleanup
@@ -304,6 +311,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
     agent_registry = AgentRegistry(fleet_registry)
     agent_client = AgentHttpClient(legacy_credential_loader=fleet_registry.load_credential)
     metrics_registry = create_registry()
+    audit_storage_health = AuditStorageHealth()
     terminal_manager = TerminalManager()
     service_manager = ServiceManager([])
     metrics_collector = MetricsCollector(metrics_registry, terminal_manager, service_manager)
@@ -324,12 +332,17 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
     enrollment_agent_client = None
     ssh_enrollment_adapter = None
     service_key_enrollment_adapter = None
+    manager_self_addresses = {"127.0.0.1", "::1"}
+    discovery_available = True
     try:
+        manager_targets = _manager_self_targets(config.server.bind, config.server.port)
+        manager_self_addresses.update(address for address, _port in manager_targets)
         target_policy = AgentTargetPolicy(
             allowed_agent_cidrs=config.control_plane.allowed_agent_cidrs,
-            self_targets=_manager_self_targets(config.server.bind, config.server.port),
+            self_targets=manager_targets,
         )
     except RuntimeError:
+        discovery_available = False
         fleet_probe_service = None
 
         async def unavailable_probe(_agent_id: str) -> None:
@@ -390,6 +403,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         manager_id=str(manager_id),
         pending_ttl_seconds=config.enrollment.pending_ttl_seconds,
         max_active=config.enrollment.max_pending,
+        discovery_retention_seconds=config.control_plane.discovery.retention_seconds,
     )
     gateway_ticket_store = GatewayTicketStore(
         config.control_plane.max_outstanding_tickets,
@@ -410,6 +424,21 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         auto_audit=ManagerAutoEnrollmentAudit(control_plane_session_factory),
         removal_repository=removal_repository,
         terminal_usage=gateway_ticket_store,
+    )
+    discovery_service = DiscoveryService(
+        config=config.control_plane.discovery,
+        transport_profiles=config.control_plane.transport_profiles,
+        repository=discovery_repository,
+        fingerprinter=HttpHealthFingerprinter(
+            config.control_plane.transport_profiles
+        ),
+        outcome_recorder=DiscoveryAuditOutcomeRecorder(
+            control_plane_session_factory, audit_storage_health
+        ),
+        registry=registry_repository,
+        enrollment_journal=enrollment_journal_repository,
+        self_targets=manager_self_addresses,
+        available=discovery_available,
     )
     manager_enrollment_socket = (
         ManagerEnrollmentSocket(
@@ -443,7 +472,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         service_manager=service_manager,
         ticket_manager=TerminalTicketManager(),
         machine_registry=MachineRegistry(),
-        audit_storage_health=AuditStorageHealth(),
+        audit_storage_health=audit_storage_health,
         manager_id=manager_id,
         registry_repository=registry_repository,
         status_repository=status_repository,
@@ -454,6 +483,8 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         fleet_probe_service=fleet_probe_service,
         enrollment_jobs=enrollment_jobs,
         enrollment_orchestrator=enrollment_orchestrator,
+        discovery_repository=discovery_repository,
+        discovery_service=discovery_service,
         ssh_enrollment_adapter=ssh_enrollment_adapter,
         service_key_enrollment_adapter=service_key_enrollment_adapter,
         manager_enrollment_socket=manager_enrollment_socket,

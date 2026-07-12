@@ -4,7 +4,14 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, IPvAnyNetwork, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    IPvAnyNetwork,
+    field_validator,
+    model_validator,
+)
 
 from ic_env_guard.auth.token import validate_token_file_permissions
 from ic_env_guard.fleet.transport import (
@@ -188,6 +195,66 @@ class HealthCheckConfig(BaseModel):
         return self
 
 
+class DiscoveryEndpointConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    port: int = Field(ge=1, le=65535)
+    transport_profile_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+class DiscoveryScopeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    name: str = Field(min_length=1, max_length=128)
+    cidr: IPvAnyNetwork
+    endpoints: tuple[DiscoveryEndpointConfig, ...] = Field(
+        min_length=1, max_length=8
+    )
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "DiscoveryScopeConfig":
+        network = self.cidr
+        address = network.network_address
+        if (
+            not network.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_multicast
+            or address.is_unspecified
+            or address.is_reserved
+        ):
+            raise ValueError("discovery CIDR must be private non-loopback")
+        if network.num_addresses > 256:
+            raise ValueError("discovery scope supports at most 256 addresses")
+        identities = [
+            (endpoint.port, endpoint.transport_profile_id)
+            for endpoint in self.endpoints
+        ]
+        if len(identities) != len(set(identities)):
+            raise ValueError("discovery endpoints must be unique")
+        return self
+
+
+class DiscoveryConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    scopes: tuple[DiscoveryScopeConfig, ...] = ()
+    max_concurrency: int = Field(default=32, ge=1, le=32)
+    connect_timeout_ms: int = Field(default=500, ge=50, le=5_000)
+    fingerprint_timeout_seconds: float = Field(default=2, gt=0, le=10)
+    job_timeout_seconds: int = Field(default=120, ge=1, le=600)
+    retention_seconds: int = Field(default=86_400, ge=3_600, le=604_800)
+    max_targets: int = Field(default=2_048, ge=1, le=2_048)
+
+    @model_validator(mode="after")
+    def validate_scope_ids(self) -> "DiscoveryConfig":
+        scope_ids = [scope.id for scope in self.scopes]
+        if len(scope_ids) != len(set(scope_ids)):
+            raise ValueError("discovery scope IDs must be unique")
+        return self
+
+
 class LogConfig(BaseModel):
     capture: bool = True
     path: str | None = None
@@ -287,6 +354,7 @@ class ControlPlaneConfig(BaseModel):
     transport_profiles: tuple[TransportProfile, ...] = Field(
         default_factory=lambda: (SYSTEM_TLS_PROFILE,)
     )
+    discovery: DiscoveryConfig = Field(default_factory=DiscoveryConfig)
 
     @field_validator("transport_profiles", mode="before")
     @classmethod
@@ -331,6 +399,32 @@ class ControlPlaneConfig(BaseModel):
                     raise ValueError(
                         "trusted LAN HTTP CIDRs must be a subset of allowed_agent_cidrs"
                     )
+        known_profiles = set(profile_ids)
+        profiles_by_id = {profile.id: profile for profile in self.transport_profiles}
+        for scope in self.discovery.scopes:
+            if not any(
+                scope.cidr.version == allowed.version
+                and scope.cidr.subnet_of(allowed)
+                for allowed in self.allowed_agent_cidrs
+            ):
+                raise ValueError(
+                    "discovery scope CIDR must be a subset of allowed_agent_cidrs"
+                )
+            for endpoint in scope.endpoints:
+                if endpoint.transport_profile_id not in known_profiles:
+                    raise ValueError("discovery endpoint transport profile is unknown")
+                profile = profiles_by_id[endpoint.transport_profile_id]
+                if isinstance(profile, TrustedLanHttpProfile) and not any(
+                    scope.cidr.version == network.version
+                    and scope.cidr.subnet_of(network)
+                    for network in profile.allowed_cidrs
+                ):
+                    raise ValueError(
+                        "discovery scope must be covered by the HTTP profile allowlist"
+                    )
+            target_count = scope.cidr.num_addresses * len(scope.endpoints)
+            if target_count > self.discovery.max_targets:
+                raise ValueError("discovery scope exceeds max_targets")
         return self
 
 

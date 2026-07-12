@@ -4,13 +4,17 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
 from ic_env_guard.api.audit_health import AuditStorageHealth, get_audit_storage_health
+from ic_env_guard.api.runtime import RuntimeMetadata, get_runtime_metadata
 
 router = APIRouter(tags=["health"])
 
 
 @router.get("/healthz")
-def healthz() -> dict[str, str]:
-    return {"status": "ok"}
+def healthz(
+    metadata: Annotated[RuntimeMetadata, Depends(get_runtime_metadata)],
+) -> JSONResponse:
+    headers = {"X-IC-Env-Guard-Agent": "2"} if metadata.mode == "agent" else {}
+    return JSONResponse(content={"status": "ok"}, headers=headers)
 
 
 @router.get("/readyz")

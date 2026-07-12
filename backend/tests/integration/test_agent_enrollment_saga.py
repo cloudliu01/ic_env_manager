@@ -55,6 +55,13 @@ async def test_consume_verified_enrollment_atomically_creates_registry_status_an
         ),
         now=NOW,
     )
+    with container.database_engine.begin() as connection:
+        connection.exec_driver_sql(
+            "UPDATE agent_enrollment_jobs SET discovery_result_id='bound-result' "
+            "WHERE enrollment_id=?",
+            (job.enrollment_id,),
+        )
+    job = journal.get(job.enrollment_id)
     with container.credential_store.lifecycle_lease():
         reference = container.credential_store.put(b"new-manager-token")
     current = job
@@ -102,6 +109,7 @@ async def test_consume_verified_enrollment_atomically_creates_registry_status_an
     )
 
     assert record.display_name == "EDA Host 01"
+    assert record.source == "discovery"
     assert journal.get(job.enrollment_id).state is EnrollmentState.CONSUMED
     status = container.status_repository.get(record.agent_id)
     assert status is not None
