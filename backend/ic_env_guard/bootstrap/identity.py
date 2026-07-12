@@ -1,4 +1,6 @@
 import fcntl
+import hashlib
+import json
 import os
 import sqlite3
 import stat
@@ -13,8 +15,7 @@ class InstanceIdentityError(RuntimeError):
 
 
 _MARKER_KEY = "instance_identity_initialized"
-_INTENT_NAME = ".instance-identity-bootstrap"
-_INTENT_CONTENT = b"instance-identity-bootstrap-v1\n"
+_BINDING_KEY = "instance_identity_path"
 
 
 def identity_bootstrap_allowed(database: Path) -> bool:
@@ -33,19 +34,39 @@ def identity_bootstrap_allowed(database: Path) -> bool:
 
 
 class SQLiteIdentityInitialization:
-    def __init__(self, database: Path, *, bootstrap_allowed: bool) -> None:
+    def __init__(
+        self,
+        database: Path,
+        *,
+        identity_path: Path,
+        bootstrap_allowed: bool,
+    ) -> None:
         self._database = database
+        self._identity_path = str(identity_path.resolve())
         self.bootstrap_allowed = bootstrap_allowed
 
     def is_initialized(self) -> bool:
         with sqlite3.connect(self._database) as connection:
-            row = connection.execute(
+            initialized = connection.execute(
                 "SELECT value FROM agent_metadata WHERE key = ?", (_MARKER_KEY,)
             ).fetchone()
-        return row == ("initialized",)
+            binding = connection.execute(
+                "SELECT value FROM agent_metadata WHERE key = ?", (_BINDING_KEY,)
+            ).fetchone()
+        self._validate_binding(binding)
+        return initialized == ("initialized",)
 
     def mark_initialized(self) -> None:
         with sqlite3.connect(self._database) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            binding = connection.execute(
+                "SELECT value FROM agent_metadata WHERE key = ?", (_BINDING_KEY,)
+            ).fetchone()
+            self._validate_binding(binding)
+            connection.execute(
+                "INSERT OR IGNORE INTO agent_metadata(key, value) VALUES (?, ?)",
+                (_BINDING_KEY, self._identity_path),
+            )
             connection.execute(
                 "INSERT INTO agent_metadata(key, value) VALUES (?, 'initialized') "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -53,16 +74,34 @@ class SQLiteIdentityInitialization:
             )
             connection.commit()
 
+    def _validate_binding(self, binding: tuple[str] | None) -> None:
+        if binding is not None and binding != (self._identity_path,):
+            raise InstanceIdentityError(
+                "configured instance identity path does not match initialized identity"
+            )
+
 
 @contextmanager
-def _identity_lock(path: Path):
-    parent_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+def _storage_locks(*paths: Path):
+    parents = sorted({path.resolve().parent for path in paths}, key=lambda path: str(path))
+    descriptors: list[int] = []
     try:
-        fcntl.flock(parent_fd, fcntl.LOCK_EX)
-        yield parent_fd
+        for parent in parents:
+            try:
+                descriptor = os.open(
+                    parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                )
+            except OSError as exc:
+                raise InstanceIdentityError(
+                    f"identity storage directory is unavailable: {parent}"
+                ) from exc
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            descriptors.append(descriptor)
+        yield
     finally:
-        fcntl.flock(parent_fd, fcntl.LOCK_UN)
-        os.close(parent_fd)
+        for descriptor in reversed(descriptors):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
 
 
 def _read_instance_id(path: Path) -> UUID:
@@ -97,10 +136,9 @@ def load_or_create_instance_id(
     allow_create: bool,
     initialization: SQLiteIdentityInitialization | None = None,
 ) -> UUID:
-    with _identity_lock(path) as parent_fd:
+    with _storage_locks(path):
         return _load_or_create_instance_id_locked(
             path,
-            parent_fd=parent_fd,
             allow_create=allow_create,
             initialization=initialization,
         )
@@ -111,27 +149,55 @@ def initialize_instance_id(
     database: Path,
     migrate: Callable[[Path], None],
 ) -> UUID:
-    with _identity_lock(path) as parent_fd:
-        intent_path = database.with_name(_INTENT_NAME)
-        has_intent = _read_bootstrap_intent(intent_path)
+    canonical_database = database.resolve()
+    canonical_identity = path.resolve()
+    with _storage_locks(canonical_database, canonical_identity):
+        intent_path = bootstrap_intent_path(canonical_database)
+        expected_intent = _bootstrap_intent_content(
+            canonical_database, canonical_identity
+        )
+        has_intent = _read_bootstrap_intent(intent_path, expected_intent)
         bootstrap_allowed = has_intent or identity_bootstrap_allowed(database)
         if bootstrap_allowed and not has_intent:
-            _create_bootstrap_intent(intent_path)
+            _create_bootstrap_intent(intent_path, expected_intent)
         migrate(database)
         instance_id = _load_or_create_instance_id_locked(
             path,
-            parent_fd=parent_fd,
             allow_create=True,
             initialization=SQLiteIdentityInitialization(
-                database, bootstrap_allowed=bootstrap_allowed
+                database,
+                identity_path=canonical_identity,
+                bootstrap_allowed=bootstrap_allowed,
             ),
         )
         if bootstrap_allowed:
-            _remove_bootstrap_intent(intent_path)
+            _remove_bootstrap_intent(intent_path, expected_intent)
         return instance_id
 
 
-def _read_bootstrap_intent(path: Path) -> bool:
+def bootstrap_intent_path(database: Path) -> Path:
+    canonical = database.resolve()
+    digest = hashlib.sha256(os.fsencode(canonical)).hexdigest()
+    return canonical.with_name(f".instance-identity-bootstrap.{digest}")
+
+
+def _bootstrap_intent_content(database: Path, identity_path: Path) -> bytes:
+    return (
+        json.dumps(
+            {
+                "database": str(database.resolve()),
+                "identity": str(identity_path.resolve()),
+                "version": 1,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def _read_bootstrap_intent(path: Path, expected: bytes) -> bool:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
@@ -141,7 +207,7 @@ def _read_bootstrap_intent(path: Path) -> bool:
         raise InstanceIdentityError("unsafe instance identity bootstrap intent") from exc
     try:
         metadata = os.fstat(descriptor)
-        content = os.read(descriptor, len(_INTENT_CONTENT) + 1)
+        content = os.read(descriptor, len(expected) + 1)
     except OSError as exc:
         raise InstanceIdentityError("invalid instance identity bootstrap intent") from exc
     finally:
@@ -150,20 +216,31 @@ def _read_bootstrap_intent(path: Path) -> bool:
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_uid != os.geteuid()
         or stat.S_IMODE(metadata.st_mode) != 0o600
-        or content != _INTENT_CONTENT
     ):
         raise InstanceIdentityError("invalid instance identity bootstrap intent")
+    if content != expected:
+        try:
+            decoded = json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise InstanceIdentityError(
+                "invalid instance identity bootstrap intent"
+            ) from exc
+        if not isinstance(decoded, dict) or decoded.get("version") != 1:
+            raise InstanceIdentityError("invalid instance identity bootstrap intent")
+        raise InstanceIdentityError(
+            "instance identity bootstrap intent does not match database and identity path"
+        )
     return True
 
 
-def _create_bootstrap_intent(path: Path) -> None:
+def _create_bootstrap_intent(path: Path, content: bytes) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
         descriptor = os.open(temporary, flags, 0o600)
         try:
-            written = os.write(descriptor, _INTENT_CONTENT)
-            if written != len(_INTENT_CONTENT):
+            written = os.write(descriptor, content)
+            if written != len(content):
                 raise OSError("short bootstrap intent write")
             os.fsync(descriptor)
         finally:
@@ -171,7 +248,7 @@ def _create_bootstrap_intent(path: Path) -> None:
         try:
             os.link(temporary, path, follow_symlinks=False)
         except FileExistsError:
-            _read_bootstrap_intent(path)
+            _read_bootstrap_intent(path, content)
         _fsync_directory(path.parent)
     except OSError as exc:
         raise InstanceIdentityError("unable to create identity bootstrap intent") from exc
@@ -179,8 +256,8 @@ def _create_bootstrap_intent(path: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _remove_bootstrap_intent(path: Path) -> None:
-    if not _read_bootstrap_intent(path):
+def _remove_bootstrap_intent(path: Path, expected: bytes) -> None:
+    if not _read_bootstrap_intent(path, expected):
         return
     try:
         path.unlink()
@@ -200,7 +277,6 @@ def _fsync_directory(path: Path) -> None:
 def _load_or_create_instance_id_locked(
     path: Path,
     *,
-    parent_fd: int,
     allow_create: bool,
     initialization: SQLiteIdentityInitialization | None,
 ) -> UUID:
@@ -232,7 +308,7 @@ def _load_or_create_instance_id_locked(
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, path)
-            os.fsync(parent_fd)
+            _fsync_directory(path.parent)
             if initialization is not None:
                 initialization.mark_initialized()
         finally:
