@@ -329,15 +329,30 @@ def create_app(
     def configured_runtime_metadata() -> RuntimeMetadata:
         if isinstance(container, ManagerContainer):
             adapter = container.ssh_enrollment_adapter
-            if adapter is not None and adapter.healthy:
-                return RuntimeMetadata(
-                    mode=runtime_metadata.mode,
-                    capabilities=(
-                        *runtime_metadata.capabilities,
-                        "ssh-enrollment.auto.v1",
+            service_key_adapter = container.service_key_enrollment_adapter
+            return RuntimeMetadata(
+                mode=runtime_metadata.mode,
+                capabilities=(
+                    *runtime_metadata.capabilities,
+                    *(
+                        ("ssh-enrollment.auto.v1",)
+                        if adapter is not None and adapter.healthy
+                        else ()
                     ),
-                )
-            return runtime_metadata
+                    *(
+                        ("ssh-enrollment.cli.v1",)
+                        if container.manager_enrollment_socket is not None
+                        and container.manager_enrollment_socket.healthy
+                        else ()
+                    ),
+                    *(
+                        ("ssh-enrollment.service-key.v1",)
+                        if service_key_adapter is not None
+                        and service_key_adapter.healthy
+                        else ()
+                    ),
+                ),
+            )
         enrollment_socket = container.enrollment_socket_server
         if enrollment_socket is None or not enrollment_socket.healthy:
             return runtime_metadata

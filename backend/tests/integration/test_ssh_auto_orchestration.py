@@ -75,6 +75,17 @@ class AgentClient:
     def prepare(self, endpoint, _profile_id):
         raise AssertionError("auto enrollment must not resolve the Agent target again")
 
+    def prepare_cli_target(
+        self, endpoint, _profile_id, *, ssh_host, ssh_port, pinned_address
+    ):
+        assert (ssh_host, ssh_port, pinned_address) == (
+            "agent.lab.example",
+            2222,
+            "10.20.30.40",
+        )
+        assert endpoint == "http://10.20.30.40:8765"
+        return VALIDATION_TARGET
+
     async def validate_pending(self, _target, token, *, helper_instance_id):
         self.calls += 1
         assert token == TOKEN
@@ -127,7 +138,16 @@ def request():
     )
 
 
-def setup_services(tmp_path, adapter, *, audit=None, store=None):
+def setup_services(
+    tmp_path,
+    adapter,
+    *,
+    audit=None,
+    store=None,
+    clock=None,
+    service_key_adapter=None,
+    service_key_configured=False,
+):
     database = tmp_path / "manager.db"
     run_control_plane_migrations(database)
     engine = create_sqlite_engine(database)
@@ -148,9 +168,11 @@ def setup_services(tmp_path, adapter, *, audit=None, store=None):
         agent_client=client,
         registry=registry,
         ssh_adapter=adapter,
+        service_key_adapter=service_key_adapter,
+        service_key_configured=service_key_configured,
         transport_profiles=(PROFILE,),
         auto_audit=audit or Audit(),
-        clock=lambda: NOW,
+        clock=clock or (lambda: NOW),
     )
     return orchestrator, jobs, journal, credential_store, client, engine
 
@@ -618,6 +640,213 @@ async def test_http_validation_failure_keeps_recoverable_secret_and_exact_audit_
             "dispatched",
             "agent_auth_error",
         )
+    finally:
+        await orchestrator.shutdown()
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_cli_claim_nonce_publication_and_replay_are_fenced(tmp_path):
+    adapter = Adapter()
+    adapter.healthy = False
+    audit = Audit()
+    orchestrator, _jobs, journal, store, _client, engine = setup_services(
+        tmp_path, adapter, audit=audit
+    )
+    try:
+        awaiting = orchestrator.create_auto(request(), AUDIT_CONTEXT).job
+        claim = orchestrator.begin_cli_submission(
+            enrollment_id=awaiting.enrollment_id,
+            ssh_user="edaops",
+            ssh_host="agent.lab.example",
+            ssh_port=2222,
+            pinned_address="10.20.30.40",
+            context=AUDIT_CONTEXT,
+        )
+        assert claim.job.state is EnrollmentState.RUNNING
+        assert claim.job.enrollment_method is EnrollmentMethod.SSH_CLI
+        assert claim.job.recovery_owner == claim.nonce
+        payload = (
+            b'{"protocol":"manager-enrollment.v1",'
+            b'"instance_id":"33333333-3333-4333-8333-333333333333",'
+            b'"credential_id":"44444444-4444-4444-8444-444444444444",'
+            b'"token":"eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg",'
+            b'"expires_at":"2026-07-12T12:05:00Z"}'
+        )
+        completed = await orchestrator.complete_cli_submission(
+            claim,
+            helper_payload=payload,
+            input_fingerprint=claim.input_fingerprint,
+            nonce=claim.nonce,
+        )
+
+        assert completed.job.state is EnrollmentState.VERIFIED
+        assert completed.job.validated_http_address == "10.20.30.40"
+        assert completed.job.recovery_owner is None
+        assert store.read(completed.job.credential_temp_ref) == TOKEN
+        with pytest.raises(EnrollmentValidationError, match="agent_enrollment_conflict"):
+            orchestrator.begin_cli_submission(
+                enrollment_id=awaiting.enrollment_id,
+                ssh_user="edaops",
+                ssh_host="agent.lab.example",
+                ssh_port=2222,
+                pinned_address="10.20.30.40",
+                context=AUDIT_CONTEXT,
+            )
+    finally:
+        await orchestrator.shutdown()
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_cli_wrong_nonce_aborts_to_awaiting_without_storing_token(tmp_path):
+    adapter = Adapter()
+    adapter.healthy = False
+    orchestrator, _jobs, journal, store, _client, engine = setup_services(
+        tmp_path, adapter
+    )
+    try:
+        awaiting = orchestrator.create_auto(request(), AUDIT_CONTEXT).job
+        claim = orchestrator.begin_cli_submission(
+            enrollment_id=awaiting.enrollment_id,
+            ssh_user="edaops",
+            ssh_host="agent.lab.example",
+            ssh_port=2222,
+            pinned_address="10.20.30.40",
+            context=AUDIT_CONTEXT,
+        )
+        with pytest.raises(EnrollmentValidationError, match="input_changed"):
+            await orchestrator.complete_cli_submission(
+                claim,
+                helper_payload=b"must-not-be-parsed",
+                input_fingerprint=claim.input_fingerprint,
+                nonce="stale-nonce",
+            )
+
+        current = journal.get(awaiting.enrollment_id)
+        assert current.state is EnrollmentState.AWAITING_CLI
+        assert current.recovery_owner is None
+        assert not [
+            path for path in store.directory.iterdir() if not path.name.startswith(".")
+        ]
+    finally:
+        await orchestrator.shutdown()
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_cli_result_atomically_expires_before_helper_token_is_parsed(tmp_path):
+    adapter = Adapter()
+    adapter.healthy = False
+    now = [NOW]
+    orchestrator, _jobs, journal, store, _client, engine = setup_services(
+        tmp_path, adapter, clock=lambda: now[0]
+    )
+    try:
+        awaiting = orchestrator.create_auto(request(), AUDIT_CONTEXT).job
+        claim = orchestrator.begin_cli_submission(
+            enrollment_id=awaiting.enrollment_id,
+            ssh_user="edaops",
+            ssh_host="agent.lab.example",
+            ssh_port=2222,
+            pinned_address="10.20.30.40",
+            context=AUDIT_CONTEXT,
+        )
+        now[0] = awaiting.expires_at
+
+        with pytest.raises(EnrollmentValidationError, match="expired"):
+            await orchestrator.complete_cli_submission(
+                claim,
+                helper_payload=b"must-not-be-parsed",
+                input_fingerprint=claim.input_fingerprint,
+                nonce=claim.nonce,
+            )
+
+        current = journal.get(awaiting.enrollment_id)
+        assert current.state is EnrollmentState.EXPIRED
+        assert current.recovery_owner is None
+        assert not [
+            path for path in store.directory.iterdir() if not path.name.startswith(".")
+        ]
+    finally:
+        await orchestrator.shutdown()
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_cli_disconnect_abort_fences_late_result_handler(tmp_path):
+    adapter = Adapter()
+    adapter.healthy = False
+    orchestrator, _jobs, journal, store, _client, engine = setup_services(
+        tmp_path, adapter
+    )
+    try:
+        awaiting = orchestrator.create_auto(request(), AUDIT_CONTEXT).job
+        claim = orchestrator.begin_cli_submission(
+            enrollment_id=awaiting.enrollment_id,
+            ssh_user="edaops",
+            ssh_host="agent.lab.example",
+            ssh_port=2222,
+            pinned_address="10.20.30.40",
+            context=AUDIT_CONTEXT,
+        )
+        orchestrator.abort_cli_submission(claim, "cli_submission_interrupted")
+
+        with pytest.raises(EnrollmentValidationError, match="conflict"):
+            await orchestrator.complete_cli_submission(
+                claim,
+                helper_payload=b"must-not-be-parsed",
+                input_fingerprint=claim.input_fingerprint,
+                nonce=claim.nonce,
+            )
+
+        assert journal.get(awaiting.enrollment_id).state is EnrollmentState.AWAITING_CLI
+        assert not [
+            path for path in store.directory.iterdir() if not path.name.startswith(".")
+        ]
+    finally:
+        await orchestrator.shutdown()
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_configured_invalid_service_key_falls_to_cli_not_personal_auto(tmp_path):
+    personal = Adapter()
+    orchestrator, _jobs, journal, _store, _client, engine = setup_services(
+        tmp_path,
+        personal,
+        service_key_configured=True,
+        service_key_adapter=None,
+    )
+    try:
+        created = orchestrator.create_auto(request(), AUDIT_CONTEXT)
+
+        assert created.job.state is EnrollmentState.AWAITING_CLI
+        assert created.job.enrollment_method is EnrollmentMethod.SSH_CLI
+        assert personal.calls == 0
+        assert journal.get(created.job.enrollment_id).state is EnrollmentState.AWAITING_CLI
+    finally:
+        await orchestrator.shutdown()
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_valid_service_key_adapter_has_priority_over_personal_auto(tmp_path):
+    personal = Adapter()
+    service = Adapter()
+    orchestrator, _jobs, _journal, _store, _client, engine = setup_services(
+        tmp_path,
+        personal,
+        service_key_configured=True,
+        service_key_adapter=service,
+    )
+    try:
+        created = orchestrator.create_auto(request(), AUDIT_CONTEXT)
+        await orchestrator.wait_for_background()
+
+        assert created.job.enrollment_method is EnrollmentMethod.SSH_SERVICE_KEY
+        assert service.calls == 1
+        assert personal.calls == 0
     finally:
         await orchestrator.shutdown()
         engine.dispose()

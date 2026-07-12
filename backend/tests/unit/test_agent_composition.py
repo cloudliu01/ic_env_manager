@@ -22,6 +22,7 @@ from ic_env_guard.config.models import (
     ServerConfig,
     TrustedLanHttpServerConfig,
 )
+from ic_env_guard.enrollment.manager_socket import ManagerEnrollmentSocket
 from ic_env_guard.enrollment.ssh import SshEnrollmentAdapter
 from ic_env_guard.services.manager import ServiceManager
 from ic_env_guard.terminal.manager import TerminalManager
@@ -118,6 +119,25 @@ def test_build_manager_container_constructs_control_plane_dependencies(tmp_path)
 
     assert isinstance(container, ManagerContainer)
     assert container.config is config
+
+
+@pytest.mark.unit
+def test_manager_submission_socket_is_opt_in_and_composed_without_starting(tmp_path):
+    socket_dir = tmp_path / "run"
+    socket_dir.mkdir(mode=0o700)
+    config = AppConfig(
+        auth=AuthConfig(token_file=_token_file(tmp_path)),
+        mode="control-plane",
+        enrollment=EnrollmentConfig(manager_socket_path=socket_dir / "manager.sock"),
+        control_plane=ControlPlaneConfig(audit_database=tmp_path / "control-plane.db"),
+    )
+
+    container = build_manager_container(config)
+
+    assert isinstance(container.manager_enrollment_socket, ManagerEnrollmentSocket)
+    assert container.manager_enrollment_socket.path == socket_dir / "manager.sock"
+    assert not container.manager_enrollment_socket.healthy
+    container.database_engine.dispose()
     assert isinstance(container.agent_registry, AgentRegistry)
     assert isinstance(container.agent_availability, AgentAvailabilityService)
     assert isinstance(container.ssh_enrollment_adapter, SshEnrollmentAdapter)

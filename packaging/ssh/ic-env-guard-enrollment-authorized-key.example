@@ -1,0 +1,1 @@
+command="ic-env-guard agent enroll-manager",restrict,no-pty,no-agent-forwarding,no-X11-forwarding,no-port-forwarding,no-user-rc ssh-ed25519 REPLACE_WITH_SERVICE_PUBLIC_KEY ic-env-guard-enrollment

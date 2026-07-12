@@ -1,3 +1,4 @@
+import os
 import socket
 from dataclasses import dataclass
 from ipaddress import ip_address
@@ -34,8 +35,14 @@ from ic_env_guard.enrollment.agent_client import EnrollmentAgentClient
 from ic_env_guard.enrollment.audit import AgentEnrollmentAudit, ManagerAutoEnrollmentAudit
 from ic_env_guard.enrollment.credential_store import CredentialStore
 from ic_env_guard.enrollment.jobs import EnrollmentJobs
+from ic_env_guard.enrollment.manager_socket import ManagerEnrollmentSocket
 from ic_env_guard.enrollment.orchestrator import EnrollmentOrchestrator
 from ic_env_guard.enrollment.service import EnrollmentService
+from ic_env_guard.enrollment.service_key import (
+    ServiceKeyError,
+    validate_service_key_files,
+    validate_service_key_snapshot,
+)
 from ic_env_guard.enrollment.socket_server import EnrollmentSocketServer
 from ic_env_guard.enrollment.ssh import SshEnrollmentAdapter
 from ic_env_guard.fleet.importer import import_yaml_agents_once
@@ -124,6 +131,8 @@ class ManagerContainer:
     enrollment_jobs: EnrollmentJobs
     enrollment_orchestrator: EnrollmentOrchestrator
     ssh_enrollment_adapter: SshEnrollmentAdapter | None
+    service_key_enrollment_adapter: SshEnrollmentAdapter | None
+    manager_enrollment_socket: ManagerEnrollmentSocket | None
 
 
 def _service_runtime(service: ServiceConfig) -> ServiceRuntime:
@@ -312,6 +321,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
     )
     enrollment_agent_client = None
     ssh_enrollment_adapter = None
+    service_key_enrollment_adapter = None
     try:
         target_policy = AgentTargetPolicy(
             allowed_agent_cidrs=config.control_plane.allowed_agent_cidrs,
@@ -333,6 +343,28 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
             connect_timeout_seconds=config.enrollment.ssh_connect_timeout_seconds,
             total_timeout_seconds=config.enrollment.ssh_total_timeout_seconds,
         )
+        if config.enrollment.service_key_identity_file is not None:
+            try:
+                service_key = validate_service_key_files(
+                    config.enrollment.service_key_identity_file,
+                    config.enrollment.service_key_known_hosts_file,
+                )
+            except ServiceKeyError:
+                pass
+            else:
+                service_key_enrollment_adapter = SshEnrollmentAdapter(
+                    target_policy=target_policy,
+                    executable=config.enrollment.ssh_binary,
+                    connect_timeout_seconds=(
+                        config.enrollment.ssh_connect_timeout_seconds
+                    ),
+                    total_timeout_seconds=config.enrollment.ssh_total_timeout_seconds,
+                    user_known_hosts_file=service_key.known_hosts_file,
+                    identity_file=service_key.identity_file,
+                    identity_policy_validator=lambda: validate_service_key_snapshot(
+                        service_key
+                    ),
+                )
         enrollment_agent_client = EnrollmentAgentClient(
             target_policy=target_policy,
             transport_profiles=config.control_plane.transport_profiles,
@@ -366,8 +398,23 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         agent_client=enrollment_agent_client,
         registry=registry_repository,
         ssh_adapter=ssh_enrollment_adapter,
+        service_key_adapter=service_key_enrollment_adapter,
+        service_key_configured=(
+            config.enrollment.service_key_identity_file is not None
+        ),
         transport_profiles=config.control_plane.transport_profiles,
         auto_audit=ManagerAutoEnrollmentAudit(control_plane_session_factory),
+    )
+    manager_enrollment_socket = (
+        ManagerEnrollmentSocket(
+            path=config.enrollment.manager_socket_path,
+            mode=int(config.enrollment.manager_socket_mode, 8),
+            orchestrator=enrollment_orchestrator,
+            allowed_uid=os.geteuid(),
+            allowed_gid=config.enrollment.manager_socket_gid,
+        )
+        if config.enrollment.manager_socket_path is not None
+        else None
     )
     return ManagerContainer(
         config=config,
@@ -403,4 +450,6 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         enrollment_jobs=enrollment_jobs,
         enrollment_orchestrator=enrollment_orchestrator,
         ssh_enrollment_adapter=ssh_enrollment_adapter,
+        service_key_enrollment_adapter=service_key_enrollment_adapter,
+        manager_enrollment_socket=manager_enrollment_socket,
     )

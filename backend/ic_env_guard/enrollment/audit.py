@@ -47,6 +47,12 @@ class ManagerAutoEnrollmentAudit:
         self._session_factory = session_factory
 
     def record_intent(self, enrollment_id: str, context) -> int:
+        return self._record_intent(enrollment_id, context, "agent-enrollment.ssh-auto")
+
+    def record_cli_intent(self, enrollment_id: str, context) -> int:
+        return self._record_intent(enrollment_id, context, "agent-enrollment.ssh-cli")
+
+    def _record_intent(self, enrollment_id: str, context, operation: str) -> int:
         with self._session_factory() as session:
             repository = ControlPlaneAuditRepository(session)
             row = repository.record_intent(
@@ -54,7 +60,7 @@ class ManagerAutoEnrollmentAudit:
                     actor_id=context.actor_id,
                     source_addr=context.source_addr,
                     agent_id=None,
-                    operation="agent-enrollment.ssh-auto",
+                    operation=operation,
                     target=f"enrollment:{enrollment_id}",
                     correlation_id=context.correlation_id,
                 )

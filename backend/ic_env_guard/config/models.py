@@ -124,16 +124,21 @@ class LogsConfig(BaseModel):
 class EnrollmentConfig(BaseModel):
     socket_path: Path = Path("/run/ic-env-guard/agent-enrollment.sock")
     socket_mode: Literal["0600", "0660"] = "0600"
+    manager_socket_path: Path | None = None
+    manager_socket_mode: Literal["0600", "0660"] = "0600"
+    manager_socket_gid: int | None = Field(default=None, ge=0)
     pending_ttl_seconds: int = Field(default=600, ge=60, le=900)
     max_pending: int = Field(default=16, ge=1, le=128)
     ssh_binary: Path = Path("/usr/bin/ssh")
     ssh_connect_timeout_seconds: int = Field(default=10, ge=1, le=60)
     ssh_total_timeout_seconds: int = Field(default=15, ge=2, le=120)
+    service_key_identity_file: Path | None = None
+    service_key_known_hosts_file: Path | None = None
 
-    @field_validator("socket_path")
+    @field_validator("socket_path", "manager_socket_path")
     @classmethod
-    def validate_socket_path(cls, value: Path) -> Path:
-        if not value.is_absolute():
+    def validate_socket_path(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
             raise ValueError("enrollment socket path must be absolute")
         return value
 
@@ -144,10 +149,21 @@ class EnrollmentConfig(BaseModel):
             raise ValueError("ssh binary must be absolute")
         return value
 
+    @field_validator("service_key_identity_file", "service_key_known_hosts_file")
+    @classmethod
+    def validate_service_key_path(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
+            raise ValueError("service key paths must be absolute")
+        return value
+
     @model_validator(mode="after")
     def validate_ssh_timeouts(self) -> "EnrollmentConfig":
         if self.ssh_total_timeout_seconds < self.ssh_connect_timeout_seconds:
             raise ValueError("ssh total timeout must cover connect timeout")
+        if (self.service_key_identity_file is None) != (
+            self.service_key_known_hosts_file is None
+        ):
+            raise ValueError("service key identity and known_hosts must be configured together")
         return self
 
 

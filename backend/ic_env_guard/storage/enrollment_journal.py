@@ -46,6 +46,7 @@ _ALLOWED_TRANSITIONS = {
         EnrollmentState.EXPIRED,
     },
     EnrollmentState.AWAITING_CLI: {
+        EnrollmentState.RUNNING,
         EnrollmentState.CREDENTIAL_ISSUED,
         EnrollmentState.CANCELLED,
         EnrollmentState.FAILED,
@@ -434,6 +435,52 @@ class EnrollmentJournalRepository(_SQLiteRepository):
                     (
                         enrollment_id,
                         EnrollmentState.RUNNING.value,
+                        _format_time(now),
+                    ),
+                ).fetchone()
+            return _job(row) if row is not None else None
+        except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise RegistryError("enrollment journal storage is unavailable") from exc
+
+    def recheck_cli_submission(
+        self,
+        enrollment_id: str,
+        *,
+        owner: str,
+        expected_revision: int,
+        now: datetime,
+    ) -> EnrollmentJob | None:
+        """Atomically expire or fence a CLI result before its helper is parsed."""
+        try:
+            with self._write() as connection:
+                connection.execute(
+                    "UPDATE agent_enrollment_jobs SET state=?, updated_at=?, "
+                    "recovery_owner=NULL, recovery_lease_until=NULL, "
+                    "recovery_revision=recovery_revision+1 "
+                    "WHERE enrollment_id=? AND state=? AND recovery_owner=? "
+                    "AND recovery_revision=? AND expires_at<=?",
+                    (
+                        EnrollmentState.EXPIRED.value,
+                        _format_time(now),
+                        enrollment_id,
+                        EnrollmentState.RUNNING.value,
+                        owner,
+                        expected_revision,
+                        _format_time(now),
+                    ),
+                )
+                row = connection.execute(
+                    f"SELECT {_COLUMNS} FROM agent_enrollment_jobs "
+                    "WHERE enrollment_id=? AND state=? AND enrollment_method=? "
+                    "AND recovery_owner=? AND recovery_revision=? "
+                    "AND recovery_lease_until>? AND expires_at>?",
+                    (
+                        enrollment_id,
+                        EnrollmentState.RUNNING.value,
+                        EnrollmentMethod.SSH_CLI.value,
+                        owner,
+                        expected_revision,
+                        _format_time(now),
                         _format_time(now),
                     ),
                 ).fetchone()

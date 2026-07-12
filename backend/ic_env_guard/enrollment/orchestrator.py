@@ -12,11 +12,17 @@ from ic_env_guard.enrollment.agent_client import (
     EnrollmentValidationError,
 )
 from ic_env_guard.enrollment.credential_store import CredentialStore, CredentialStoreError
-from ic_env_guard.enrollment.jobs import EnrollmentJobRequest, EnrollmentJobs
+from ic_env_guard.enrollment.jobs import (
+    EnrollmentJobRequest,
+    EnrollmentJobs,
+    job_input_fingerprint,
+)
 from ic_env_guard.enrollment.ssh import (
+    EnrollmentHelperResult,
     SshEnrollmentAdapter,
     SshEnrollmentError,
     SshEnrollmentRequest,
+    parse_submitted_helper_result,
 )
 from ic_env_guard.fleet.models import (
     AgentRecord,
@@ -27,6 +33,7 @@ from ic_env_guard.fleet.models import (
     RegistryError,
     RevisionConflict,
 )
+from ic_env_guard.fleet.target_policy import ValidatedTarget
 from ic_env_guard.fleet.transport import TransportProfile
 from ic_env_guard.storage.enrollment_journal import EnrollmentJournalRepository
 
@@ -58,6 +65,15 @@ class AutoEnrollmentAuditContext:
     actor_id: str | None
     source_addr: str | None
     correlation_id: str | None
+
+
+@dataclass(frozen=True)
+class CliSubmissionClaim:
+    job: EnrollmentJob
+    target: ValidatedTarget
+    input_fingerprint: str
+    audit_event_id: Any
+    nonce: str
 
 
 @dataclass(frozen=True)
@@ -130,6 +146,8 @@ class EnrollmentOrchestrator:
         registry: Any,
         clock: Callable[[], datetime] | None = None,
         ssh_adapter: SshEnrollmentAdapter | None = None,
+        service_key_adapter: SshEnrollmentAdapter | None = None,
+        service_key_configured: bool = False,
         transport_profiles: tuple[TransportProfile, ...] = (),
         auto_audit: Any | None = None,
     ) -> None:
@@ -140,6 +158,8 @@ class EnrollmentOrchestrator:
         self.registry = registry
         self._now = clock or (lambda: datetime.now(UTC))
         self.ssh_adapter = ssh_adapter
+        self.service_key_adapter = service_key_adapter
+        self._service_key_configured = service_key_configured
         self._transport_profiles = {
             profile.id: profile for profile in transport_profiles
         }
@@ -159,14 +179,24 @@ class EnrollmentOrchestrator:
         request: EnrollmentJobRequest,
         audit_context: AutoEnrollmentAuditContext,
     ) -> EnrollmentPublicResult:
-        request = replace(request, enrollment_method=EnrollmentMethod.SSH_AUTO)
+        method = (
+            EnrollmentMethod.SSH_SERVICE_KEY
+            if self._service_key_configured
+            else EnrollmentMethod.SSH_AUTO
+        )
+        request = replace(request, enrollment_method=method)
         pending = self.jobs.create(request, now=self._now())
-        adapter = self.ssh_adapter
+        adapter = (
+            self.service_key_adapter
+            if method is EnrollmentMethod.SSH_SERVICE_KEY
+            else self.ssh_adapter
+        )
         if self._closing or adapter is None or not adapter.healthy:
             awaiting = self.journal.replace_if_state(
                 replace(
                     pending,
                     state=EnrollmentState.AWAITING_CLI,
+                    enrollment_method=EnrollmentMethod.SSH_CLI,
                     last_error_code="ssh_unavailable",
                     updated_at=self._now(),
                 ),
@@ -214,6 +244,174 @@ class EnrollmentOrchestrator:
             return EnrollmentPublicResult(
                 self._cleanup_terminal(self.jobs.cancel(enrollment_id))
             )
+
+    def begin_cli_submission(
+        self,
+        *,
+        enrollment_id: str,
+        ssh_user: str,
+        ssh_host: str,
+        ssh_port: int,
+        pinned_address: str,
+        context: AutoEnrollmentAuditContext,
+    ) -> CliSubmissionClaim:
+        if self._closing or self.agent_client is None or self._auto_audit is None:
+            raise EnrollmentValidationError(
+                "enrollment_unavailable", dispatch_state="not_dispatched"
+            )
+        try:
+            record_intent = getattr(
+                self._auto_audit, "record_cli_intent", self._auto_audit.record_intent
+            )
+            event_id = record_intent(enrollment_id, context)
+        except Exception:
+            raise EnrollmentValidationError(
+                "audit_unavailable", dispatch_state="not_dispatched"
+            ) from None
+        try:
+            job = self.jobs.get(enrollment_id, now=self._now())
+            if job.state is not EnrollmentState.AWAITING_CLI:
+                raise EnrollmentValidationError(
+                    "agent_enrollment_conflict", dispatch_state="not_dispatched"
+                )
+            if (job.ssh_user, job.ssh_host, job.ssh_port) != (
+                ssh_user,
+                ssh_host,
+                ssh_port,
+            ):
+                raise EnrollmentValidationError(
+                    "agent_enrollment_input_changed", dispatch_state="not_dispatched"
+                )
+            target = self.agent_client.prepare_cli_target(
+                job.normalized_endpoint,
+                job.transport_profile_id,
+                ssh_host=ssh_host,
+                ssh_port=ssh_port,
+                pinned_address=pinned_address,
+            )
+            nonce = str(uuid4())
+            claimed = self.journal.replace_if_state(
+                replace(
+                    job,
+                    state=EnrollmentState.RUNNING,
+                    enrollment_method=EnrollmentMethod.SSH_CLI,
+                    recovery_owner=nonce,
+                    recovery_lease_until=job.expires_at,
+                    recovery_revision=job.recovery_revision + 1,
+                    updated_at=self._now(),
+                ),
+                expected_state=EnrollmentState.AWAITING_CLI,
+            )
+            return CliSubmissionClaim(
+                job=claimed,
+                target=target,
+                input_fingerprint=job_input_fingerprint(claimed),
+                audit_event_id=event_id,
+                nonce=nonce,
+            )
+        except Exception as exc:
+            code = exc.code if isinstance(exc, EnrollmentValidationError) else "storage_unavailable"
+            self._record_auto_outcome(
+                event_id,
+                result="failure",
+                dispatch_state="not_dispatched",
+                failure_category=code,
+            )
+            raise
+
+    async def complete_cli_submission(
+        self,
+        claim: CliSubmissionClaim,
+        *,
+        helper_payload: bytes,
+        input_fingerprint: str,
+        nonce: str,
+    ) -> EnrollmentPublicResult:
+        if nonce != claim.nonce or input_fingerprint != claim.input_fingerprint:
+            self.abort_cli_submission(claim, "agent_enrollment_input_changed")
+            raise EnrollmentValidationError(
+                "agent_enrollment_input_changed", dispatch_state="not_dispatched"
+            )
+        now = self._now()
+        current = self.journal.recheck_cli_submission(
+            claim.job.enrollment_id,
+            owner=claim.nonce,
+            expected_revision=claim.job.recovery_revision,
+            now=now,
+        )
+        if current is None:
+            latest = self.journal.get(claim.job.enrollment_id)
+            code = (
+                "agent_enrollment_expired"
+                if latest is not None and latest.state is EnrollmentState.EXPIRED
+                else "agent_enrollment_conflict"
+            )
+            self._record_auto_outcome(
+                claim.audit_event_id,
+                result="failure",
+                dispatch_state="not_dispatched",
+                failure_category=code,
+            )
+            raise EnrollmentValidationError(code, dispatch_state="not_dispatched")
+        request = SshEnrollmentRequest(
+            manager_id=current.manager_id,
+            enrollment_id=current.enrollment_id,
+            base_url=current.normalized_endpoint,
+            ssh_user=current.ssh_user or "",
+            ssh_host=current.ssh_host or "",
+            ssh_port=current.ssh_port or 0,
+            expires_at=current.expires_at,
+        )
+        helper = parse_submitted_helper_result(
+            helper_payload,
+            request=request,
+            validation_target=claim.target,
+            now=now,
+        )
+        try:
+            await self._publish_cli_helper(current, helper)
+        except Exception:
+            self._record_auto_outcome(
+                claim.audit_event_id,
+                result="failure",
+                dispatch_state="dispatched",
+                failure_category="ssh_remote_command_failed",
+            )
+            raise
+        self._record_auto_outcome(
+            claim.audit_event_id, result="success", dispatch_state="dispatched"
+        )
+        return self.get(claim.job.enrollment_id)
+
+    def abort_cli_submission(self, claim: CliSubmissionClaim, code: str) -> None:
+        current = self.journal.get(claim.job.enrollment_id)
+        if (
+            current is None
+            or current.state is not EnrollmentState.RUNNING
+            or current.recovery_owner != claim.nonce
+        ):
+            return
+        try:
+            self.journal.replace_if_state(
+                replace(
+                    current,
+                    state=EnrollmentState.AWAITING_CLI,
+                    last_error_code=code,
+                    recovery_owner=None,
+                    recovery_lease_until=None,
+                    recovery_revision=current.recovery_revision + 1,
+                    updated_at=self._now(),
+                ),
+                expected_state=EnrollmentState.RUNNING,
+            )
+        except (RegistryError, RevisionConflict):
+            return
+        self._record_auto_outcome(
+            claim.audit_event_id,
+            result="failure",
+            dispatch_state="unknown",
+            failure_category=code,
+        )
 
     async def validate_legacy(
         self, request: LegacyValidationRequest, token: str
@@ -445,7 +643,11 @@ class EnrollmentOrchestrator:
         )
 
     async def _issue_and_validate_auto(self, job: EnrollmentJob) -> None:
-        adapter = self.ssh_adapter
+        adapter = (
+            self.service_key_adapter
+            if job.enrollment_method is EnrollmentMethod.SSH_SERVICE_KEY
+            else self.ssh_adapter
+        )
         if adapter is None or not job.ssh_user or not job.ssh_host or not job.ssh_port:
             raise SshEnrollmentError("ssh_unavailable")
         try:
@@ -519,6 +721,65 @@ class EnrollmentOrchestrator:
                 state=EnrollmentState.VERIFIED,
                 updated_at=self._now(),
             ),
+            expected_state=EnrollmentState.VERIFYING,
+        )
+        self._validation_cache[verified.enrollment_id] = validation
+
+    async def _publish_cli_helper(
+        self, job: EnrollmentJob, helper: EnrollmentHelperResult
+    ) -> None:
+        reference = None
+        try:
+            with self.credential_store.lifecycle_lease():
+                current = self.journal.get(job.enrollment_id)
+                if (
+                    current is None
+                    or current.state is not EnrollmentState.RUNNING
+                    or current.enrollment_method is not EnrollmentMethod.SSH_CLI
+                    or current.recovery_owner != job.recovery_owner
+                    or current.recovery_revision != job.recovery_revision
+                ):
+                    raise _AutoStateLost
+                reference = self.credential_store.put(helper.token)
+                issued = self.journal.replace_if_state(
+                    replace(
+                        current,
+                        state=EnrollmentState.CREDENTIAL_ISSUED,
+                        remote_instance_id=helper.instance_id,
+                        remote_credential_id=helper.credential_id,
+                        credential_temp_ref=reference,
+                        validated_http_address=str(
+                            helper.validation_target.pinned_address
+                        ),
+                        recovery_owner=None,
+                        recovery_lease_until=None,
+                        recovery_revision=current.recovery_revision + 1,
+                        updated_at=self._now(),
+                    ),
+                    expected_state=EnrollmentState.RUNNING,
+                    expected_recovery_owner=current.recovery_owner,
+                    expected_recovery_revision=current.recovery_revision,
+                    recovery_now=self._now(),
+                )
+        except Exception:
+            if reference is not None:
+                self.credential_store.delete_if_exists(reference)
+            raise
+        verifying = self.journal.replace_if_state(
+            replace(issued, state=EnrollmentState.VERIFYING, updated_at=self._now()),
+            expected_state=EnrollmentState.CREDENTIAL_ISSUED,
+        )
+        if self.agent_client is None:
+            raise EnrollmentValidationError(
+                "enrollment_unavailable", dispatch_state="not_dispatched"
+            )
+        validation = await self.agent_client.validate_pending(
+            helper.validation_target,
+            self.credential_store.read(verifying.credential_temp_ref),
+            helper_instance_id=helper.instance_id,
+        )
+        verified = self.journal.replace_if_state(
+            replace(verifying, state=EnrollmentState.VERIFIED, updated_at=self._now()),
             expected_state=EnrollmentState.VERIFYING,
         )
         self._validation_cache[verified.enrollment_id] = validation
@@ -846,14 +1107,28 @@ class EnrollmentOrchestrator:
 
     def _recover_auto_startup(self) -> None:
         for job in self.journal.list_non_terminal():
-            if job.enrollment_method is not EnrollmentMethod.SSH_AUTO:
+            if job.enrollment_method not in {
+                EnrollmentMethod.SSH_AUTO,
+                EnrollmentMethod.SSH_CLI,
+                EnrollmentMethod.SSH_SERVICE_KEY,
+            }:
                 continue
-            if job.state is EnrollmentState.PENDING:
-                if self.ssh_adapter is None or not self.ssh_adapter.healthy:
+            if (
+                job.enrollment_method
+                in {EnrollmentMethod.SSH_AUTO, EnrollmentMethod.SSH_SERVICE_KEY}
+                and job.state is EnrollmentState.PENDING
+            ):
+                adapter = (
+                    self.service_key_adapter
+                    if job.enrollment_method is EnrollmentMethod.SSH_SERVICE_KEY
+                    else self.ssh_adapter
+                )
+                if adapter is None or not adapter.healthy:
                     self.journal.replace_if_state(
                         replace(
                             job,
                             state=EnrollmentState.AWAITING_CLI,
+                            enrollment_method=EnrollmentMethod.SSH_CLI,
                             last_error_code="ssh_unavailable",
                             updated_at=self._now(),
                         ),
@@ -882,7 +1157,11 @@ class EnrollmentOrchestrator:
                     replace(
                         job,
                         state=EnrollmentState.AWAITING_CLI,
+                        enrollment_method=EnrollmentMethod.SSH_CLI,
                         last_error_code="ssh_interaction_required",
+                        recovery_owner=None,
+                        recovery_lease_until=None,
+                        recovery_revision=job.recovery_revision + 1,
                         updated_at=self._now(),
                     ),
                     expected_state=EnrollmentState.RUNNING,

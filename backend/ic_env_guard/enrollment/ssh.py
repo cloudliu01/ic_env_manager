@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from ic_env_guard.enrollment.service_key import ServiceKeyError
 from ic_env_guard.enrollment.ssh_config import (
     MAX_EFFECTIVE_CONFIG_BYTES,
     SshConfigError,
@@ -97,6 +98,8 @@ class SshEnrollmentAdapter:
         clock=None,
         termination_grace_seconds: float = 0.5,
         user_known_hosts_file: Path | None = None,
+        identity_file: Path | None = None,
+        identity_policy_validator: Callable[[], None] | None = None,
         executable_validator: Callable[[Path], ExecutableIdentity] | None = None,
     ) -> None:
         self._target_policy = target_policy
@@ -106,6 +109,8 @@ class SshEnrollmentAdapter:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._termination_grace_seconds = termination_grace_seconds
         self._user_known_hosts_file = user_known_hosts_file
+        self._identity_file = identity_file
+        self._identity_policy_validator = identity_policy_validator
         self._executable_validator = executable_validator or _validate_executable
         self._executable_identity: ExecutableIdentity | None = None
         self.healthy = False
@@ -113,6 +118,8 @@ class SshEnrollmentAdapter:
     async def check_available(self) -> bool:
         self.healthy = False
         try:
+            if self._identity_policy_validator is not None:
+                self._identity_policy_validator()
             self._executable_identity = self._executable_validator(self._executable)
             known_hosts_file = _validate_user_known_hosts_file(
                 self._user_known_hosts_file
@@ -130,6 +137,7 @@ class SshEnrollmentAdapter:
                 connect_timeout_seconds=self._connect_timeout_seconds,
                 batch_mode=True,
                 user_known_hosts_file=known_hosts_file,
+                identity_file=self._identity_file,
             )
             output, _stderr, returncode = await self._execute(
                 build_ssh_preflight_argv(actual),
@@ -147,13 +155,24 @@ class SshEnrollmentAdapter:
                     user="ic_env_guard_probe",
                     port=22,
                     host_key_alias="[runtime-check.invalid]:22",
-                    strict_host_key_checking="accept-new",
+                    strict_host_key_checking=(
+                        "yes" if self._identity_file is not None else "accept-new"
+                    ),
                     batch_mode=True,
                     connect_timeout_seconds=self._connect_timeout_seconds,
                     user_known_hosts_file=str(known_hosts_file),
+                    identity_file=(
+                        str(self._identity_file) if self._identity_file is not None else ""
+                    ),
                 ),
             )
-        except (OSError, SshConfigError, _StreamLimitExceeded, _ProcessTimedOut):
+        except (
+            OSError,
+            ServiceKeyError,
+            SshConfigError,
+            _StreamLimitExceeded,
+            _ProcessTimedOut,
+        ):
             self._executable_identity = None
             return False
         self.healthy = True
@@ -163,6 +182,8 @@ class SshEnrollmentAdapter:
         self, request: SshEnrollmentRequest, profile: TransportProfile
     ) -> EnrollmentHelperResult:
         try:
+            if self._identity_policy_validator is not None:
+                self._identity_policy_validator()
             identity = self._executable_validator(self._executable)
             if self._executable_identity is None:
                 self._executable_identity = identity
@@ -207,6 +228,7 @@ class SshEnrollmentAdapter:
                 connect_timeout_seconds=self._connect_timeout_seconds,
                 batch_mode=True,
                 user_known_hosts_file=known_hosts_file,
+                identity_file=self._identity_file,
             )
             preflight, _stderr, returncode = await self._execute(
                 build_ssh_preflight_argv(actual),
@@ -217,7 +239,13 @@ class SshEnrollmentAdapter:
             )
             if returncode != 0:
                 raise SshEnrollmentError("ssh_unavailable")
-            strict = "accept-new" if isinstance(profile, TrustedLanHttpProfile) else "yes"
+            strict = (
+                "yes"
+                if self._identity_file is not None
+                else "accept-new"
+                if isinstance(profile, TrustedLanHttpProfile)
+                else "yes"
+            )
             verify_effective_config(
                 preflight,
                 SshEffectiveTarget(
@@ -229,10 +257,13 @@ class SshEnrollmentAdapter:
                     batch_mode=True,
                     connect_timeout_seconds=self._connect_timeout_seconds,
                     user_known_hosts_file=str(known_hosts_file),
+                    identity_file=(
+                        str(self._identity_file) if self._identity_file is not None else ""
+                    ),
                 ),
             )
             stdin_payload = _request_payload(request)
-        except OSError:
+        except (OSError, ServiceKeyError):
             self.healthy = False
             raise SshEnrollmentError("ssh_unavailable") from None
         except (
@@ -445,6 +476,26 @@ def _parse_helper_result(
         expires_at=expires_at,
         validation_target=validation_target,
     )
+
+
+def parse_submitted_helper_result(
+    output: bytes,
+    *,
+    request: SshEnrollmentRequest,
+    validation_target: ValidatedTarget,
+    now: datetime,
+) -> EnrollmentHelperResult:
+    try:
+        return _parse_helper_result(
+            output,
+            request=request,
+            now=now,
+            validation_target=validation_target,
+        )
+    except (TypeError, ValueError):
+        raise SshEnrollmentError(
+            "ssh_remote_command_failed", dispatch_state="dispatched"
+        ) from None
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

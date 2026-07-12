@@ -1,12 +1,13 @@
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from ipaddress import ip_address
 from typing import Any
 from uuid import UUID
 
 from ic_env_guard.agents.client import AgentClientError, AgentHttpClient
 from ic_env_guard.fleet.target_policy import AgentTargetPolicy, TargetPolicyError, ValidatedTarget
-from ic_env_guard.fleet.transport import TransportProfile
+from ic_env_guard.fleet.transport import TransportProfile, TrustedLanHttpProfile
 
 _CAPABILITY = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
@@ -80,6 +81,38 @@ class EnrollmentAgentClient:
                 exc.code, dispatch_state="not_dispatched"
             ) from exc
 
+    def prepare_cli_target(
+        self,
+        endpoint: str,
+        profile_id: str,
+        *,
+        ssh_host: str,
+        ssh_port: int,
+        pinned_address: str,
+    ) -> ValidatedTarget:
+        try:
+            profile = self._profiles[profile_id]
+            http_target = self._policy.resolve(endpoint, profile)
+            scheme = "http" if isinstance(profile, TrustedLanHttpProfile) else "https"
+            url_host = f"[{ssh_host}]" if ":" in ssh_host else ssh_host
+            ssh_target = self._policy.resolve(
+                f"{scheme}://{url_host}:{ssh_port}", profile
+            )
+            pinned = ip_address(pinned_address)
+            if str(pinned) != pinned_address or pinned not in set(
+                http_target.resolved_addresses
+            ) & set(ssh_target.resolved_addresses):
+                raise TargetPolicyError(
+                    "agent_identity_mismatch", "the CLI target does not match the Agent"
+                )
+            return replace(http_target, pinned_address=pinned)
+        except KeyError as exc:
+            raise EnrollmentValidationError(
+                "transport_profile_invalid", dispatch_state="not_dispatched"
+            ) from exc
+        except (TargetPolicyError, ValueError) as exc:
+            code = exc.code if isinstance(exc, TargetPolicyError) else "target_address_forbidden"
+            raise EnrollmentValidationError(code, dispatch_state="not_dispatched") from exc
     async def validate_legacy(
         self, target: ValidatedTarget, token: bytes
     ) -> EnrollmentValidation:

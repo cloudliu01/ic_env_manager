@@ -28,6 +28,7 @@ class SshEffectiveTarget:
     batch_mode: bool
     connect_timeout_seconds: int
     user_known_hosts_file: str
+    identity_file: str = ""
 
 
 def validate_ssh_destination(*, user: str, host: str, port: int) -> tuple[str, str, int]:
@@ -56,6 +57,7 @@ def build_ssh_argv(
     connect_timeout_seconds: int,
     batch_mode: bool,
     user_known_hosts_file: Path,
+    identity_file: Path | None = None,
 ) -> tuple[str, ...]:
     user, host, port = validate_ssh_destination(user=user, host=host, port=port)
     if (
@@ -65,10 +67,21 @@ def build_ssh_argv(
         or not user_known_hosts_file.is_absolute()
         or any(ord(character) < 0x20 for character in str(user_known_hosts_file))
         or str(user_known_hosts_file).lower() in {"none", "/dev/null"}
+        or (
+            identity_file is not None
+            and (
+                not identity_file.is_absolute()
+                or any(ord(character) < 0x20 for character in str(identity_file))
+            )
+        )
         or not 1 <= connect_timeout_seconds <= 60
     ):
         raise SshConfigError("ssh_unavailable")
-    strict = "accept-new" if isinstance(profile, TrustedLanHttpProfile) else "yes"
+    strict = (
+        "yes"
+        if identity_file is not None
+        else "accept-new" if isinstance(profile, TrustedLanHttpProfile) else "yes"
+    )
     options = (
         f"Hostname={pinned_address}",
         f"User={user}",
@@ -101,6 +114,15 @@ def build_ssh_argv(
         "ConnectionAttempts=1",
         f"ConnectTimeout={connect_timeout_seconds}",
         "LogLevel=ERROR",
+        *(
+            (
+                f"IdentityFile={identity_file}",
+                "IdentityAgent=none",
+                "IdentitiesOnly=yes",
+            )
+            if identity_file is not None
+            else ()
+        ),
     )
     argv: list[str] = [str(executable), "-F", "/dev/null"]
     for option in options:
@@ -128,8 +150,12 @@ def verify_effective_config(output: bytes, expected: SshEffectiveTarget) -> None
         "numberofpasswordprompts": "0",
         "connecttimeout": str(expected.connect_timeout_seconds),
         "loglevel": "ERROR",
-        "userknownhostsfile": expected.user_known_hosts_file,
     }
+    if expected.user_known_hosts_file:
+        exact["userknownhostsfile"] = expected.user_known_hosts_file
+    if expected.identity_file:
+        exact["identityfile"] = expected.identity_file
+        exact["identityagent"] = "none"
     absent_or_none = (
         "proxycommand",
         "proxyjump",
@@ -153,6 +179,8 @@ def verify_effective_config(output: bytes, expected: SshEffectiveTarget) -> None
         "forwardx11trusted": False,
         "proxyusefdpass": False,
     }
+    if expected.identity_file:
+        booleans["identitiesonly"] = True
     for key, wanted in exact.items():
         actual = _single(values, key)
         if key == "stricthostkeychecking" and wanted == "yes":

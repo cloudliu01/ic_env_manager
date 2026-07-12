@@ -31,6 +31,7 @@ test = [
 [project.scripts]
 ic-env-guard = "ic_env_guard.systemd.cli:runtime_main"
 ic-env-guard-config = "ic_env_guard.systemd.cli:main"
+ic-env-guardctl = "ic_env_guard.systemd.cli:ctl_main"
 
 [tool.setuptools.packages.find]
 where = ["."]
