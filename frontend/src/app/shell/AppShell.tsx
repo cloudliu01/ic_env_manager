@@ -18,7 +18,13 @@ const navigation = [
   { to: '/settings/manager-access', label: 'Manager Access', capability: 'runtime.v2', icon: KeyRound },
 ];
 
-export function AppShell({ identity, terminal, children }: PropsWithChildren<{ identity: Identity; terminal: ReactNode }>) {
+const managerNavigation = [
+  { to: '/fleet', label: 'Fleet' },
+  { to: '/monitoring', label: 'Monitoring' },
+  { to: '/audit', label: 'Audit' },
+];
+
+export function AppShell({ identity, terminal, children, manager = false }: PropsWithChildren<{ identity: Identity; terminal: ReactNode; manager?: boolean }>) {
   const location = useLocation();
 
   useEffect(() => {
@@ -30,7 +36,7 @@ export function AppShell({ identity, terminal, children }: PropsWithChildren<{ i
       }
       return false;
     };
-    if (location.pathname === '/terminal') {
+    if (!manager && location.pathname === '/terminal') {
       document.querySelector<HTMLElement>('.persistent-terminal h1')?.focus();
       return;
     }
@@ -44,15 +50,19 @@ export function AppShell({ identity, terminal, children }: PropsWithChildren<{ i
     });
     observer.observe(document.getElementById('main-content') ?? document.body, { childList: true, subtree: true });
     return () => observer.disconnect();
-  }, [location.pathname]);
+  }, [location.pathname, manager]);
 
   return (
     <div className="app-frame">
       <a className="skip-link" href="#main-content">Skip to main content</a>
       <aside className="app-sidebar">
         <div className="product-lockup"><span className="product-mark" aria-hidden="true">IG</span><span>IC Env Guard</span></div>
-        <nav aria-label="Standalone navigation">
-          {navigation.map(({ to, label, capability, icon: Icon }) => {
+        <nav aria-label={manager ? 'Manager navigation' : 'Standalone navigation'}>
+          {manager ? managerNavigation.map(({ to, label }) => (
+            <NavLink key={to} to={to} className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
+              <span>{label}</span>
+            </NavLink>
+          )) : navigation.map(({ to, label, capability, icon: Icon }) => {
             const available = identity.capabilities.includes(capability);
             const reason = available ? undefined : `Unavailable: requires ${capability}`;
             return available ? (
@@ -69,15 +79,15 @@ export function AppShell({ identity, terminal, children }: PropsWithChildren<{ i
       </aside>
       <div className="app-workspace">
         <header className="identity-bar">
-          <div><span className="mode-label">Standalone Agent</span><strong>{identity.name}</strong></div>
-          <code>{identity.instance_id}</code>
+          <div><span className="mode-label">{manager ? 'Manager Console' : 'Standalone Agent'}</span><strong>{identity.name}</strong></div>
+          {manager ? null : <code>{identity.instance_id}</code>}
         </header>
         <main id="main-content" tabIndex={-1}>
-          <div hidden={location.pathname !== '/terminal'} className="persistent-terminal">
+          {!manager ? <div hidden={location.pathname !== '/terminal'} className="persistent-terminal">
             <h1 tabIndex={-1} className="sr-only">Terminal</h1>
             {terminal}
-          </div>
-          {location.pathname === '/terminal' ? null : children}
+          </div> : null}
+          {!manager && location.pathname === '/terminal' ? null : children}
         </main>
       </div>
     </div>

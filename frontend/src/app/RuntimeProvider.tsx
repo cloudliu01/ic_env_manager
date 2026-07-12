@@ -7,6 +7,10 @@ export type Runtime = {
   capabilities: string[];
 };
 
+export const runtimeKeys = {
+  current: ['runtime'] as const,
+};
+
 const RuntimeContext = createContext<Runtime | null>(null);
 
 export async function getRuntime(signal?: AbortSignal): Promise<Runtime> {
@@ -15,7 +19,7 @@ export async function getRuntime(signal?: AbortSignal): Promise<Runtime> {
 
 export function RuntimeProvider({ children }: PropsWithChildren) {
   const query = useQuery({
-    queryKey: ['runtime'],
+    queryKey: runtimeKeys.current,
     queryFn: ({ signal }) => getRuntime(signal),
     staleTime: Infinity,
     retry: false,

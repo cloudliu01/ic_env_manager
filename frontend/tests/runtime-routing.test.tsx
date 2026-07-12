@@ -170,12 +170,13 @@ describe('runtime routing', () => {
     await waitFor(() => expect(document.activeElement).toBe(heading));
   });
 
-  it('routes manager mode lazily to the compatibility fleet entry', async () => {
+  it('routes manager mode to the fleet router', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => response({ mode: 'manager', capabilities: [] })));
     render(<App />);
 
-    expect(await screen.findByText('Legacy fleet application')).toBeTruthy();
+    expect(await screen.findByRole('heading', { name: 'Fleet' })).toBeTruthy();
     expect(window.location.pathname).toBe('/fleet');
+    expect(screen.getByText('Manager Console')).toBeTruthy();
     expect(screen.queryByText('Standalone Agent')).toBeNull();
   });
 });

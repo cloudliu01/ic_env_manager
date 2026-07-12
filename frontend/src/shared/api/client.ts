@@ -44,6 +44,10 @@ export class ApiClientError extends Error {
   }
 }
 
+export function isApiClientError(error: unknown): error is ApiClientError {
+  return error instanceof ApiClientError;
+}
+
 function correlationId(): string {
   return globalThis.crypto?.randomUUID?.() ?? `web-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
