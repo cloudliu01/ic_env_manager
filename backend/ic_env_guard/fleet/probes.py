@@ -128,7 +128,14 @@ class FleetProbeService:
         now = self._clock()
         aggregate_dispatch: DispatchState = "not_dispatched"
         try:
-            safety = self._target_policy.validate_safety(captured.normalized_endpoint)
+            if self._legacy_http_marker_allowed(captured):
+                safety = self._target_policy.validate_legacy_import_http_safety(
+                    captured.normalized_endpoint
+                )
+            else:
+                safety = self._target_policy.validate_safety(
+                    captured.normalized_endpoint
+                )
             profile = self._profiles[captured.transport_profile_id]
             target = self._target_policy.resolve_validated(safety, profile)
             with self._credentials.lifecycle_lease():
@@ -356,14 +363,23 @@ class FleetProbeService:
             and record.enrollment_method is EnrollmentMethod.LEGACY_ADMIN_TOKEN
         ):
             return False
+        if self._legacy_http_marker_allowed(record):
+            return True
         scheme = urlsplit(record.normalized_endpoint).scheme
-        if record.transport_profile_id == "legacy-config-http":
-            return scheme == "http"
         if record.transport_profile_id == "legacy-disabled-no-credential":
             return False
         profile = self._profiles.get(record.transport_profile_id)
         return (isinstance(profile, VerifiedTlsProfile) and scheme == "https") or (
             isinstance(profile, TrustedLanHttpProfile) and scheme == "http"
+        )
+
+    @staticmethod
+    def _legacy_http_marker_allowed(record: AgentRecord) -> bool:
+        return (
+            record.source == "config_import"
+            and record.enrollment_method is EnrollmentMethod.LEGACY_ADMIN_TOKEN
+            and record.transport_profile_id == "legacy-config-http"
+            and urlsplit(record.normalized_endpoint).scheme == "http"
         )
 
     def _record_failure(

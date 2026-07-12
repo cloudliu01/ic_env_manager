@@ -78,10 +78,27 @@ class AgentTargetPolicy:
         return self.resolve_validated(safety, profile)
 
     def validate_safety(self, endpoint: str) -> SafetyValidatedTarget:
+        return self._validate_safety(endpoint, allow_loopback_http=False)
+
+    def validate_legacy_import_http_safety(
+        self, endpoint: str
+    ) -> SafetyValidatedTarget:
+        return self._validate_safety(endpoint, allow_loopback_http=True)
+
+    def _validate_safety(
+        self, endpoint: str, *, allow_loopback_http: bool
+    ) -> SafetyValidatedTarget:
         scheme, hostname, port = _parse_endpoint(endpoint)
+        if allow_loopback_http and scheme != "http":
+            raise TargetPolicyError(
+                "transport_profile_mismatch",
+                "the Agent URL does not match its transport profile",
+            )
         addresses = self._resolve_once(hostname, port)
         for address in addresses:
-            if _is_forbidden(address):
+            if _is_forbidden(address) and not (
+                allow_loopback_http and address.is_loopback
+            ):
                 raise TargetPolicyError(
                     "target_address_forbidden", "the Agent address is forbidden"
                 )

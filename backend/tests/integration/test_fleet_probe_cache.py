@@ -150,6 +150,9 @@ class TargetPolicy:
     def validate_safety(self, endpoint):
         return endpoint
 
+    def validate_legacy_import_http_safety(self, endpoint):
+        return endpoint
+
     def resolve_validated(self, endpoint, profile):
         self.calls.append((endpoint, profile.id))
         return object()
@@ -358,6 +361,82 @@ async def test_legacy_http_marker_cannot_bypass_safety_gate(
     ).probe("marker")
 
     assert result.status.last_error_code == expected_code
+    assert result.dispatch_state == "not_dispatched"
+    assert legacy.calls == []
+
+
+@pytest.mark.integration
+async def test_imported_legacy_http_marker_allows_non_manager_loopback(tmp_path):
+    container = _manager(tmp_path)
+    marker = _add(container, "marker", "http://127.0.0.1:9000")
+    container.registry_repository.update_if_revision(
+        replace(marker, transport_profile_id="legacy-config-http", updated_at=NOW),
+        expected_revision=1,
+    )
+    legacy = LegacyAdapter()
+    policy = AgentTargetPolicy(
+        allowed_agent_cidrs=[], self_targets=[("127.0.0.1", 8765)]
+    )
+
+    result = await _service(
+        container, Client([]), policy=policy, legacy=legacy
+    ).probe("marker")
+
+    assert result.status.connection_status == "degraded"
+    assert result.status.last_error_code == "legacy_identity_unavailable"
+    assert legacy.calls == ["marker"]
+
+
+@pytest.mark.integration
+async def test_imported_legacy_http_marker_still_blocks_exact_loopback_manager(tmp_path):
+    container = _manager(tmp_path)
+    marker = _add(container, "marker", "http://127.0.0.1:8765")
+    container.registry_repository.update_if_revision(
+        replace(marker, transport_profile_id="legacy-config-http", updated_at=NOW),
+        expected_revision=1,
+    )
+    legacy = LegacyAdapter()
+    policy = AgentTargetPolicy(
+        allowed_agent_cidrs=[], self_targets=[("127.0.0.1", 8765)]
+    )
+
+    result = await _service(
+        container, Client([]), policy=policy, legacy=legacy
+    ).probe("marker")
+
+    assert result.status.last_error_code == "target_is_manager"
+    assert result.dispatch_state == "not_dispatched"
+    assert legacy.calls == []
+
+
+@pytest.mark.integration
+async def test_manual_legacy_http_marker_gets_no_loopback_exception(tmp_path):
+    container = _manager(tmp_path)
+    marker = _add(
+        container,
+        "manual",
+        "http://127.0.0.1:9000",
+        instance_id="11111111-1111-4111-8111-111111111111",
+    )
+    container.registry_repository.update_if_revision(
+        replace(
+            marker,
+            source="manual",
+            transport_profile_id="legacy-config-http",
+            updated_at=NOW,
+        ),
+        expected_revision=1,
+    )
+    legacy = LegacyAdapter()
+    policy = AgentTargetPolicy(
+        allowed_agent_cidrs=[], self_targets=[("127.0.0.1", 8765)]
+    )
+
+    result = await _service(
+        container, Client([]), policy=policy, legacy=legacy
+    ).probe("manual")
+
+    assert result.status.last_error_code == "target_address_forbidden"
     assert result.dispatch_state == "not_dispatched"
     assert legacy.calls == []
 
