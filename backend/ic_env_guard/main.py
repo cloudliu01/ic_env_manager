@@ -528,8 +528,6 @@ def create_app(
     app.dependency_overrides[get_control_plane_audit_repository] = (
         configured_control_plane_audit_repository
     )
-    terminal_ws.get_terminal_ws_dependencies = lambda: (terminal_manager, ticket_manager)
-
     app.include_router(health_router)
     app.include_router(auth_router)
     app.include_router(runtime_router)

@@ -33,9 +33,19 @@ class EnrollmentService:
         self.max_pending = max_pending
 
     def issue_pending(
-        self, manager_id: str, enrollment_id: str, *, now: datetime | None = None
+        self,
+        manager_id: str,
+        enrollment_id: str,
+        *,
+        now: datetime | None = None,
+        expires_at: datetime | None = None,
     ) -> IssuedCredential:
         current = aware_utc(now or datetime.now(UTC), "now")
+        requested_expiry = (
+            aware_utc(expires_at, "expires_at") if expires_at is not None else None
+        )
+        if requested_expiry is not None and requested_expiry <= current:
+            raise ValueError("expires_at must be in the future")
         manager_id = canonical_uuid(manager_id, "manager_id")
         enrollment_id = valid_enrollment_id(enrollment_id)
         operation = "credential.issue"
@@ -49,7 +59,10 @@ class EnrollmentService:
             enrollment_id=enrollment_id,
             token_hash=_token_hash(token),
             state=CredentialState.PENDING,
-            pending_expires_at=current + timedelta(seconds=self.pending_ttl_seconds),
+            pending_expires_at=min(
+                current + timedelta(seconds=self.pending_ttl_seconds),
+                requested_expiry or datetime.max.replace(tzinfo=UTC),
+            ),
             created_at=current,
         )
         try:

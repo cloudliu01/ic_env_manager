@@ -155,6 +155,7 @@ async def test_issue_runs_preflight_then_fixed_helper_and_returns_secret_safe_re
         "protocol": "manager-enrollment.v1",
         "manager_id": MANAGER_ID,
         "enrollment_id": ENROLLMENT_ID,
+        "expires_at": "2026-07-12T12:10:00+00:00",
     }
     argv = json.loads(Path(f"{executable}.argv").read_text())
     assert "Hostname=10.20.30.40" in argv

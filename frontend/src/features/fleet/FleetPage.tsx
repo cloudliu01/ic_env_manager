@@ -47,6 +47,7 @@ export function FleetPage() {
     <FleetFilters filters={filters} onChange={updateFilters} />
     {fleet.isPending && showSkeleton ? <div className="fleet-skeleton" role="status" aria-live="polite">Loading fleet…</div> : null}
     {fleet.isError ? <p role="alert">Fleet data could not be loaded.</p> : null}
+    {fleet.data ? <p role="status" aria-live="polite" className="sr-only">{displayed.length} Agent{displayed.length === 1 ? '' : 's'} displayed.</p> : null}
     {fleet.data && displayed.length === 0 ? <div className="empty-state">No Agents match these filters.</div> : null}
     {fleet.data && displayed.length > 0 ? compact ? <FleetCardList agents={displayed} /> : <FleetTable agents={displayed} /> : null}
     <p><Link to="/agents/new">Add agent</Link> · <Link to="/discovery">Discover agents</Link></p>

@@ -1,7 +1,9 @@
 import asyncio
+from typing import Annotated
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 
+from ic_env_guard.api.terminals import get_terminal_manager, get_ticket_manager
 from ic_env_guard.terminal.manager import TerminalManager
 from ic_env_guard.terminal.tickets import TerminalTicketManager
 
@@ -9,10 +11,6 @@ router = APIRouter(tags=["terminal-websocket"])
 
 
 POLL_INTERVAL_SECONDS = 0.05
-
-
-def get_terminal_ws_dependencies() -> tuple[TerminalManager, TerminalTicketManager]:
-    raise RuntimeError("terminal websocket dependencies were not configured")
 
 
 async def _pump_terminal_output(
@@ -35,8 +33,12 @@ async def _pump_terminal_output(
 
 
 @router.websocket("/ws/terminals/{terminal_id}")
-async def terminal_websocket(websocket: WebSocket, terminal_id: str) -> None:
-    manager, tickets = get_terminal_ws_dependencies()
+async def terminal_websocket(
+    websocket: WebSocket,
+    terminal_id: str,
+    manager: Annotated[TerminalManager, Depends(get_terminal_manager)],
+    tickets: Annotated[TerminalTicketManager, Depends(get_ticket_manager)],
+) -> None:
     ticket = websocket.query_params.get("ticket")
     try:
         cursor = int(websocket.query_params.get("cursor", "0"))

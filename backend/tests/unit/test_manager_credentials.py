@@ -65,6 +65,28 @@ def test_pending_expiry_capacity_activation_and_idempotency(container):
 
 
 @pytest.mark.unit
+def test_pending_credential_is_capped_by_manager_job_expiry(container):
+    service = container.enrollment_service
+    requested_expiry = NOW + timedelta(seconds=45, microseconds=123456)
+
+    issued = service.issue_pending(
+        MANAGER_ID,
+        "enrollment-capped",
+        now=NOW,
+        expires_at=requested_expiry,
+    )
+
+    assert issued.credential.pending_expires_at == requested_expiry
+    with pytest.raises(ValueError, match="future"):
+        service.issue_pending(
+            MANAGER_ID,
+            "enrollment-expired",
+            now=NOW,
+            expires_at=NOW,
+        )
+
+
+@pytest.mark.unit
 def test_activation_requires_matching_pending_secret_and_identifiers(container):
     service = container.enrollment_service
     first = service.issue_pending(MANAGER_ID, "enrollment-1", now=NOW)

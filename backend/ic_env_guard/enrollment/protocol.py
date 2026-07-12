@@ -12,6 +12,8 @@ from pydantic import (
     field_validator,
 )
 
+from ic_env_guard.enrollment.models import valid_enrollment_id
+
 PROTOCOL = "manager-enrollment.v1"
 MAX_REQUEST_BYTES = 4096
 MAX_RESPONSE_BYTES = 8192
@@ -26,7 +28,8 @@ class EnrollmentRequest(BaseModel):
 
     protocol: Literal["manager-enrollment.v1"]
     manager_id: UUID
-    enrollment_id: str = Field(pattern=r"^[0-9A-HJKMNP-TV-Z]{26}$")
+    enrollment_id: str = Field(min_length=1, max_length=128)
+    expires_at: datetime | None = None
 
     @field_validator("manager_id", mode="before")
     @classmethod
@@ -40,6 +43,26 @@ class EnrollmentRequest(BaseModel):
         if value != canonical:
             raise ValueError("manager_id must be a canonical lowercase UUID")
         return value
+
+    @field_validator("enrollment_id")
+    @classmethod
+    def safe_enrollment_id(cls, value: str) -> str:
+        return valid_enrollment_id(value)
+
+    @field_validator("expires_at")
+    @classmethod
+    def timezone_aware_request_expiry(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("expires_at must be timezone-aware")
+        return value.astimezone(UTC)
+
+    @field_serializer("expires_at")
+    def serialize_request_expiry(self, value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        return value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 class EnrollmentResponse(BaseModel):

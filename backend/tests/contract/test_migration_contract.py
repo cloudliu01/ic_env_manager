@@ -164,7 +164,7 @@ def test_discovery_migration_downgrade_is_forward_only(tmp_path):
     finally:
         connection.close()
 
-    assert version == 11
+    assert version == 12
     assert {"discovery_jobs", "discovery_results"} <= tables
 
 
@@ -252,7 +252,7 @@ def test_discovery_dispatch_downgrade_is_forward_only_without_mutation(tmp_path)
     try:
         with pytest.raises(sqlite3.NotSupportedError, match="forward-only"):
             migration.downgrade(connection)
-        assert connection.execute("PRAGMA user_version").fetchone() == (11,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (12,)
         assert connection.execute(
             "SELECT * FROM schema_versions ORDER BY version"
         ).fetchall() == before
@@ -293,7 +293,7 @@ def test_fleet_registry_migration_has_exact_control_plane_tables(tmp_path):
                     "old_normalized_endpoint", "old_transport_profile_id",
                     "old_instance_id", "old_registry_revision",
                     "old_enrollment_method", "old_source", "old_enabled",
-                    "old_display_name",
+                    "old_display_name", "replace_agent_tombstone",
                 ),
                 "agent_removal_jobs": (
                     "removal_id", "agent_id", "captured_revision", "credential_ref",
@@ -507,7 +507,7 @@ def test_legacy_manual_migration_preserves_rows_indexes_fks_and_checks(tmp_path)
             item[2] == "agents" and item[6] == "CASCADE"
             for item in connection.execute("PRAGMA foreign_key_list(agent_status)")
         )
-        assert connection.execute("PRAGMA user_version").fetchone() == (11,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (12,)
         status_indexes = {
             row[1] for row in connection.execute("PRAGMA index_list(agent_status)")
         }
@@ -842,7 +842,7 @@ def test_validated_address_migration_preserves_legal_pending_ssh_row(tmp_path):
     run_control_plane_migrations(db_path)
     connection = sqlite3.connect(db_path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone() == (11,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (12,)
         assert connection.execute(
             "SELECT validated_http_address FROM agent_enrollment_jobs"
         ).fetchone() == (None,)
@@ -899,7 +899,7 @@ def test_validated_address_downgrade_is_forward_only_without_mutation(tmp_path):
     try:
         with pytest.raises(sqlite3.NotSupportedError):
             migration.downgrade(connection)
-        assert connection.execute("PRAGMA user_version").fetchone() == (11,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (12,)
         assert connection.execute(
             "SELECT * FROM schema_versions ORDER BY version"
         ).fetchall() == before
@@ -925,7 +925,7 @@ def test_cli_resume_migration_adds_peer_bound_durable_claim_fields(tmp_path):
             "cli_pinned_address",
             "cli_accept_receipt",
         } <= columns
-        assert connection.execute("PRAGMA user_version").fetchone() == (11,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (12,)
     finally:
         connection.close()
 
@@ -965,6 +965,7 @@ def test_cli_resume_migration_expires_legacy_unbound_running_cli_claim(tmp_path)
     finally:
         connection.close()
 
+
     run_control_plane_migrations(db_path)
 
     connection = sqlite3.connect(db_path)
@@ -973,5 +974,27 @@ def test_cli_resume_migration_expires_legacy_unbound_running_cli_claim(tmp_path)
             "SELECT state, last_error_code, cli_resume_nonce, cli_accept_receipt "
             "FROM agent_enrollment_jobs"
         ).fetchone() == ("expired", "cli_resume_unavailable", None, None)
+    finally:
+        connection.close()
+
+
+@pytest.mark.contract
+def test_rotation_tombstone_migration_is_idempotent_and_forward_only(tmp_path):
+    db_path = tmp_path / "control-plane.db"
+    run_control_plane_migrations(db_path)
+    run_control_plane_migrations(db_path)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(agent_enrollment_jobs)")
+        }
+        assert "replace_agent_tombstone" in columns
+        assert connection.execute("PRAGMA user_version").fetchone() == (12,)
+        migration = _load_migration(
+            CONTROL_PLANE_MIGRATIONS / "0012_rotation_agent_tombstone.py"
+        )
+        with pytest.raises(sqlite3.NotSupportedError, match="forward-only"):
+            migration.downgrade(connection)
     finally:
         connection.close()

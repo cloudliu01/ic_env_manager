@@ -437,6 +437,7 @@ def _request_payload(request: SshEnrollmentRequest) -> bytes:
             "protocol": _PROTOCOL,
             "manager_id": request.manager_id,
             "enrollment_id": request.enrollment_id,
+            "expires_at": request.expires_at.isoformat(),
         },
         sort_keys=True,
         separators=(",", ":"),

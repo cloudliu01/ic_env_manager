@@ -31,6 +31,11 @@ def test_enrollment_request_is_exact_and_bounded():
     with pytest.raises(EnrollmentProtocolError, match="invalid enrollment request"):
         parse_request(b"not-json")
 
+    manager_generated = parse_request(
+        REQUEST.replace(b"01J2W4ABCDEFGHJKMNPQRSTVWX", b"b20522dc-13d4-4250-acd7-85e604b3e1c1")
+    )
+    assert manager_generated.enrollment_id == "b20522dc-13d4-4250-acd7-85e604b3e1c1"
+
 
 @pytest.mark.contract
 @pytest.mark.parametrize(
@@ -39,7 +44,9 @@ def test_enrollment_request_is_exact_and_bounded():
         {"protocol": "manager-enrollment.v2"},
         {"extra": True},
         {"manager_id": "2B576727-4F36-4F08-B90B-E8CBE98EBC80"},
-        {"enrollment_id": "not-a-ulid"},
+        {"enrollment_id": "../manager-secret"},
+        {"enrollment_id": "line\nbreak"},
+        {"enrollment_id": "x" * 129},
     ],
 )
 def test_enrollment_request_rejects_protocol_extensions(payload):

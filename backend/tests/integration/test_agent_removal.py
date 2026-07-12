@@ -268,6 +268,58 @@ async def test_online_remove_revokes_before_registry_and_local_credential_delete
 
 
 @pytest.mark.integration
+def test_registry_delete_never_detaches_a_nonterminal_rotation(tmp_path):
+    token_file = tmp_path / "manager.token"
+    token_file.write_text("manager-secret\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    app = create_app(
+        config=AppConfig(
+            mode="control-plane",
+            auth=AuthConfig(token_file=token_file),
+            control_plane=ControlPlaneConfig(audit_database=tmp_path / "manager.db"),
+        )
+    )
+    container = app.state.container
+    with container.credential_store.lifecycle_lease():
+        reference = container.credential_store.put(b"remove-token")
+    record = AgentRecord(
+        agent_id="alpha",
+        instance_id="33333333-3333-4333-8333-333333333333",
+        display_name="Alpha",
+        normalized_endpoint="https://10.0.0.11:8765",
+        credential_ref=reference,
+        remote_credential_id="44444444-4444-4444-8444-444444444444",
+        transport_profile_id="system-tls",
+        enrollment_method=EnrollmentMethod.SSH_AUTO,
+        enabled=True,
+        source="manual",
+        revision=2,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    container.registry_repository.create(record)
+    rotation = container.enrollment_orchestrator.start_rotation(
+        "alpha", ssh_user="edaops", ssh_host="10.0.0.11", ssh_port=22
+    ).job
+
+    with pytest.raises(RegistryConflict, match="agent_mutation_in_progress"):
+        container.registry_repository.delete_if_revision_and_credential(
+            "alpha",
+            expected_revision=record.revision,
+            expected_credential_ref=reference,
+        )
+
+    assert container.registry_repository.get("alpha") == record
+    with container.database_engine.connect() as connection:
+        row = connection.exec_driver_sql(
+            "SELECT replace_agent_id, replace_agent_tombstone "
+            "FROM agent_enrollment_jobs WHERE enrollment_id=?",
+            (rotation.enrollment_id,),
+        ).one()
+    assert tuple(row) == ("alpha", None)
+
+
+@pytest.mark.integration
 async def test_startup_finalizes_remove_intent_crash_before_journal_create(tmp_path):
     token_file = tmp_path / "manager.token"
     token_file.write_text("manager-secret\n", encoding="utf-8")

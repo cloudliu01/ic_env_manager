@@ -565,6 +565,22 @@ class ManagerRegistryRepository(_SQLiteRepository):
                     owner_enrollment_id=owner_enrollment_id,
                     owner_removal_id=owner_removal_id,
                 )
+                terminal_states = ("consumed", "cancelled", "failed", "expired")
+                placeholders = ",".join("?" for _ in terminal_states)
+                active_rotation = connection.execute(
+                    "SELECT 1 FROM agent_enrollment_jobs WHERE replace_agent_id=? "
+                    f"AND state NOT IN ({placeholders}) LIMIT 1",
+                    (agent_id, *terminal_states),
+                ).fetchone()
+                if active_rotation is not None:
+                    raise RegistryConflict("agent_mutation_in_progress")
+                connection.execute(
+                    "UPDATE agent_enrollment_jobs "
+                    "SET replace_agent_tombstone=replace_agent_id, replace_agent_id=NULL "
+                    "WHERE replace_agent_id=? "
+                    f"AND state IN ({placeholders})",
+                    (agent_id, *terminal_states),
+                )
                 cursor = connection.execute(
                     "DELETE FROM agents WHERE agent_id=? AND revision=? AND credential_ref=?",
                     (agent_id, expected_revision, expected_credential_ref),
