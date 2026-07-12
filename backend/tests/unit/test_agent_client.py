@@ -3,6 +3,8 @@ import pytest
 
 from ic_env_guard.agents.client import AgentClientError, AgentHttpClient
 from ic_env_guard.config.models import AgentConfig, AgentTlsConfig
+from ic_env_guard.fleet.target_policy import AgentTargetPolicy
+from ic_env_guard.fleet.transport import VerifiedTlsProfile
 
 
 def _agent(tmp_path):
@@ -15,6 +17,13 @@ def _agent(tmp_path):
         base_url="https://lab-01.example",
         token_file=token_file,
     )
+
+
+def _validated_target():
+    return AgentTargetPolicy(
+        allowed_agent_cidrs=["10.20.30.0/24"],
+        resolver=lambda _host, _port: ("10.20.30.10",),
+    ).resolve("https://agent.example:8765", VerifiedTlsProfile(id="system-tls"))
 
 
 @pytest.mark.unit
@@ -132,3 +141,47 @@ async def test_agent_client_applies_per_agent_ca_bundle(tmp_path, monkeypatch):
     assert captured["follow_redirects"] is False
     assert captured["trust_env"] is False
     assert captured["closed"] is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_validated_target_uses_credential_bytes_and_never_forwards_browser_auth():
+    observed_headers = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        observed_headers.update(request.headers)
+        return httpx.Response(200, json={"ok": True})
+
+    client = AgentHttpClient(transport=httpx.MockTransport(handler))
+    await client.request(
+        _validated_target(),
+        b"manager-token",
+        "GET",
+        "/api/v2/summary",
+        incoming_headers={"Authorization": "Bearer browser", "Cookie": "session=secret"},
+    )
+    await client.aclose()
+
+    assert observed_headers["authorization"] == "Bearer manager-token"
+    assert "cookie" not in observed_headers
+    with pytest.raises(TypeError, match="credential bytes"):
+        await AgentHttpClient().request(
+            _validated_target(), "plaintext-string", "GET", "/api/v2/summary"  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_validated_target_maps_upstream_auth_failure_to_stable_category():
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"detail": "do not expose this"})
+
+    client = AgentHttpClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(AgentClientError) as error:
+        await client.request(
+            _validated_target(), b"manager-token", "GET", "/api/v2/summary"
+        )
+    await client.aclose()
+
+    assert error.value.category == "agent_auth_error"
+    assert "expose" not in error.value.message

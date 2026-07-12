@@ -7,6 +7,11 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, Field, IPvAnyNetwork, field_validator, model_validator
 
 from ic_env_guard.auth.token import validate_token_file_permissions
+from ic_env_guard.fleet.transport import (
+    SYSTEM_TLS_PROFILE,
+    TransportProfile,
+    TrustedLanHttpProfile,
+)
 
 
 class TrustedLanHttpServerConfig(BaseModel):
@@ -223,6 +228,20 @@ class ControlPlaneConfig(BaseModel):
     credential_directory: Path | None = None
     max_active_terminal_proxies: int = Field(default=64, ge=1)
     max_outstanding_tickets: int = Field(default=128, ge=1)
+    allowed_agent_cidrs: list[IPvAnyNetwork] = Field(default_factory=list)
+    transport_profiles: list[TransportProfile] = Field(default_factory=lambda: [SYSTEM_TLS_PROFILE])
+
+    @field_validator("transport_profiles", mode="before")
+    @classmethod
+    def add_system_tls_profile(cls, value):
+        profiles = list(value or [])
+        if any(
+            (item.get("id") if isinstance(item, dict) else getattr(item, "id", None))
+            == "system-tls"
+            for item in profiles
+        ):
+            raise ValueError("system-tls is a reserved transport profile ID")
+        return [SYSTEM_TLS_PROFILE, *profiles]
 
     @field_validator("audit_database", "credential_directory")
     @classmethod
@@ -234,6 +253,24 @@ class ControlPlaneConfig(BaseModel):
     @property
     def effective_credential_directory(self) -> Path:
         return self.credential_directory or self.audit_database.with_name("agent-credentials")
+
+    @model_validator(mode="after")
+    def validate_transport_profiles(self) -> "ControlPlaneConfig":
+        profile_ids = [profile.id for profile in self.transport_profiles]
+        if len(profile_ids) != len(set(profile_ids)):
+            raise ValueError("transport profile IDs must be unique")
+        for profile in self.transport_profiles:
+            if not isinstance(profile, TrustedLanHttpProfile):
+                continue
+            for network in profile.allowed_cidrs:
+                if not any(
+                    network.version == allowed.version and network.subnet_of(allowed)
+                    for allowed in self.allowed_agent_cidrs
+                ):
+                    raise ValueError(
+                        "trusted LAN HTTP CIDRs must be a subset of allowed_agent_cidrs"
+                    )
+        return self
 
 
 def _is_loopback_url(value: str) -> bool:
