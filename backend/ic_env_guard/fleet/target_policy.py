@@ -43,6 +43,18 @@ class ValidatedTarget:
         return f"{self.scheme}://{_url_host(str(self.pinned_address))}:{self.port}"
 
 
+@dataclass(frozen=True)
+class SafetyValidatedTarget:
+    normalized_endpoint: str
+    scheme: str
+    hostname: str
+    port: int
+    resolved_addresses: tuple[IPAddress, ...]
+    pinned_address: IPAddress
+    host_header: str
+    sni_hostname: str | None
+
+
 class AgentTargetPolicy:
     def __init__(
         self,
@@ -62,31 +74,25 @@ class AgentTargetPolicy:
         )
 
     def resolve(self, endpoint: str, profile: TransportProfile) -> ValidatedTarget:
+        safety = self.validate_safety(endpoint)
+        return self.resolve_validated(safety, profile)
+
+    def validate_safety(self, endpoint: str) -> SafetyValidatedTarget:
         scheme, hostname, port = _parse_endpoint(endpoint)
-        _validate_profile_scheme(scheme, profile)
         addresses = self._resolve_once(hostname, port)
-        profile_allowlist = (
-            tuple(profile.allowed_cidrs)
-            if isinstance(profile, TrustedLanHttpProfile)
-            else self._allowed
-        )
         for address in addresses:
             if _is_forbidden(address):
                 raise TargetPolicyError(
                     "target_address_forbidden", "the Agent address is forbidden"
                 )
-            if not _in_any(address, self._allowed) or not _in_any(address, profile_allowlist):
-                raise TargetPolicyError(
-                    "target_address_not_allowed", "the Agent address is outside the allowlist"
-                )
+        for address in addresses:
             if (address, port) in self._self_targets:
                 raise TargetPolicyError("target_is_manager", "the Agent target is the Manager")
-
         pinned = addresses[0]
         explicit_host = _url_host(hostname)
         default_port = 443 if scheme == "https" else 80
         host_header = explicit_host if port == default_port else f"{explicit_host}:{port}"
-        return ValidatedTarget(
+        return SafetyValidatedTarget(
             normalized_endpoint=f"{scheme}://{explicit_host}:{port}",
             scheme=scheme,
             hostname=hostname,
@@ -95,6 +101,31 @@ class AgentTargetPolicy:
             pinned_address=pinned,
             host_header=host_header,
             sni_hostname=hostname if scheme == "https" else None,
+        )
+
+    def resolve_validated(
+        self, safety: SafetyValidatedTarget, profile: TransportProfile
+    ) -> ValidatedTarget:
+        _validate_profile_scheme(safety.scheme, profile)
+        profile_allowlist = (
+            tuple(profile.allowed_cidrs)
+            if isinstance(profile, TrustedLanHttpProfile)
+            else self._allowed
+        )
+        for address in safety.resolved_addresses:
+            if not _in_any(address, self._allowed) or not _in_any(address, profile_allowlist):
+                raise TargetPolicyError(
+                    "target_address_not_allowed", "the Agent address is outside the allowlist"
+                )
+        return ValidatedTarget(
+            normalized_endpoint=safety.normalized_endpoint,
+            scheme=safety.scheme,
+            hostname=safety.hostname,
+            port=safety.port,
+            resolved_addresses=safety.resolved_addresses,
+            pinned_address=safety.pinned_address,
+            host_header=safety.host_header,
+            sni_hostname=safety.sni_hostname,
             warning_code=(
                 "trusted_lan_http_unencrypted"
                 if isinstance(profile, TrustedLanHttpProfile)

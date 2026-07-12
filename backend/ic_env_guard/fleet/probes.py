@@ -126,9 +126,11 @@ class FleetProbeService:
                 "agent_identity_conflict", dispatch_state="not_dispatched"
             )
         now = self._clock()
+        aggregate_dispatch: DispatchState = "not_dispatched"
         try:
+            safety = self._target_policy.validate_safety(captured.normalized_endpoint)
             profile = self._profiles[captured.transport_profile_id]
-            target = self._target_policy.resolve(captured.normalized_endpoint, profile)
+            target = self._target_policy.resolve_validated(safety, profile)
             with self._credentials.lifecycle_lease():
                 credential = self._credentials.read(captured.credential_ref)
             capabilities_response = await self._client.request(
@@ -137,8 +139,13 @@ class FleetProbeService:
                 "GET",
                 "/api/v2/capabilities",
             )
+            aggregate_dispatch = _combine_dispatch(
+                aggregate_dispatch, "dispatched"
+            )
             if getattr(capabilities_response, "status_code", 200) in {404, 405}:
-                fallback = await self._legacy_fallback(captured, now)
+                fallback = await self._legacy_fallback(
+                    captured, now, aggregate_dispatch
+                )
                 if fallback is not None:
                     return fallback
             capabilities = _parse_capabilities(capabilities_response.json())
@@ -148,9 +155,12 @@ class FleetProbeService:
                 "GET",
                 "/api/v2/summary",
             )
+            aggregate_dispatch = _combine_dispatch(
+                aggregate_dispatch, "dispatched"
+            )
             summary = _parse_summary(summary_response.json())
         except KeyError:
-            fallback = await self._legacy_fallback(captured, now)
+            fallback = await self._legacy_fallback(captured, now, aggregate_dispatch)
             if fallback is not None:
                 return fallback
             return ProbeResult(
@@ -174,7 +184,9 @@ class FleetProbeService:
                 exc.code == "target_address_not_allowed"
                 and self._allow_import_without_dynamic_allowlist
             ):
-                fallback = await self._legacy_fallback(captured, now)
+                fallback = await self._legacy_fallback(
+                    captured, now, aggregate_dispatch
+                )
                 if fallback is not None:
                     return fallback
             return ProbeResult(
@@ -184,14 +196,17 @@ class FleetProbeService:
                 "not_dispatched",
             )
         except AgentClientError as exc:
+            aggregate_dispatch = _combine_dispatch(
+                aggregate_dispatch, _dispatch_state(exc.dispatch_state)
+            )
             return ProbeResult(
                 self._record_failure(
                     captured,
                     now,
                     exc.category,
-                    dispatch_state=_dispatch_state(exc.dispatch_state),
+                    dispatch_state=aggregate_dispatch,
                 ),
-                _dispatch_state(exc.dispatch_state),
+                aggregate_dispatch,
             )
         except (TypeError, ValueError):
             return ProbeResult(
@@ -199,9 +214,9 @@ class FleetProbeService:
                     captured,
                     now,
                     "agent_protocol_error",
-                    dispatch_state="dispatched",
+                    dispatch_state=aggregate_dispatch,
                 ),
-                "dispatched",
+                aggregate_dispatch,
             )
 
         async with self._identity_lock:
@@ -278,10 +293,13 @@ class FleetProbeService:
             ):
                 raise AgentProbeError("agent_target_changed", dispatch_state="dispatched")
             self._published[agent_id] = status
-            return ProbeResult(status, "dispatched")
+            return ProbeResult(status, aggregate_dispatch)
 
     async def _legacy_fallback(
-        self, captured: AgentRecord, now: datetime
+        self,
+        captured: AgentRecord,
+        now: datetime,
+        prior_dispatch: DispatchState,
     ) -> ProbeResult | None:
         if (
             self._legacy_availability is None
@@ -289,6 +307,9 @@ class FleetProbeService:
         ):
             return None
         observation = await self._legacy_availability.probe_legacy(captured.agent_id)
+        aggregate_dispatch = _combine_dispatch(
+            prior_dispatch, _dispatch_state(observation.dispatch_state)
+        )
         successful = observation.status in {"ready", "degraded"}
         try:
             if successful:
@@ -324,10 +345,10 @@ class FleetProbeService:
         if not self._statuses.update_if_target_revision(status, captured.revision):
             raise AgentProbeError(
                 "agent_target_changed",
-                dispatch_state=_dispatch_state(observation.dispatch_state),
+                dispatch_state=aggregate_dispatch,
             )
         self._published[captured.agent_id] = status
-        return ProbeResult(status, _dispatch_state(observation.dispatch_state))
+        return ProbeResult(status, aggregate_dispatch)
 
     def _legacy_fallback_allowed(self, record: AgentRecord) -> bool:
         if not (
@@ -512,3 +533,8 @@ def _dispatch_state(value: str) -> DispatchState:
     if value in {"not_dispatched", "unknown", "dispatched"}:
         return cast(DispatchState, value)
     return "unknown"
+
+
+def _combine_dispatch(left: DispatchState, right: DispatchState) -> DispatchState:
+    priority = {"not_dispatched": 0, "unknown": 1, "dispatched": 2}
+    return left if priority[left] >= priority[right] else right

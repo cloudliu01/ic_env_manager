@@ -355,12 +355,26 @@ class AgentStatusRepository(_SQLiteRepository):
         serialized = tuple(self._serialize(item) for item in observations)
         try:
             with self._write() as connection:
-                for observation in observations:
+                for observation, values in zip(observations, serialized, strict=True):
                     current = connection.execute(
                         "SELECT revision FROM agents WHERE agent_id = ?",
                         (observation.agent_id,),
                     ).fetchone()
                     if current is None or current[0] != observation.target_revision:
+                        return False
+                    existing = connection.execute(
+                        "SELECT target_revision, observed_at, updated_at "
+                        "FROM agent_status WHERE agent_id = ?",
+                        (observation.agent_id,),
+                    ).fetchone()
+                    if (
+                        existing is not None
+                        and existing[0] == observation.target_revision
+                        and (
+                            _stored_time_is_later(existing[1], values[4])
+                            or _stored_time_is_later(existing[2], values[11])
+                        )
+                    ):
                         return False
                 for values in serialized:
                     self._upsert(connection, values)
@@ -437,3 +451,11 @@ class AgentStatusRepository(_SQLiteRepository):
             last_error_code=row[10],
             updated_at=_parse_time(row[11]),
         )
+
+
+def _stored_time_is_later(stored: str | None, candidate: str | None) -> bool:
+    if stored is None:
+        return False
+    if candidate is None:
+        return True
+    return _parse_time(stored) > _parse_time(candidate)

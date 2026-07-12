@@ -113,6 +113,20 @@ def test_policy_requires_at_least_one_exact_manager_self_target():
 
 
 @pytest.mark.unit
+def test_manager_self_target_wins_over_empty_allowlist():
+    policy = AgentTargetPolicy(
+        allowed_agent_cidrs=[],
+        self_targets=[("10.20.30.1", 8765)],
+        resolver=lambda _host, _port: ["10.20.30.1"],
+    )
+
+    with pytest.raises(TargetPolicyError) as blocked:
+        policy.resolve("https://manager.internal:8765", VERIFIED_TLS)
+
+    assert blocked.value.code == "target_is_manager"
+
+
+@pytest.mark.unit
 def test_ipv6_target_is_bracketed_and_host_header_preserves_effective_port():
     target = _policy(("fd20:30::10",)).resolve("https://[fd20:30::10]:9443", VERIFIED_TLS)
     assert target.normalized_endpoint == "https://[fd20:30::10]:9443"

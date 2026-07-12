@@ -13,7 +13,7 @@ from ic_env_guard.bootstrap.composition import _manager_self_targets
 from ic_env_guard.config.models import AgentConfig, AppConfig, AuthConfig, ControlPlaneConfig
 from ic_env_guard.fleet.models import AgentRecord, AgentStatus, EnrollmentMethod
 from ic_env_guard.fleet.probes import AgentProbeError, FleetProbeService
-from ic_env_guard.fleet.target_policy import TargetPolicyError
+from ic_env_guard.fleet.target_policy import AgentTargetPolicy, TargetPolicyError
 from ic_env_guard.main import create_app
 
 NOW = datetime(2026, 7, 12, 10, 0, tzinfo=UTC)
@@ -147,7 +147,10 @@ class TargetPolicy:
     def __init__(self):
         self.calls = []
 
-    def resolve(self, endpoint, profile):
+    def validate_safety(self, endpoint):
+        return endpoint
+
+    def resolve_validated(self, endpoint, profile):
         self.calls.append((endpoint, profile.id))
         return object()
 
@@ -225,6 +228,7 @@ def _service(
     legacy=None,
     max_parallel=2,
     allow_import_without_dynamic_allowlist=True,
+    clock=lambda: NOW,
 ):
     return FleetProbeService(
         registry_repository=container.registry_repository,
@@ -236,7 +240,7 @@ def _service(
         stale_after_seconds=30,
         max_parallel_probes=max_parallel,
         probe_jitter_seconds=0,
-        clock=lambda: NOW,
+        clock=clock,
         legacy_availability=legacy,
         allow_import_without_dynamic_allowlist=allow_import_without_dynamic_allowlist,
     )
@@ -268,7 +272,10 @@ class LegacyAdapter:
 
 
 class RejectingPolicy:
-    def resolve(self, _endpoint, _profile):
+    def validate_safety(self, endpoint):
+        return endpoint
+
+    def resolve_validated(self, _endpoint, _profile):
         raise TargetPolicyError("target_address_not_allowed", "not allowed")
 
 
@@ -324,6 +331,35 @@ async def test_imported_legacy_http_marker_and_v2_not_found_use_narrow_fallback(
     assert marker_result.status.connection_status == "degraded"
     assert not_found_result.status.connection_status == "degraded"
     assert legacy.calls == ["marker", "not-found"]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("endpoint", "expected_code", "self_targets"),
+    [
+        ("http://10.0.0.11:8765", "target_is_manager", [("10.0.0.11", 8765)]),
+        ("http://169.254.169.254:80", "target_address_forbidden", [("10.0.0.1", 8765)]),
+    ],
+)
+async def test_legacy_http_marker_cannot_bypass_safety_gate(
+    tmp_path, endpoint, expected_code, self_targets
+):
+    container = _manager(tmp_path)
+    marker = _add(container, "marker", endpoint)
+    container.registry_repository.update_if_revision(
+        replace(marker, transport_profile_id="legacy-config-http", updated_at=NOW),
+        expected_revision=1,
+    )
+    legacy = LegacyAdapter()
+    policy = AgentTargetPolicy(allowed_agent_cidrs=[], self_targets=self_targets)
+
+    result = await _service(
+        container, Client([]), policy=policy, legacy=legacy
+    ).probe("marker")
+
+    assert result.status.last_error_code == expected_code
+    assert result.dispatch_state == "not_dispatched"
+    assert legacy.calls == []
 
 
 @pytest.mark.integration
@@ -403,8 +439,11 @@ async def test_import_fallback_never_bypasses_forbidden_or_manager_self_target(t
             def __init__(self, error_code):
                 self.error_code = error_code
 
-            def resolve(self, _endpoint, _profile):
+            def validate_safety(self, _endpoint):
                 raise TargetPolicyError(self.error_code, "forbidden")
+
+            def resolve_validated(self, _endpoint, _profile):
+                raise AssertionError("forbidden target must not reach profile validation")
 
         result = await _service(
             container,
@@ -787,6 +826,118 @@ def test_bulk_status_revision_mismatch_writes_no_members(tmp_path):
     assert not container.status_repository.update_many_if_target_revisions(statuses)
     assert container.status_repository.get("alpha") is None
     assert container.status_repository.get("beta") is None
+
+
+@pytest.mark.integration
+def test_bulk_status_stale_member_rolls_back_every_candidate(tmp_path):
+    container = _manager(tmp_path)
+    _add(container, "alpha", "https://10.0.0.11:8765")
+    _add(container, "beta", "https://10.0.0.12:8765")
+
+    def status(agent_id, observed_at, code):
+        return AgentStatus(
+            agent_id=agent_id,
+            target_revision=1,
+            connection_status="unavailable",
+            workload_status="unknown",
+            observed_at=observed_at,
+            stale_after=observed_at + timedelta(seconds=30),
+            api_version=None,
+            agent_version=None,
+            capabilities=(),
+            summary={},
+            last_error_code=code,
+            updated_at=observed_at,
+        )
+
+    newer = NOW + timedelta(seconds=10)
+    container.status_repository.update_many_if_target_revisions(
+        (status("alpha", NOW, "old-alpha"), status("beta", newer, "new-beta"))
+    )
+
+    assert not container.status_repository.update_many_if_target_revisions(
+        (
+            status("alpha", newer + timedelta(seconds=1), "candidate-alpha"),
+            status("beta", NOW, "stale-beta"),
+        )
+    )
+    assert container.status_repository.get("alpha").last_error_code == "old-alpha"
+    assert container.status_repository.get("beta").last_error_code == "new-beta"
+
+
+@pytest.mark.integration
+async def test_cross_process_older_probe_cannot_overwrite_newer_status(tmp_path):
+    container = _manager(tmp_path)
+    identity = "11111111-1111-4111-8111-111111111111"
+    _add(
+        container,
+        "alpha",
+        "https://10.0.0.11:8765",
+        instance_id=identity,
+    )
+    old_capabilities = _capabilities(identity)
+    old_capabilities["agent_version"] = "0.1.0"
+    new_capabilities = _capabilities(identity)
+    new_capabilities["agent_version"] = "0.2.0"
+
+    class SlowClient(Client):
+        def __init__(self):
+            super().__init__([old_capabilities, _summary(critical=1)])
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def request(self, *args, **kwargs):
+            if not self.calls:
+                self.entered.set()
+                await self.release.wait()
+            return await super().request(*args, **kwargs)
+
+    slow_client = SlowClient()
+    old_service = _service(container, slow_client, clock=lambda: NOW)
+    new_service = _service(
+        container,
+        Client([new_capabilities, _summary()]),
+        clock=lambda: NOW + timedelta(seconds=10),
+    )
+    old_probe = asyncio.create_task(old_service.probe("alpha"))
+    await slow_client.entered.wait()
+    await new_service.probe("alpha")
+    slow_client.release.set()
+
+    with pytest.raises(AgentProbeError):
+        await old_probe
+    final = container.status_repository.get("alpha")
+    assert final.agent_version == "0.2.0"
+    assert final.workload_status == "healthy"
+
+
+@pytest.mark.integration
+async def test_dispatch_state_aggregates_v2_dispatch_before_local_legacy_failure(tmp_path):
+    container = _manager(tmp_path)
+    _add(container, "legacy", "https://10.0.0.11:8765")
+
+    class NotFound(Response):
+        status_code = 404
+
+    class LocalLegacyFailure(LegacyAdapter):
+        async def probe_legacy(self, agent_id):
+            self.calls.append(agent_id)
+            return AgentObservation(
+                status="unavailable",
+                observed_at=NOW,
+                stale_after=NOW + timedelta(seconds=30),
+                last_error="agent_auth_error",
+                dispatch_state="not_dispatched",
+            )
+
+    result = await _service(
+        container,
+        Client([NotFound({"error": "not found"})]),
+        legacy=LocalLegacyFailure(),
+    ).probe("legacy")
+
+    assert result.status.last_error_code == "agent_auth_error"
+    assert result.dispatch_state == "dispatched"
 
 
 @pytest.mark.integration
