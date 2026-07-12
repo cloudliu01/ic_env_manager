@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { agentSupports, useActiveAgent } from '../agents/AgentStateContext';
+import { supportsCapability, useStandaloneAgent } from '../agents/StandaloneAgentContext';
 import { closeTerminal, createTerminal, listTerminals, TerminalSession } from '../api/terminals';
 import { TerminalPane } from '../terminal/TerminalPane';
 
@@ -16,11 +16,11 @@ type TerminalAgentState = {
 const emptyAgentState: TerminalAgentState = { terminals: [], activeId: null, error: null };
 
 export function TerminalPage({ visible = true }: TerminalPageProps) {
-  const { activeAgent, activeAgentId } = useActiveAgent();
-  const supportsTerminals = agentSupports(activeAgent, 'terminals.v1');
+  const { agentId, capabilities } = useStandaloneAgent();
+  const supportsTerminals = supportsCapability(capabilities, 'terminals.v1');
   const [terminalStateByAgent, setTerminalStateByAgent] = useState<Record<string, TerminalAgentState>>({});
   const requestGeneration = useRef(0);
-  const activeState = activeAgentId ? terminalStateByAgent[activeAgentId] ?? emptyAgentState : emptyAgentState;
+  const activeState = terminalStateByAgent[agentId] ?? emptyAgentState;
   const { terminals, activeId, error } = activeState;
 
   function updateAgentState(agentId: string, updater: (current: TerminalAgentState) => TerminalAgentState) {
@@ -30,10 +30,10 @@ export function TerminalPage({ visible = true }: TerminalPageProps) {
     }));
   }
 
-  async function refresh(agentId = activeAgentId, signal?: AbortSignal) {
+  async function refresh(signal?: AbortSignal) {
     const generation = requestGeneration.current + 1;
     requestGeneration.current = generation;
-    if (!agentId || !supportsTerminals) {
+    if (!supportsTerminals) {
       return;
     }
 
@@ -57,48 +57,45 @@ export function TerminalPage({ visible = true }: TerminalPageProps) {
 
   useEffect(() => {
     const controller = new AbortController();
-    void refresh(activeAgentId, controller.signal);
+    void refresh(controller.signal);
     return () => controller.abort();
-  }, [activeAgentId]);
+  }, [agentId, supportsTerminals]);
 
   async function openTerminal() {
-    if (!activeAgentId || !supportsTerminals) {
+    if (!supportsTerminals) {
       return;
     }
-    updateAgentState(activeAgentId, (current) => ({ ...current, error: null }));
+    updateAgentState(agentId, (current) => ({ ...current, error: null }));
     try {
-      const terminal = await createTerminal(activeAgentId, `Terminal ${terminals.length + 1}`);
-      updateAgentState(activeAgentId, (current) => ({
+      const terminal = await createTerminal(agentId, `Terminal ${terminals.length + 1}`);
+      updateAgentState(agentId, (current) => ({
         terminals: [...current.terminals, terminal],
         activeId: terminal.id,
         error: null,
       }));
     } catch (err) {
-      updateAgentState(activeAgentId, (current) => ({ ...current, error: (err as Error).message }));
+      updateAgentState(agentId, (current) => ({ ...current, error: (err as Error).message }));
     }
   }
 
   async function closeActiveTerminal() {
-    if (!activeAgentId || !activeId || !supportsTerminals) {
+    if (!activeId || !supportsTerminals) {
       return;
     }
-    updateAgentState(activeAgentId, (current) => ({ ...current, error: null }));
+    updateAgentState(agentId, (current) => ({ ...current, error: null }));
     try {
-      const closed = await closeTerminal(activeAgentId, activeId);
-      updateAgentState(activeAgentId, (current) => ({
+      const closed = await closeTerminal(agentId, activeId);
+      updateAgentState(agentId, (current) => ({
         ...current,
         terminals: current.terminals.map((item) => (item.id === closed.id ? closed : item)),
       }));
     } catch (err) {
-      updateAgentState(activeAgentId, (current) => ({ ...current, error: (err as Error).message }));
+      updateAgentState(agentId, (current) => ({ ...current, error: (err as Error).message }));
     }
   }
 
   function selectTerminal(id: string) {
-    if (!activeAgentId) {
-      return;
-    }
-    updateAgentState(activeAgentId, (current) => ({ ...current, activeId: id }));
+    updateAgentState(agentId, (current) => ({ ...current, activeId: id }));
   }
 
   const active = terminals.find((terminal) => terminal.id === activeId) ?? null;
@@ -111,11 +108,11 @@ export function TerminalPage({ visible = true }: TerminalPageProps) {
           <p>Interactive shell sessions are attached through single-use websocket tickets.</p>
         </div>
         <div className="terminal-actions">
-          <button type="button" onClick={openTerminal} disabled={!activeAgentId || !supportsTerminals}>New terminal</button>
-          <button type="button" onClick={closeActiveTerminal} disabled={!activeAgentId || !supportsTerminals || !active || active.status !== 'running'}>
+          <button type="button" onClick={openTerminal} disabled={!supportsTerminals}>New terminal</button>
+          <button type="button" onClick={closeActiveTerminal} disabled={!supportsTerminals || !active || active.status !== 'running'}>
             Close terminal
           </button>
-          <button type="button" onClick={() => void refresh()} disabled={!activeAgentId || !supportsTerminals}>Refresh</button>
+          <button type="button" onClick={() => void refresh()} disabled={!supportsTerminals}>Refresh</button>
         </div>
       </header>
       {error ? <p role="alert" className="terminal-error">{error}</p> : null}
@@ -137,8 +134,8 @@ export function TerminalPage({ visible = true }: TerminalPageProps) {
         </div>
         {active ? (
           <TerminalPane
-            key={`${activeAgentId}:${active.id}`}
-            agentId={activeAgentId ?? ''}
+            key={`${agentId}:${active.id}`}
+            agentId={agentId}
             terminalId={active.id}
             initialCursor={active.output_cursor}
             status={active.status}
@@ -146,8 +143,8 @@ export function TerminalPage({ visible = true }: TerminalPageProps) {
           />
         ) : (
           <div className="terminal-empty">
-            <p>{activeAgentId ? (supportsTerminals ? 'No terminal sessions.' : 'Selected agent does not support terminals.') : 'No active agent selected.'}</p>
-            {activeAgentId && supportsTerminals ? <button type="button" onClick={openTerminal}>Open a terminal</button> : null}
+            <p>{supportsTerminals ? 'No terminal sessions.' : 'This Agent does not support terminals.'}</p>
+            {supportsTerminals ? <button type="button" onClick={openTerminal}>Open a terminal</button> : null}
           </div>
         )}
       </div>

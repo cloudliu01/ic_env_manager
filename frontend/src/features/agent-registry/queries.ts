@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { getAgent, listAgentObservations, listAgents } from './api';
 import { AgentFilters, ObservationFilters } from './types';
@@ -10,15 +11,22 @@ export const agentKeys = {
     ['agents', agentId, 'observations', filters] as const,
 };
 
-function pollingInterval() {
-  return document.visibilityState === 'visible' ? 30_000 : false;
+function usePollingInterval() {
+  const [visible, setVisible] = useState(() => document.visibilityState === 'visible');
+  useEffect(() => {
+    const updateVisibility = () => setVisible(document.visibilityState === 'visible');
+    document.addEventListener('visibilitychange', updateVisibility);
+    return () => document.removeEventListener('visibilitychange', updateVisibility);
+  }, []);
+  return visible ? 30_000 : false;
 }
 
 export function useAgents(filters: AgentFilters) {
+  const refetchInterval = usePollingInterval();
   return useQuery({
     queryKey: agentKeys.list(filters),
     queryFn: ({ signal }) => listAgents(filters, signal),
-    refetchInterval: pollingInterval,
+    refetchInterval,
     refetchIntervalInBackground: false,
   });
 }
@@ -31,12 +39,13 @@ export function useAgent(agentId: string) {
   });
 }
 
-export function useAgentObservations(agentId: string, filters: ObservationFilters) {
+export function useAgentObservations(agentId: string, filters: ObservationFilters, enabled = true) {
+  const refetchInterval = usePollingInterval();
   return useQuery({
     queryKey: agentKeys.observations(agentId, filters),
     queryFn: ({ signal }) => listAgentObservations(agentId, filters, signal),
-    enabled: Boolean(agentId),
-    refetchInterval: pollingInterval,
+    enabled: Boolean(agentId) && enabled,
+    refetchInterval,
     refetchIntervalInBackground: false,
   });
 }

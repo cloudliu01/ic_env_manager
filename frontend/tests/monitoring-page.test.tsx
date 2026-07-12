@@ -5,12 +5,9 @@ import { MetricsPage } from '../src/pages/MetricsPage';
 const getAgentMonitoringSnapshot = vi.hoisted(() => vi.fn());
 const CAPABILITIES = ['services.v1', 'terminals.v1', 'audit.v1', 'monitoring.snapshot.v1'];
 
-vi.mock('../src/agents/AgentStateContext', () => ({
-  useActiveAgent: () => ({
-    activeAgentId: 'agent-a',
-    activeAgent: { id: 'agent-a', name: 'Alpha agent', enabled: true, status: 'ready', capabilities: CAPABILITIES },
-  }),
-  agentSupports: (agent: { capabilities?: string[] } | null, capability: string) => Boolean(agent?.capabilities?.includes(capability)),
+vi.mock('../src/agents/StandaloneAgentContext', () => ({
+  useStandaloneAgent: () => ({ agentId: 'local', name: 'Build node', capabilities: CAPABILITIES }),
+  supportsCapability: (capabilities: string[], capability: string) => capabilities.includes(capability),
 }));
 
 vi.mock('../src/api/monitoring', () => ({

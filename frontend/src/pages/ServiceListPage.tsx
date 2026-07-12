@@ -1,17 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
-import { agentSupports, useActiveAgent } from '../agents/AgentStateContext';
+import { supportsCapability, useStandaloneAgent } from '../agents/StandaloneAgentContext';
 import { listServices, ServiceSummary, startService, stopService } from '../api/services';
 
 export function ServiceListPage() {
   const [services, setServices] = useState<ServiceSummary[]>([]);
-  const { activeAgent, activeAgentId } = useActiveAgent();
-  const supportsServices = agentSupports(activeAgent, 'services.v1');
+  const { agentId, capabilities } = useStandaloneAgent();
+  const supportsServices = supportsCapability(capabilities, 'services.v1');
   const requestGeneration = useRef(0);
 
-  async function refresh(agentId = activeAgentId, signal?: AbortSignal) {
+  async function refresh(signal?: AbortSignal) {
     const generation = requestGeneration.current + 1;
     requestGeneration.current = generation;
-    if (!agentId || !supportsServices) {
+    if (!supportsServices) {
       setServices([]);
       return;
     }
@@ -30,31 +30,30 @@ export function ServiceListPage() {
 
   useEffect(() => {
     const controller = new AbortController();
-    void refresh(activeAgentId, controller.signal);
+    void refresh(controller.signal);
     return () => controller.abort();
-  }, [activeAgentId]);
+  }, [agentId, supportsServices]);
 
   async function handleStart(serviceId: string) {
-    if (!activeAgentId || !supportsServices) {
+    if (!supportsServices) {
       return;
     }
-    await startService(activeAgentId, serviceId);
-    await refresh(activeAgentId);
+    await startService(agentId, serviceId);
+    await refresh();
   }
 
   async function handleStop(serviceId: string) {
-    if (!activeAgentId || !supportsServices) {
+    if (!supportsServices) {
       return;
     }
-    await stopService(activeAgentId, serviceId);
-    await refresh(activeAgentId);
+    await stopService(agentId, serviceId);
+    await refresh();
   }
 
   return (
     <section>
       <h1 tabIndex={-1}>Services</h1>
-      {!activeAgentId ? <p>No active agent selected.</p> : null}
-      {activeAgentId && !supportsServices ? <p>Selected agent does not support services.</p> : null}
+      {!supportsServices ? <p>This Agent does not support services.</p> : null}
       {services.map((service) => (
         <article key={service.id}>
           <h2>{service.name}</h2>

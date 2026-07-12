@@ -79,7 +79,7 @@ export default function AgentEntry() {
             <Route path="/observations" element={<CapabilityRoute identity={identity.data} capability="observations.v2"><ObservationsPage /></CapabilityRoute>} />
             <Route path="/logs" element={<CapabilityRoute identity={identity.data} capability="logs.v2"><LogsPage /></CapabilityRoute>} />
             <Route path="/metrics" element={<CapabilityRoute identity={identity.data} capability="monitoring.snapshot.v1"><MetricsPage /></CapabilityRoute>} />
-            <Route path="/audit" element={<CapabilityRoute identity={identity.data} capability="audit.v1"><AuditPage mode="standalone" /></CapabilityRoute>} />
+            <Route path="/audit" element={<CapabilityRoute identity={identity.data} capability="audit.v1"><AuditPage /></CapabilityRoute>} />
             <Route path="/settings/manager-access" element={<CapabilityRoute identity={identity.data} capability="runtime.v2"><ManagerAccessPage /></CapabilityRoute>} />
             <Route path="*" element={<section className="feature-page"><h1 tabIndex={-1}>Page not found</h1><a href="/terminal">Return to Terminal</a></section>} />
           </Routes>

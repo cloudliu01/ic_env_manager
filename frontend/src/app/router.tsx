@@ -95,7 +95,7 @@ function AgentObservationsPage() {
   const { agent, agentId } = useRouteAgent();
   const [searchParams, setSearchParams] = useSearchParams();
   const filters: ObservationFilters = { status: searchParams.get('status') || undefined };
-  const observations = useAgentObservations(agentId, filters);
+  const observations = useAgentObservations(agentId, filters, agent.capabilities.includes('observations.v2'));
   const onStatusChange = (event: ChangeEvent<HTMLSelectElement>) => {
     const next = new URLSearchParams(searchParams);
     if (event.target.value) next.set('status', event.target.value); else next.delete('status');

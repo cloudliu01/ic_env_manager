@@ -18,7 +18,7 @@ export function RouteFocus() {
     });
     observer.observe(document.getElementById('main-content') ?? document.body, { childList: true, subtree: true });
     return () => observer.disconnect();
-  }, [location.key, location.pathname, location.search]);
+  }, [location.pathname]);
 
   return null;
 }

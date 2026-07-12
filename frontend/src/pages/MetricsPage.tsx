@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { getAgentMonitoringSnapshot, HostSnapshot } from '../api/monitoring';
-import { agentSupports, useActiveAgent } from '../agents/AgentStateContext';
+import { supportsCapability, useStandaloneAgent } from '../agents/StandaloneAgentContext';
 import { DiskTable } from '../components/monitoring/DiskTable';
 import { formatBytes, formatDuration, formatPercent } from '../components/monitoring/format';
 import { MetricCard } from '../components/monitoring/MetricCard';
@@ -8,17 +8,17 @@ import { MetricCard } from '../components/monitoring/MetricCard';
 const REFRESH_MS = 5000;
 
 export function MetricsPage() {
-  const { activeAgent, activeAgentId } = useActiveAgent();
-  const supportsMonitoring = agentSupports(activeAgent, 'monitoring.snapshot.v1');
+  const { agentId, name, capabilities } = useStandaloneAgent();
+  const supportsMonitoring = supportsCapability(capabilities, 'monitoring.snapshot.v1');
   const [snapshot, setSnapshot] = useState<HostSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const requestGeneration = useRef(0);
 
-  async function loadSnapshot(agentId = activeAgentId, signal?: AbortSignal) {
+  async function loadSnapshot(signal?: AbortSignal) {
     const generation = requestGeneration.current + 1;
     requestGeneration.current = generation;
-    if (!agentId || !supportsMonitoring) {
+    if (!supportsMonitoring) {
       setSnapshot(null);
       setError(null);
       setLoading(false);
@@ -46,15 +46,15 @@ export function MetricsPage() {
 
   useEffect(() => {
     const controller = new AbortController();
-    void loadSnapshot(activeAgentId, controller.signal);
+    void loadSnapshot(controller.signal);
     const timer = window.setInterval(() => {
-      void loadSnapshot(activeAgentId);
+      void loadSnapshot();
     }, REFRESH_MS);
     return () => {
       controller.abort();
       window.clearInterval(timer);
     };
-  }, [activeAgentId]);
+  }, [agentId, supportsMonitoring]);
 
   const rootDisk = snapshot?.disks.find((disk) => disk.mount === '/') ?? snapshot?.disks[0];
 
@@ -67,20 +67,19 @@ export function MetricsPage() {
           <p>Track CPU, memory, disk, uptime, and network activity for the selected agent.</p>
         </div>
         <div className="monitoring-actions">
-          <span className="machine-selector">Agent: {activeAgent?.name ?? activeAgentId ?? 'none'}</span>
-          <button type="button" disabled={!activeAgentId || !supportsMonitoring} onClick={() => void loadSnapshot(activeAgentId)}>Refresh</button>
+          <span className="machine-selector">Agent: {name}</span>
+          <button type="button" disabled={!supportsMonitoring} onClick={() => void loadSnapshot()}>Refresh</button>
         </div>
       </header>
 
-      {!activeAgentId ? <p role="status" className="monitoring-empty">No active agent selected.</p> : null}
-      {activeAgentId && !supportsMonitoring ? <p role="status" className="monitoring-empty">Selected agent does not support monitoring.</p> : null}
+      {!supportsMonitoring ? <p role="status" className="monitoring-empty">This Agent does not support monitoring.</p> : null}
       {error ? <p role="alert" className="monitoring-error">{error}</p> : null}
 
       <div className="monitoring-status-card">
         <div>
           <span className={`status-badge status-${snapshot?.status ?? 'loading'}`}>{snapshot?.status ?? 'loading'}</span>
-          <strong>{snapshot?.name ?? activeAgent?.name ?? 'Agent'}</strong>
-          <span>{snapshot?.hostname ?? snapshot?.address ?? activeAgentId ?? ''}</span>
+          <strong>{snapshot?.name ?? name}</strong>
+          <span>{snapshot?.hostname ?? snapshot?.address ?? agentId}</span>
         </div>
         <div>
           <span>Sampled</span>

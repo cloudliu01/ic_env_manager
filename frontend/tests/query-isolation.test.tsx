@@ -53,4 +53,5 @@ describe('agent query isolation', () => {
     expect(screen.getByText('Beta result')).toBeTruthy();
     expect(screen.queryByText('Alpha result')).toBeNull();
   });
+
 });

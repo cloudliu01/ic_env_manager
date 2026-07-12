@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { AuditEvent, listAgentAuditEvents, listGatewayAuditEvents } from '../api/audit';
-import { agentSupports, useActiveAgent } from '../agents/AgentStateContext';
+import { AuditEvent, listAgentAuditEvents } from '../api/audit';
+import { supportsCapability, useStandaloneAgent } from '../agents/StandaloneAgentContext';
 
 const AUDIT_LIMIT = 100;
 
@@ -33,55 +33,36 @@ function AuditTable({ events, label }: { events: AuditEvent[]; label: string }) 
   );
 }
 
-export function AuditStatusPage({ mode = 'manager' }: { mode?: 'standalone' | 'manager' }) {
-  const { activeAgent, activeAgentId } = useActiveAgent();
-  const supportsAudit = agentSupports(activeAgent, 'audit.v1');
-  const [gatewayEvents, setGatewayEvents] = useState<AuditEvent[]>([]);
+export function AuditStatusPage() {
+  const { agentId, name, capabilities } = useStandaloneAgent();
+  const supportsAudit = supportsCapability(capabilities, 'audit.v1');
   const [agentEvents, setAgentEvents] = useState<AuditEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (mode !== 'manager') {
-      setGatewayEvents([]);
-      return;
-    }
-    const controller = new AbortController();
-    let active = true;
-    listGatewayAuditEvents(AUDIT_LIMIT, controller.signal)
-      .then((response) => { if (active) setGatewayEvents(response.events); })
-      .catch((err: Error) => { if (active && err.name !== 'AbortError') setError(err.message); });
-    return () => { active = false; controller.abort(); };
-  }, [mode]);
-
-  useEffect(() => {
-    if (!activeAgentId || !supportsAudit) {
+    if (!supportsAudit) {
       setAgentEvents([]);
       return;
     }
 
     const controller = new AbortController();
     let active = true;
-    listAgentAuditEvents(activeAgentId, AUDIT_LIMIT, controller.signal)
+    listAgentAuditEvents(agentId, AUDIT_LIMIT, controller.signal)
       .then((response) => { if (active) setAgentEvents(response.events); })
       .catch((err: Error) => { if (active && err.name !== 'AbortError') setError(err.message); });
     return () => { active = false; controller.abort(); };
-  }, [activeAgentId, supportsAudit]);
+  }, [agentId, supportsAudit]);
 
   return (
     <section>
       <h1 tabIndex={-1}>Audit Status</h1>
       {error ? <p role="alert">{error}</p> : null}
 
-      {mode === 'manager' ? <article>
-        <h2>Gateway audit</h2>
-        <AuditTable events={gatewayEvents} label="Gateway audit table" />
-      </article> : null}
-
       <article>
         <h2>Agent audit</h2>
-        <p>{activeAgent?.name ?? activeAgentId ?? 'No active agent selected.'}</p>
-        {activeAgentId && !supportsAudit ? <p>Selected agent does not support audit.</p> : null}
-        {activeAgentId && supportsAudit ? <AuditTable events={agentEvents} label="Agent audit table" /> : null}
+        <p>{name}</p>
+        {!supportsAudit ? <p>This Agent does not support audit.</p> : null}
+        {supportsAudit ? <AuditTable events={agentEvents} label="Agent audit table" /> : null}
       </article>
     </section>
   );

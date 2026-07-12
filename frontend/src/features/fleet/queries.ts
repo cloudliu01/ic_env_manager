@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { getFleetOverview } from './api';
 
@@ -6,15 +7,22 @@ export const fleetKeys = {
   overview: () => ['fleet', 'overview'] as const,
 };
 
-function pollingInterval() {
-  return document.visibilityState === 'visible' ? 30_000 : false;
+function usePollingInterval() {
+  const [visible, setVisible] = useState(() => document.visibilityState === 'visible');
+  useEffect(() => {
+    const updateVisibility = () => setVisible(document.visibilityState === 'visible');
+    document.addEventListener('visibilitychange', updateVisibility);
+    return () => document.removeEventListener('visibilitychange', updateVisibility);
+  }, []);
+  return visible ? 30_000 : false;
 }
 
 export function useFleetOverview() {
+  const refetchInterval = usePollingInterval();
   return useQuery({
     queryKey: fleetKeys.overview(),
     queryFn: ({ signal }) => getFleetOverview(signal),
-    refetchInterval: pollingInterval,
+    refetchInterval,
     refetchIntervalInBackground: false,
   });
 }

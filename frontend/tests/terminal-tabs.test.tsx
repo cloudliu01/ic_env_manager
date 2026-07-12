@@ -41,9 +41,9 @@ vi.mock('../src/api/terminals', () => ({
   })),
 }));
 
-vi.mock('../src/agents/AgentStateContext', () => ({
-  agentSupports: () => true,
-  useActiveAgent: () => ({ activeAgent: { id: 'agent-a', capabilities: ['terminals.v1'] }, activeAgentId: 'agent-a' }),
+vi.mock('../src/agents/StandaloneAgentContext', () => ({
+  supportsCapability: () => true,
+  useStandaloneAgent: () => ({ agentId: 'local', name: 'Build node', capabilities: ['terminals.v1'] }),
 }));
 
 vi.mock('../src/terminal/TerminalPane', () => ({
@@ -61,6 +61,6 @@ describe('TerminalPage', () => {
 
     expect(await screen.findByRole('tab', { name: /terminal 1/i })).toBeTruthy();
     expect(screen.getByLabelText('Terminal')).toBeTruthy();
-    expect(screen.getByText(/terminal pane for agent-a term-1 cursor 1234/i)).toBeTruthy();
+    expect(screen.getByText(/terminal pane for local term-1 cursor 1234/i)).toBeTruthy();
   });
 });

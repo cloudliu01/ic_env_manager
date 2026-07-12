@@ -28,6 +28,7 @@ export function AppShell({ identity, terminal, children, manager = false }: Prop
   const location = useLocation();
 
   useEffect(() => {
+    if (manager) return;
     const focusHeading = () => {
       const heading = document.querySelector<HTMLElement>('#main-content h1:not(.sr-only)');
       if (heading) {
@@ -36,7 +37,7 @@ export function AppShell({ identity, terminal, children, manager = false }: Prop
       }
       return false;
     };
-    if (!manager && location.pathname === '/terminal') {
+    if (location.pathname === '/terminal') {
       document.querySelector<HTMLElement>('.persistent-terminal h1')?.focus();
       return;
     }
