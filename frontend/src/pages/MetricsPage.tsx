@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { getAgentMonitoringSnapshot, HostSnapshot } from '../api/monitoring';
-import { agentSupports, useActiveAgent } from '../agents/AgentContext';
+import { agentSupports, useActiveAgent } from '../agents/AgentStateContext';
 import { DiskTable } from '../components/monitoring/DiskTable';
 import { formatBytes, formatDuration, formatPercent } from '../components/monitoring/format';
 import { MetricCard } from '../components/monitoring/MetricCard';

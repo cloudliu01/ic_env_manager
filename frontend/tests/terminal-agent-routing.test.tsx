@@ -32,7 +32,7 @@ const listTerminals = vi.hoisted(() => vi.fn());
 const createTerminal = vi.hoisted(() => vi.fn());
 const closeTerminal = vi.hoisted(() => vi.fn());
 
-vi.mock('../src/agents/AgentContext', () => ({
+vi.mock('../src/agents/AgentStateContext', () => ({
   useActiveAgent: () => ({ activeAgentId: activeAgent.id, activeAgent: activeAgent.id ? { id: activeAgent.id, enabled: true, status: 'ready', capabilities: CAPABILITIES } : null }),
   agentSupports: (agent: { capabilities?: string[] } | null, capability: string) => Boolean(agent?.capabilities?.includes(capability)),
 }));

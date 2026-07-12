@@ -49,5 +49,8 @@ export async function getAgentMonitoringSnapshot(
   agentId: string,
   init: RequestInit = {},
 ): Promise<HostSnapshot> {
-  return apiClient.request<HostSnapshot>(`/api/agents/${encodeURIComponent(agentId)}/monitoring/snapshot`, init);
+  const path = agentId === 'local'
+    ? '/api/monitoring/local'
+    : `/api/agents/${encodeURIComponent(agentId)}/monitoring/snapshot`;
+  return apiClient.request<HostSnapshot>(path, init);
 }

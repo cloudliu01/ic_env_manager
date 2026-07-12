@@ -41,7 +41,7 @@ vi.mock('../src/api/terminals', () => ({
   })),
 }));
 
-vi.mock('../src/agents/AgentContext', () => ({
+vi.mock('../src/agents/AgentStateContext', () => ({
   agentSupports: () => true,
   useActiveAgent: () => ({ activeAgent: { id: 'agent-a', capabilities: ['terminals.v1'] }, activeAgentId: 'agent-a' }),
 }));

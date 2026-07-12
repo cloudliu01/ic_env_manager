@@ -1,7 +1,9 @@
 import './styles/app.css';
+import './shared/styles/tokens.css';
+import './shared/styles/base.css';
 import React from 'react';
 import { createRoot } from 'react-dom/client';
-import { AppRoutes } from './pages/AppRoutes';
+import { App } from './app/App';
 
 const root = document.getElementById('root');
 
@@ -11,6 +13,6 @@ if (!root) {
 
 createRoot(root).render(
   <React.StrictMode>
-    <AppRoutes />
+    <App />
   </React.StrictMode>,
 );

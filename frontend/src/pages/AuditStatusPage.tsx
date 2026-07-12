@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { AuditEvent, listAgentAuditEvents, listGatewayAuditEvents } from '../api/audit';
-import { agentSupports, useActiveAgent } from '../agents/AgentContext';
+import { agentSupports, useActiveAgent } from '../agents/AgentStateContext';
 
 const AUDIT_LIMIT = 100;
 

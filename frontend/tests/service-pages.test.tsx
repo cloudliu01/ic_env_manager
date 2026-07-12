@@ -2,7 +2,7 @@ import { render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { ServiceListPage } from '../src/pages/ServiceListPage';
 
-vi.mock('../src/agents/AgentContext', () => ({
+vi.mock('../src/agents/AgentStateContext', () => ({
   useActiveAgent: () => ({ activeAgentId: 'agent-a', activeAgent: { id: 'agent-a', enabled: true, status: 'ready', capabilities: ['services.v1'] } }),
   agentSupports: (agent: { capabilities?: string[] } | null, capability: string) => Boolean(agent?.capabilities?.includes(capability)),
 }));

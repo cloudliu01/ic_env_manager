@@ -1,12 +1,12 @@
 import { FormEvent, useState } from 'react';
 import { login } from '../api/auth';
-import { saveSessionToken } from '../auth/session';
 
 export type LoginPageProps = {
   onAuthenticated: (actor: string) => void;
+  persistSession?: boolean;
 };
 
-export function LoginPage({ onAuthenticated }: LoginPageProps) {
+export function LoginPage({ onAuthenticated, persistSession = true }: LoginPageProps) {
   const [token, setToken] = useState('');
   const [error, setError] = useState<string | null>(null);
 
@@ -15,7 +15,10 @@ export function LoginPage({ onAuthenticated }: LoginPageProps) {
     setError(null);
     try {
       const response = await login(token);
-      saveSessionToken(token);
+      if (persistSession) {
+        const { saveSessionToken } = await import('../auth/session');
+        saveSessionToken(token);
+      }
       onAuthenticated(response.actor);
     } catch {
       setError('Authentication failed. Check the generated local bearer token.');

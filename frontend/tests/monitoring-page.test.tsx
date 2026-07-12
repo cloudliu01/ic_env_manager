@@ -5,7 +5,7 @@ import { MetricsPage } from '../src/pages/MetricsPage';
 const getAgentMonitoringSnapshot = vi.hoisted(() => vi.fn());
 const CAPABILITIES = ['services.v1', 'terminals.v1', 'audit.v1', 'monitoring.snapshot.v1'];
 
-vi.mock('../src/agents/AgentContext', () => ({
+vi.mock('../src/agents/AgentStateContext', () => ({
   useActiveAgent: () => ({
     activeAgentId: 'agent-a',
     activeAgent: { id: 'agent-a', name: 'Alpha agent', enabled: true, status: 'ready', capabilities: CAPABILITIES },

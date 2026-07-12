@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { agentSupports, useActiveAgent } from '../agents/AgentContext';
+import { agentSupports, useActiveAgent } from '../agents/AgentStateContext';
 import { closeTerminal, createTerminal, listTerminals, TerminalSession } from '../api/terminals';
 import { TerminalPane } from '../terminal/TerminalPane';
 

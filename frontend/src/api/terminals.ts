@@ -29,6 +29,9 @@ export type TerminalHistory = {
 };
 
 function terminalPath(agentId: string, path = ''): string {
+  if (agentId === 'local') {
+    return `/api/terminals${path}`;
+  }
   return `/api/agents/${encodeURIComponent(agentId)}/terminals${path}`;
 }
 

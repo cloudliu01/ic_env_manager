@@ -1,16 +1,20 @@
-export default [
+import js from '@eslint/js';
+import reactHooks from 'eslint-plugin-react-hooks';
+import tseslint from 'typescript-eslint';
+
+export default tseslint.config(
+  { ignores: ['dist/**', 'node_modules/**', 'coverage/**', '*.min.js'] },
+  js.configs.recommended,
+  ...tseslint.configs.recommended,
+  reactHooks.configs['recommended-latest'],
   {
-    ignores: ["dist/**", "node_modules/**", "coverage/**", "*.min.js"],
-  },
-  {
-    files: ["**/*.{js,mjs,cjs,jsx}"],
+    files: ['**/*.{ts,tsx}'],
     languageOptions: {
-      ecmaVersion: "latest",
-      sourceType: "module",
+      parserOptions: { ecmaFeatures: { jsx: true } },
     },
     rules: {
-      "no-undef": "error",
-      "no-unused-vars": "warn",
+      '@typescript-eslint/no-explicit-any': 'off',
+      '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
     },
   },
-];
+);

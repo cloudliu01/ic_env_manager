@@ -1,33 +1,15 @@
-import { createContext, ReactNode, useContext, useEffect, useMemo, useState } from 'react';
+import { ReactNode, useEffect, useMemo, useState } from 'react';
 import { AgentSummary, listAgents } from '../api/agents';
 import { ApiClientError } from '../api/client';
-import { FleetHost, FleetOverview, getFleetOverview, setAgentEnabled } from '../api/fleet';
+import { FleetOverview, getFleetOverview, setAgentEnabled } from '../api/fleet';
+import { AgentContext } from './AgentStateContext';
+
+export { agentSupports, useActiveAgent } from './AgentStateContext';
 
 const ACTIVE_AGENT_STORAGE_KEY = 'activeAgentId';
 
 export function clearActiveAgentSelection(): void {
   window.sessionStorage.removeItem(ACTIVE_AGENT_STORAGE_KEY);
-}
-
-type AgentContextValue = {
-  agents: AgentSummary[];
-  activeAgentId: string | null;
-  activeAgent: FleetHost | AgentSummary | null;
-  loading: boolean;
-  error: string | null;
-  setActiveAgentId: (agentId: string) => void;
-  fleet: FleetOverview | null;
-  fleetHosts: FleetHost[];
-  fleetLoading: boolean;
-  fleetError: string | null;
-  refreshFleet: () => Promise<void>;
-  setHostEnabled: (agentId: string, enabled: boolean) => Promise<void>;
-};
-
-const AgentContext = createContext<AgentContextValue | null>(null);
-
-export function agentSupports(agent: AgentSummary | null, capability: string): boolean {
-  return Boolean(agent?.enabled && agent.status === 'ready' && (agent.capabilities ?? []).includes(capability));
 }
 
 function chooseActiveAgentId(agents: AgentSummary[], storedId: string | null): string | null {
@@ -189,12 +171,4 @@ export function AgentProvider({ children, onAuthenticationExpired }: { children:
   );
 
   return <AgentContext.Provider value={value}>{children}</AgentContext.Provider>;
-}
-
-export function useActiveAgent() {
-  const value = useContext(AgentContext);
-  if (!value) {
-    throw new Error('useActiveAgent must be used within AgentProvider');
-  }
-  return value;
 }

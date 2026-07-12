@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { agentSupports, useActiveAgent } from '../agents/AgentContext';
+import { agentSupports, useActiveAgent } from '../agents/AgentStateContext';
 import { listServices, ServiceSummary, startService, stopService } from '../api/services';
 
 export function ServiceListPage() {

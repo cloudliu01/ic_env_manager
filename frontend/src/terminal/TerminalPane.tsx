@@ -19,6 +19,9 @@ type ConnectionState = 'connecting' | 'connected' | 'disconnected' | 'closed' | 
 function terminalWebSocketUrl(agentId: string, terminalId: string, ticket: string, cursor: number): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const params = new URLSearchParams({ ticket, cursor: String(cursor) });
+  if (agentId === 'local') {
+    return `${protocol}//${window.location.host}/ws/terminals/${encodeURIComponent(terminalId)}?${params.toString()}`;
+  }
   return `${protocol}//${window.location.host}/ws/agents/${encodeURIComponent(agentId)}/terminals/${encodeURIComponent(terminalId)}?${params.toString()}`;
 }
 

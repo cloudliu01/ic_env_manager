@@ -6,7 +6,7 @@ const activeAgent = vi.hoisted(() => ({ id: 'agent-a' as string | null }));
 const getAgentMonitoringSnapshot = vi.hoisted(() => vi.fn());
 const CAPABILITIES = ['services.v1', 'terminals.v1', 'audit.v1', 'monitoring.snapshot.v1'];
 
-vi.mock('../src/agents/AgentContext', () => ({
+vi.mock('../src/agents/AgentStateContext', () => ({
   useActiveAgent: () => ({
     activeAgentId: activeAgent.id,
     activeAgent: activeAgent.id ? { id: activeAgent.id, name: activeAgent.id === 'agent-b' ? 'Beta agent' : 'Alpha agent', enabled: true, status: 'ready', capabilities: CAPABILITIES } : null,

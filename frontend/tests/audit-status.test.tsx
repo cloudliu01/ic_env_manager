@@ -7,7 +7,7 @@ const listGatewayAuditEvents = vi.hoisted(() => vi.fn());
 const listAgentAuditEvents = vi.hoisted(() => vi.fn());
 const CAPABILITIES = ['services.v1', 'terminals.v1', 'audit.v1', 'monitoring.snapshot.v1'];
 
-vi.mock('../src/agents/AgentContext', () => ({
+vi.mock('../src/agents/AgentStateContext', () => ({
   useActiveAgent: () => ({
     activeAgentId: activeAgent.id,
     activeAgent: activeAgent.id ? { id: activeAgent.id, name: 'Alpha agent', enabled: true, status: 'ready', capabilities: CAPABILITIES } : null,

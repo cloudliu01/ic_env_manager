@@ -9,6 +9,9 @@ export type ServiceSummary = {
 };
 
 function agentPath(agentId: string, path: string): string {
+  if (agentId === 'local') {
+    return `/api${path}`;
+  }
   return `/api/agents/${encodeURIComponent(agentId)}${path}`;
 }
 

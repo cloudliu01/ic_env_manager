@@ -26,7 +26,8 @@ export async function listAgentAuditEvents(
   agentId: string,
   limit = 100,
 ): Promise<AuditEventsResponse> {
-  return apiClient.request<AuditEventsResponse>(
-    `/api/agents/${encodeURIComponent(agentId)}/audit?limit=${limit}`,
-  );
+  const path = agentId === 'local'
+    ? `/api/audit?limit=${limit}`
+    : `/api/agents/${encodeURIComponent(agentId)}/audit?limit=${limit}`;
+  return apiClient.request<AuditEventsResponse>(path);
 }
