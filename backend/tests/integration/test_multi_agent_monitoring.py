@@ -20,9 +20,9 @@ CAPABILITIES = (
 )
 
 
-def _token_file(tmp_path, name="token"):
+def _token_file(tmp_path, name="token", value="secret-token"):
     token_file = tmp_path / name
-    token_file.write_text("secret-token\n", encoding="utf-8")
+    token_file.write_text(f"{value}\n", encoding="utf-8")
     token_file.chmod(0o600)
     return token_file
 
@@ -32,7 +32,7 @@ def _agent(tmp_path, agent_id):
         id=agent_id,
         name=agent_id,
         base_url=f"https://{agent_id}.example",
-        token_file=_token_file(tmp_path, f"{agent_id}.token"),
+        token_file=_token_file(tmp_path, f"{agent_id}.token", "agent-secret-token"),
     )
 
 

@@ -12,6 +12,7 @@ from ic_env_guard.agents.client import AgentHttpClient
 from ic_env_guard.agents.registry import AgentRegistry
 from ic_env_guard.agents.terminal_proxy import GatewayProxyLimiter, GatewayTicketStore
 from ic_env_guard.api.audit_health import AuditStorageHealth
+from ic_env_guard.auth.token import load_bearer_token
 from ic_env_guard.bootstrap.identity import (
     initialize_instance_id,
 )
@@ -30,6 +31,8 @@ from ic_env_guard.enrollment.audit import AgentEnrollmentAudit
 from ic_env_guard.enrollment.credential_store import CredentialStore
 from ic_env_guard.enrollment.service import EnrollmentService
 from ic_env_guard.enrollment.socket_server import EnrollmentSocketServer
+from ic_env_guard.fleet.importer import import_yaml_agents_once
+from ic_env_guard.fleet.registry import FleetRegistry
 from ic_env_guard.logs.policy import LogPathPolicy, LogTailReader
 from ic_env_guard.logs.service import LogSourceService
 from ic_env_guard.metrics.collector import MetricsCollector
@@ -226,7 +229,19 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
     # One ManagerContainer owns one Store/coordinator; enrollment mutations and startup cleanup
     # must share its lifecycle lease rather than constructing another Store for this directory.
     credential_store = CredentialStore(config.control_plane.effective_credential_directory)
-    agent_registry = AgentRegistry(config.agents)
+    import_yaml_agents_once(
+        database_engine,
+        credential_store,
+        config.agents,
+        manager_token=load_bearer_token(config.auth.token_file).encode("utf-8"),
+        transport_profiles=config.control_plane.transport_profiles,
+    )
+    fleet_registry = FleetRegistry(
+        registry_repository,
+        credential_store,
+        config.control_plane.transport_profiles,
+    )
+    agent_registry = AgentRegistry(fleet_registry)
     agent_client = AgentHttpClient()
     metrics_registry = create_registry()
     terminal_manager = TerminalManager()
@@ -242,6 +257,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
             agent_client,
             stale_after_seconds=config.control_plane.status_stale_after_seconds,
             max_parallel_probes=config.control_plane.max_parallel_probes,
+            status_repository=status_repository,
         ),
         gateway_ticket_store=GatewayTicketStore(
             config.control_plane.max_outstanding_tickets

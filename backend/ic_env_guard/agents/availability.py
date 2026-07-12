@@ -6,6 +6,8 @@ from datetime import UTC, datetime, timedelta
 from ic_env_guard.agents.client import AgentClientError, AgentHttpClient
 from ic_env_guard.agents.models import API_VERSION, LOCAL_CAPABILITIES
 from ic_env_guard.agents.registry import AgentRegistry
+from ic_env_guard.fleet.models import AgentStatus
+from ic_env_guard.fleet.ports import AgentStatusRepository
 
 
 @dataclass(frozen=True)
@@ -27,12 +29,14 @@ class AgentAvailabilityService:
         stale_after_seconds: int = 30,
         max_parallel_probes: int = 8,
         probe_jitter_seconds: float = 1.0,
+        status_repository: AgentStatusRepository | None = None,
     ) -> None:
         self._registry = registry
         self._client = client
         self._stale_after_seconds = stale_after_seconds
         self._max_parallel_probes = max_parallel_probes
         self._probe_jitter_seconds = probe_jitter_seconds
+        self._status_repository = status_repository
         self._observations: dict[str, AgentObservation] = {}
 
     def summary(self, agent_id: str) -> dict[str, object]:
@@ -41,6 +45,33 @@ class AgentAvailabilityService:
         if not agent.enabled:
             return summary
         observation = self._observations.get(agent_id)
+        if self._status_repository is not None:
+            stored = self._status_repository.get(agent_id)
+            revision = self._registry.revision(agent_id)
+            if (
+                stored is not None
+                and revision is not None
+                and stored.target_revision == revision
+            ):
+                if stored.connection_status == "disabled":
+                    return summary
+                if stored.stale_after is None or stored.stale_after <= datetime.now(UTC):
+                    summary["status"] = "unknown"
+                    return summary
+                summary.update(
+                    {
+                        "status": stored.connection_status,
+                        "observed_at": (
+                            stored.observed_at.isoformat() if stored.observed_at else None
+                        ),
+                        "stale_after": stored.stale_after.isoformat(),
+                        "api_version": stored.api_version,
+                        "agent_version": stored.agent_version,
+                        "capabilities": list(stored.capabilities),
+                        "last_error": stored.last_error_code,
+                    }
+                )
+                return summary
         if observation is None or observation.stale_after <= datetime.now(UTC):
             summary["status"] = "unknown"
             return summary
@@ -132,6 +163,26 @@ class AgentAvailabilityService:
                 last_error=exc.category,
             )
         self._observations[agent_id] = observation
+        if self._status_repository is not None:
+            revision = self._registry.revision(agent_id)
+            if revision is not None:
+                self._status_repository.update_if_target_revision(
+                    AgentStatus(
+                        agent_id=agent_id,
+                        target_revision=revision,
+                        connection_status=observation.status,
+                        workload_status="unknown",
+                        observed_at=observation.observed_at,
+                        stale_after=observation.stale_after,
+                        api_version=observation.api_version,
+                        agent_version=observation.agent_version,
+                        capabilities=observation.capabilities,
+                        summary={},
+                        last_error_code=observation.last_error,
+                        updated_at=observation.observed_at,
+                    ),
+                    expected_revision=revision,
+                )
         return self.summary(agent_id)
 
     def record_ready_for_test(

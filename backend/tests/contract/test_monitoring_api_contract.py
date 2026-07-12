@@ -43,7 +43,8 @@ def auth_headers():
 
 def _token_file(tmp_path, name="token"):
     token_file = tmp_path / name
-    token_file.write_text("secret-token\n", encoding="utf-8")
+    token = "secret-token" if name == "token" else "agent-secret-token"
+    token_file.write_text(f"{token}\n", encoding="utf-8")
     token_file.chmod(0o600)
     return token_file
 

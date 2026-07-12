@@ -7,9 +7,8 @@ from fastapi.testclient import TestClient
 
 from ic_env_guard.agents.availability import AgentAvailabilityService
 from ic_env_guard.agents.client import AgentHttpClient
-from ic_env_guard.agents.registry import AgentRegistry
 from ic_env_guard.api.agent_http import get_agent_http_client
-from ic_env_guard.api.agents import get_agent_availability
+from ic_env_guard.api.agents import get_agent_availability, get_agent_registry
 from ic_env_guard.config.models import AgentConfig, AppConfig, AuthConfig, ControlPlaneConfig
 from ic_env_guard.main import create_app
 
@@ -63,7 +62,9 @@ def manager_client(tmp_path) -> Iterator[tuple[TestClient, list[tuple[str, str, 
     app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
         transport=httpx.MockTransport(handler)
     )
-    availability = AgentAvailabilityService(AgentRegistry(config.agents), AgentHttpClient())
+    availability = AgentAvailabilityService(
+        app.dependency_overrides[get_agent_registry](), AgentHttpClient()
+    )
     availability.record_ready_for_test("lab-01", datetime.now(UTC))
     app.dependency_overrides[get_agent_availability] = lambda: availability
 
@@ -108,3 +109,20 @@ def test_manager_v1_routes_require_manager_auth(manager_client, path):
     assert missing.status_code == 401
     assert agent_credential.status_code == 401
     assert seen == []
+
+
+@pytest.mark.contract
+def test_manager_v1_enable_state_is_durable_sqlite_state(manager_client):
+    client, _ = manager_client
+
+    disabled = client.post(
+        "/api/agents/lab-01/enabled",
+        headers=MANAGER_AUTH,
+        json={"enabled": False},
+    )
+
+    assert disabled.status_code == 200
+    assert disabled.json()["agent"]["enabled"] is False
+    assert client.get("/api/agents", headers=MANAGER_AUTH).json()["agents"][0][
+        "enabled"
+    ] is False

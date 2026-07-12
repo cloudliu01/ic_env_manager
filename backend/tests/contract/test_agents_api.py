@@ -8,9 +8,9 @@ from ic_env_guard.config.models import AgentConfig, AppConfig, AuthConfig, Contr
 from ic_env_guard.main import create_app
 
 
-def _token_file(tmp_path, name="token"):
+def _token_file(tmp_path, name="token", value="secret-token"):
     token_file = tmp_path / name
-    token_file.write_text("secret-token\n", encoding="utf-8")
+    token_file.write_text(f"{value}\n", encoding="utf-8")
     token_file.chmod(0o600)
     return token_file
 
@@ -20,7 +20,7 @@ def _agent(tmp_path, agent_id="lab-01", enabled=True):
         id=agent_id,
         name=f"Agent {agent_id}",
         base_url=f"https://{agent_id}.example",
-        token_file=_token_file(tmp_path, f"{agent_id}.token"),
+        token_file=_token_file(tmp_path, f"{agent_id}.token", "agent-secret-token"),
         enabled=enabled,
     )
 
