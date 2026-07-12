@@ -1,19 +1,32 @@
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from shutil import rmtree
+from tempfile import mkdtemp
 
 import pytest
 from fastapi.testclient import TestClient
 
 from ic_env_guard.bootstrap.composition import build_agent_container
-from ic_env_guard.config.models import AppConfig, AuthConfig, LogsConfig
+from ic_env_guard.config.models import AppConfig, AuthConfig, EnrollmentConfig, LogsConfig
 from ic_env_guard.logs.models import LogSourceInput
 from ic_env_guard.main import create_ingest_app, create_public_app
 
 AUTH = {"Authorization": "Bearer secret-token"}
 
 
+@pytest.fixture
+def enrollment_runtime_dir():
+    path = Path(mkdtemp(prefix="ieg-log-tail-", dir="/tmp"))
+    path.chmod(0o700)
+    yield path
+    rmtree(path, ignore_errors=True)
+
+
 @pytest.mark.integration
-def test_log_metadata_persists_and_stale_tail_returns_gone_after_restart(tmp_path):
+def test_log_metadata_persists_and_stale_tail_returns_gone_after_restart(
+    tmp_path, enrollment_runtime_dir
+):
     root = tmp_path / "logs"
     root.mkdir()
     path = root / "run.log"
@@ -22,7 +35,11 @@ def test_log_metadata_persists_and_stale_tail_returns_gone_after_restart(tmp_pat
     token_file.write_text("secret-token\n", encoding="utf-8")
     token_file.chmod(0o600)
     config = AppConfig(
-        auth=AuthConfig(token_file=token_file), logs=LogsConfig(allowed_roots=[root])
+        auth=AuthConfig(token_file=token_file),
+        logs=LogsConfig(allowed_roots=[root]),
+        enrollment=EnrollmentConfig(
+            socket_path=enrollment_runtime_dir / "enrollment.sock", socket_mode="0600"
+        ),
     )
     database = tmp_path / "state.db"
     first = build_agent_container(config, database)
@@ -52,12 +69,13 @@ def test_log_metadata_persists_and_stale_tail_returns_gone_after_restart(tmp_pat
     assert stale_detail.status_code == 410
     assert stale_detail.json()["error"]["code"] == "log_source_stale"
     assert listing.json()["items"] == []
+    assert not config.enrollment.socket_path.exists()
     second.database_engine.dispose()
 
 
 @pytest.mark.integration
 def test_log_tail_response_metadata_and_content_use_one_repository_snapshot(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, enrollment_runtime_dir
 ):
     root = tmp_path / "logs"
     root.mkdir()
@@ -69,7 +87,11 @@ def test_log_tail_response_metadata_and_content_use_one_repository_snapshot(
     token_file.write_text("secret-token\n", encoding="utf-8")
     token_file.chmod(0o600)
     config = AppConfig(
-        auth=AuthConfig(token_file=token_file), logs=LogsConfig(allowed_roots=[root])
+        auth=AuthConfig(token_file=token_file),
+        logs=LogsConfig(allowed_roots=[root]),
+        enrollment=EnrollmentConfig(
+            socket_path=enrollment_runtime_dir / "enrollment.sock", socket_mode="0600"
+        ),
     )
     container = build_agent_container(config, tmp_path / "state.db")
     now = datetime.now(UTC)
@@ -107,4 +129,5 @@ def test_log_tail_response_metadata_and_content_use_one_repository_snapshot(
     ).replace("+00:00", "Z")
     assert response.json()["lines"] == ["first-snapshot"]
     assert calls == 1
+    assert not config.enrollment.socket_path.exists()
     container.database_engine.dispose()

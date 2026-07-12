@@ -1,5 +1,8 @@
 import json
 from datetime import UTC, datetime
+from pathlib import Path
+from shutil import rmtree
+from tempfile import mkdtemp
 
 import pytest
 from fastapi.testclient import TestClient
@@ -7,13 +10,21 @@ from sqlalchemy import text
 
 from ic_env_guard.api.logs import get_log_tail_audit_recorder
 from ic_env_guard.bootstrap.composition import build_agent_container
-from ic_env_guard.config.models import AppConfig, AuthConfig, LogsConfig
+from ic_env_guard.config.models import AppConfig, AuthConfig, EnrollmentConfig, LogsConfig
 from ic_env_guard.main import create_ingest_app, create_public_app
 
 AUTH = {"Authorization": "Bearer secret-token", "X-Correlation-ID": "tail-correlation"}
 
 
-def _setup(tmp_path, **log_settings):
+@pytest.fixture
+def enrollment_runtime_dir():
+    path = Path(mkdtemp(prefix="ieg-tail-security-", dir="/tmp"))
+    path.chmod(0o700)
+    yield path
+    rmtree(path, ignore_errors=True)
+
+
+def _setup(tmp_path, enrollment_runtime_dir, **log_settings):
     root = tmp_path / "allowed"
     root.mkdir()
     token_file = tmp_path / "token"
@@ -23,6 +34,10 @@ def _setup(tmp_path, **log_settings):
         AppConfig(
             auth=AuthConfig(token_file=token_file),
             logs=LogsConfig(allowed_roots=[root], **log_settings),
+            enrollment=EnrollmentConfig(
+                socket_path=enrollment_runtime_dir / "enrollment.sock",
+                socket_mode="0600",
+            ),
         ),
         tmp_path / "state.db",
     )
@@ -38,9 +53,15 @@ def _register(app, path, log_id="run-log", ttl=120):
         )
 
 
+def _assert_enrollment_socket_cleaned_up(container):
+    assert not container.config.enrollment.socket_path.exists()
+
+
 @pytest.mark.security
-def test_tail_distinguishes_unknown_stale_missing_and_moved_paths(tmp_path):
-    root, container, ingest_app, public_app = _setup(tmp_path)
+def test_tail_distinguishes_unknown_stale_missing_and_moved_paths(
+    tmp_path, enrollment_runtime_dir
+):
+    root, container, ingest_app, public_app = _setup(tmp_path, enrollment_runtime_dir)
     path = root / "run.log"
     path.write_text("safe\n", encoding="utf-8")
     assert _register(ingest_app, path).status_code == 201
@@ -74,12 +95,15 @@ def test_tail_distinguishes_unknown_stale_missing_and_moved_paths(tmp_path):
     assert moved_audit["failure_reason"] == "lines=100;result=log_path_forbidden"
     assert str(path) not in str(dict(moved_audit))
     assert "secret" not in str(dict(moved_audit))
+    _assert_enrollment_socket_cleaned_up(container)
     container.database_engine.dispose()
 
 
 @pytest.mark.security
-def test_tail_invalid_utf8_is_bounded_and_content_never_enters_sqlite_or_audit(tmp_path):
-    root, container, ingest_app, public_app = _setup(tmp_path)
+def test_tail_invalid_utf8_is_bounded_and_content_never_enters_sqlite_or_audit(
+    tmp_path, enrollment_runtime_dir
+):
+    root, container, ingest_app, public_app = _setup(tmp_path, enrollment_runtime_dir)
     marker = "UNIQUE-LOG-CONTENT-DO-NOT-PERSIST"
     path = root / "large.log"
     path.write_bytes((b'"\\' * 500_000) + b"\n" + marker.encode() + b"-\xff\n")
@@ -105,12 +129,15 @@ def test_tail_invalid_utf8_is_bounded_and_content_never_enters_sqlite_or_audit(t
     assert audit["correlation_id"] == "tail-correlation"
     assert "lines=1000" in audit["failure_reason"]
     assert str(path) not in str(dict(audit))
+    _assert_enrollment_socket_cleaned_up(container)
     container.database_engine.dispose()
 
 
 @pytest.mark.security
-def test_tail_audit_failure_fails_closed_without_returning_content(tmp_path):
-    root, container, ingest_app, public_app = _setup(tmp_path)
+def test_tail_audit_failure_fails_closed_without_returning_content(
+    tmp_path, enrollment_runtime_dir
+):
+    root, container, ingest_app, public_app = _setup(tmp_path, enrollment_runtime_dir)
     path = root / "run.log"
     path.write_text("must-not-be-returned\n", encoding="utf-8")
     assert _register(ingest_app, path).status_code == 201
@@ -126,13 +153,19 @@ def test_tail_audit_failure_fails_closed_without_returning_content(tmp_path):
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "audit_storage_unavailable"
     assert "must-not-be-returned" not in response.text
+    _assert_enrollment_socket_cleaned_up(container)
     container.database_engine.dispose()
 
 
 @pytest.mark.security
-def test_authenticated_tail_validation_failures_are_safely_audited(tmp_path):
+def test_authenticated_tail_validation_failures_are_safely_audited(
+    tmp_path, enrollment_runtime_dir
+):
     _, container, _, public_app = _setup(
-        tmp_path, default_tail_lines=10, max_tail_lines=10
+        tmp_path,
+        enrollment_runtime_dir,
+        default_tail_lines=10,
+        max_tail_lines=10,
     )
     unsafe_log_id = "Bad-secret-token-value"
     with TestClient(public_app) as public:
@@ -164,12 +197,15 @@ def test_authenticated_tail_validation_failures_are_safely_audited(tmp_path):
     assert audits[-1]["target_id"] == "<invalid-log-id>"
     assert unsafe_log_id not in json.dumps([dict(row) for row in audits])
     assert all(row["result"] == "rejected" for row in audits)
+    _assert_enrollment_socket_cleaned_up(container)
     container.database_engine.dispose()
 
 
 @pytest.mark.security
-def test_unauthenticated_tail_validation_failure_is_not_audited(tmp_path):
-    _, container, _, public_app = _setup(tmp_path)
+def test_unauthenticated_tail_validation_failure_is_not_audited(
+    tmp_path, enrollment_runtime_dir
+):
+    _, container, _, public_app = _setup(tmp_path, enrollment_runtime_dir)
     with TestClient(public_app) as public:
         response = public.get("/api/v2/logs/Bad-secret-token/tail?lines=invalid")
 
@@ -179,12 +215,13 @@ def test_unauthenticated_tail_validation_failure_is_not_audited(tmp_path):
             text("SELECT COUNT(*) FROM audit_events WHERE operation = 'logs.tail'")
         ).scalar_one()
     assert count == 0
+    _assert_enrollment_socket_cleaned_up(container)
     container.database_engine.dispose()
 
 
 @pytest.mark.security
-def test_tail_validation_audit_failure_fails_closed(tmp_path):
-    _, container, _, public_app = _setup(tmp_path)
+def test_tail_validation_audit_failure_fails_closed(tmp_path, enrollment_runtime_dir):
+    _, container, _, public_app = _setup(tmp_path, enrollment_runtime_dir)
 
     class FailingRecorder:
         def record(self, **kwargs):
@@ -196,4 +233,5 @@ def test_tail_validation_audit_failure_fails_closed(tmp_path):
 
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "audit_storage_unavailable"
+    _assert_enrollment_socket_cleaned_up(container)
     container.database_engine.dispose()

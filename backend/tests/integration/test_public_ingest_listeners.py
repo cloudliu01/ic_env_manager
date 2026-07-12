@@ -2,6 +2,9 @@ import asyncio
 import socket
 from contextlib import closing
 from datetime import UTC, datetime
+from pathlib import Path
+from shutil import rmtree
+from tempfile import mkdtemp
 from unittest.mock import Mock
 
 import httpx
@@ -13,13 +16,21 @@ from ic_env_guard.config.models import AppConfig
 from ic_env_guard.main import serve_config
 
 
+@pytest.fixture
+def enrollment_runtime_dir():
+    path = Path(mkdtemp(prefix="ieg-listeners-", dir="/tmp"))
+    path.chmod(0o700)
+    yield path
+    rmtree(path, ignore_errors=True)
+
+
 def _free_port() -> int:
     with closing(socket.socket()) as listener:
         listener.bind(("127.0.0.1", 0))
         return listener.getsockname()[1]
 
 
-def _config(tmp_path, *, mode: str = "agent") -> AppConfig:
+def _config(tmp_path, enrollment_runtime_dir, *, mode: str = "agent") -> AppConfig:
     token_file = tmp_path / f"{mode}.token"
     token_file.write_text("secret-token\n", encoding="utf-8")
     token_file.chmod(0o600)
@@ -31,6 +42,10 @@ def _config(tmp_path, *, mode: str = "agent") -> AppConfig:
             "server": {"bind": "127.0.0.1", "port": public_port},
             "ingest": {"bind": "127.0.0.1", "port": ingest_port},
             "auth": {"token_file": token_file},
+            "enrollment": {
+                "socket_path": enrollment_runtime_dir / "enrollment.sock",
+                "socket_mode": "0600",
+            },
             "state_database": tmp_path / f"{mode}.db",
             "control_plane": {"audit_database": tmp_path / "manager.db"},
         }
@@ -65,7 +80,9 @@ def _observation_payload() -> dict[str, object]:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_agent_real_listeners_are_isolated_and_close_together(tmp_path, monkeypatch):
+async def test_agent_real_listeners_are_isolated_and_close_together(
+    tmp_path, monkeypatch, enrollment_runtime_dir
+):
     proxy_header_settings = []
     built_containers = []
     original_init = uvicorn.Config.__init__
@@ -83,7 +100,7 @@ async def test_agent_real_listeners_are_isolated_and_close_together(tmp_path, mo
 
     monkeypatch.setattr(uvicorn.Config, "__init__", recording_init)
     monkeypatch.setattr(main, "build_agent_container", recording_builder)
-    config = _config(tmp_path)
+    config = _config(tmp_path, enrollment_runtime_dir)
     shutdown = asyncio.Event()
     task = asyncio.create_task(serve_config(config, shutdown_event=shutdown))
     public_url = f"http://127.0.0.1:{config.server.port}"
@@ -114,12 +131,13 @@ async def test_agent_real_listeners_are_isolated_and_close_together(tmp_path, mo
         with pytest.raises(httpx.TransportError):
             await client.get(f"{ingest_url}/api/v2/runtime")
     built_containers[0].database_engine.dispose.assert_called_once_with()
+    assert not config.enrollment.socket_path.exists()
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_manager_never_binds_ingest_listener(tmp_path):
-    config = _config(tmp_path, mode="control-plane")
+async def test_manager_never_binds_ingest_listener(tmp_path, enrollment_runtime_dir):
+    config = _config(tmp_path, enrollment_runtime_dir, mode="control-plane")
     shutdown = asyncio.Event()
     task = asyncio.create_task(serve_config(config, shutdown_event=shutdown))
     public_url = f"http://127.0.0.1:{config.server.port}"
@@ -132,11 +150,15 @@ async def test_manager_never_binds_ingest_listener(tmp_path):
         shutdown.set()
         await asyncio.wait_for(task, timeout=5)
 
+    assert not config.enrollment.socket_path.exists()
+
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_agent_listener_bind_failure_stops_public_listener(tmp_path):
-    config = _config(tmp_path)
+async def test_agent_listener_bind_failure_stops_public_listener(
+    tmp_path, enrollment_runtime_dir
+):
+    config = _config(tmp_path, enrollment_runtime_dir)
     blocker = socket.socket()
     blocker.bind((config.ingest.bind, config.ingest.port))
     blocker.listen()
@@ -149,3 +171,4 @@ async def test_agent_listener_bind_failure_stops_public_listener(tmp_path):
     async with httpx.AsyncClient() as client:
         with pytest.raises(httpx.TransportError):
             await client.get(f"http://127.0.0.1:{config.server.port}/healthz")
+    assert not config.enrollment.socket_path.exists()
