@@ -54,3 +54,9 @@ export function startCredentialRotation(agentId: string, ssh: EnrollmentInput['s
     method: 'POST', body: JSON.stringify({ action: 'start', ssh }),
   });
 }
+
+export function consumeCredentialRotation(agentId: string, enrollmentId: string) {
+  return apiClient.request<{ rotation: EnrollmentJob }>(`/api/v2/agents/${encodeURIComponent(agentId)}/credential-rotation`, {
+    method: 'POST', body: JSON.stringify({ action: 'consume', enrollment_id: enrollmentId }),
+  });
+}

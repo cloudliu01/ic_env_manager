@@ -238,6 +238,20 @@ def test_discovery_result_can_be_rehydrated_by_opaque_id_with_safe_projection(tm
 
 
 @pytest.mark.contract
+def test_discovery_result_rehydration_requires_auth_and_hides_unknown_ids(tmp_path):
+    client = _client(tmp_path, enabled=True)
+
+    unauthenticated = client.get("/api/v2/discovery/results/opaque-missing")
+    unknown = client.get("/api/v2/discovery/results/opaque-missing", headers=AUTH)
+
+    assert unauthenticated.status_code == 401
+    assert unknown.status_code == 404
+    assert unknown.json()["error"]["code"] == "discovery_result_not_found"
+    assert unknown.json()["error"]["message"] == "discovery result not found"
+    assert set(unknown.json()["error"]) <= {"code", "message", "correlation_id"}
+
+
+@pytest.mark.contract
 def test_discovery_finish_finalizes_start_audit_with_real_counts(tmp_path):
     client = _client(tmp_path, enabled=True)
 

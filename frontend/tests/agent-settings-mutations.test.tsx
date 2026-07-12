@@ -1,4 +1,4 @@
-import { cleanup, render, screen, within } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '../src/app/App';
@@ -39,5 +39,25 @@ describe('Agent Settings mutations', () => {
     await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Remove from Manager' }));
     expect(await screen.findByText(/currently in use/)).toBeTruthy();
     expect(within(screen.getByRole('dialog')).getAllByRole('button', { name: 'Close' }).length).toBeGreaterThan(0);
+  });
+
+  it('starts and consumes credential rotation with entered SSH details and shows residual cleanup', async () => {
+    apiRequest.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
+      if (path === '/api/v2/agents/alpha' && !init?.method) return { agent };
+      if (path === '/api/v2/agents/alpha/credential-rotation' && init?.method === 'POST' && String(init.body).includes('"action":"start"')) return { rotation: { enrollment_id: 'rotation-opaque', state: 'awaiting_cli' } };
+      if (path === '/api/v2/agent-enrollments/rotation-opaque') return { enrollment_id: 'rotation-opaque', state: 'verified' };
+      if (path === '/api/v2/agents/alpha/credential-rotation' && init?.method === 'POST' && String(init.body).includes('"action":"consume"')) return { rotation: { enrollment_id: 'rotation-opaque', state: 'consumed', residual_warning: 'Remove old credential manually' } };
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Rotate credential' }));
+    await user.type(screen.getByLabelText('Rotation SSH user'), 'edaops');
+    await user.type(screen.getByLabelText('Rotation SSH host'), '10.0.0.4');
+    await user.click(screen.getByRole('button', { name: 'Start credential rotation' }));
+    await waitFor(() => expect(apiRequest).toHaveBeenCalledWith('/api/v2/agents/alpha/credential-rotation', expect.objectContaining({ body: JSON.stringify({ action: 'start', ssh: { user: 'edaops', host: '10.0.0.4', port: 22 } }) })));
+    await user.click(await screen.findByRole('button', { name: 'Apply rotated credential' }));
+    expect(await screen.findByText('Remove old credential manually')).toBeTruthy();
   });
 });

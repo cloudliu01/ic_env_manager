@@ -13,7 +13,7 @@ import { useDiscoveryResult } from '../discovery/queries';
 const defaults: ConnectionValues = { displayName: '', baseUrl: '', profile: 'trusted-lan-http', sshUser: '', sshHost: '', sshPort: '22' };
 
 function fieldError(field: keyof ConnectionValues, value: string) {
-  if (field === 'displayName') return '';
+  if (field === 'displayName') return value.trim() ? '' : 'Display name is required.';
   if (field === 'baseUrl') try { const url = new URL(value); return /^https?:$/.test(url.protocol) ? '' : 'Use an HTTP or HTTPS URL.'; } catch { return 'Enter a complete Agent URL.'; }
   if (field === 'profile') return value.trim() ? '' : 'Transport profile is required.';
   if (field === 'sshUser' || field === 'sshHost') return value.trim() ? '' : 'This field is required.';
@@ -40,7 +40,7 @@ export function AddAgentPage() {
     setValues((current) => ({ ...current, baseUrl: result.candidate_url, profile: result.transport_profile_id, sshHost: result.ip }));
   }, [candidate.data]);
   const cancelCurrent = async () => { if (!enrollmentId) return; try { await cancelEnrollment(enrollmentId); } finally { const next = new URLSearchParams(params); next.delete('enrollment'); setParams(next, { replace: true }); } };
-  const change = (field: keyof ConnectionValues, value: string) => { if (enrollmentId) void cancelCurrent(); setValues((current) => ({ ...current, [field]: value })); };
+  const change = (field: keyof ConnectionValues, value: string) => { if (enrollmentId && job.data?.state !== 'verified') void cancelCurrent(); setValues((current) => ({ ...current, [field]: value })); };
   const blur = (field: keyof ConnectionValues) => setErrors((current) => ({ ...current, [field]: fieldError(field, values[field]) }));
   const start = async () => {
     const nextErrors = Object.fromEntries((Object.keys(values) as Array<keyof ConnectionValues>).map((field) => [field, fieldError(field, values[field])]).filter(([, error]) => error));
@@ -49,7 +49,7 @@ export function AddAgentPage() {
     try {
       const created = legacy ? await validateLegacyAgent({ base_url: values.baseUrl, transport_profile_id: values.profile, token: legacyToken }) : await createEnrollment({ base_url: values.baseUrl, display_name: values.displayName, transport_profile_id: values.profile, ssh: { user: values.sshUser, host: values.sshHost, port: Number(values.sshPort) }, ...(discoveryResultId ? { discovery_result_id: discoveryResultId } : {}) });
       const next = new URLSearchParams(params); next.set('enrollment', created.enrollment_id); setParams(next, { replace: true });
-    } catch { setSubmitError('Enrollment could not start. Review the details and retry.'); } finally { setSubmitting(false); }
+    } catch { setSubmitError('Enrollment could not start. Review the details and retry.'); } finally { if (legacy) { setLegacyToken(''); setLegacy(false); } setSubmitting(false); }
   };
   const onSaved = () => { void client.invalidateQueries({ queryKey: agentKeys.all }); void client.invalidateQueries({ queryKey: fleetKeys.all }); navigate('/fleet'); };
   return <section className="feature-page"><header className="page-header"><h1 tabIndex={-1}>Add agent</h1><p>Enroll an Agent with the Manager’s existing safe v2 flow.</p></header>

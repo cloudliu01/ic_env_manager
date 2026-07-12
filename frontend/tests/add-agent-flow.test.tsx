@@ -32,6 +32,7 @@ describe('Add agent flow', () => {
     const user = userEvent.setup();
     render(<App />);
 
+    await user.type(await screen.findByLabelText('Display name'), 'Alpha');
     await user.type(await screen.findByLabelText('Agent URL'), 'https://10.0.0.4:8765');
     await user.type(screen.getByLabelText('SSH user'), 'edaops');
     await user.type(screen.getByLabelText('SSH host'), '10.0.0.4');
@@ -78,5 +79,49 @@ describe('Add agent flow', () => {
     await waitFor(() => expect((screen.getByLabelText('Agent URL') as HTMLInputElement).value).toBe('http://10.0.0.4:8765'));
     expect((screen.getByLabelText('SSH host') as HTMLInputElement).value).toBe('10.0.0.4');
     expect((screen.getByLabelText('SSH user') as HTMLInputElement).value).toBe('');
+  });
+
+  it('requires a name before enrollment and lets a refreshed verified job save without cancellation', async () => {
+    window.history.replaceState({}, '', '/agents/new?enrollment=job-opaque-1');
+    apiRequest.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
+      if (path === '/api/v2/agent-enrollments/job-opaque-1') return { ...job, state: 'verified' };
+      if (path === '/api/v2/agents' && init?.method === 'POST') return { agent: { agent_id: 'alpha' } };
+      if (path.endsWith('/cancel')) throw new Error('verified jobs must not be cancelled');
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    const name = await screen.findByLabelText('Display name');
+    await user.click(name);
+    await user.tab();
+    expect(screen.getByText('Display name is required.')).toBeTruthy();
+    await user.type(name, 'Alpha');
+    await user.click(screen.getByRole('button', { name: 'Save Agent' }));
+    await waitFor(() => expect(apiRequest).toHaveBeenCalledWith('/api/v2/agents', expect.objectContaining({ method: 'POST', body: JSON.stringify({ enrollment_id: 'job-opaque-1', display_name: 'Alpha' }) })));
+    expect(apiRequest).not.toHaveBeenCalledWith('/api/v2/agent-enrollments/job-opaque-1/cancel', expect.anything());
+  });
+
+  it.each(['success', 'failure'])('clears legacy token state and removes its password input after %s', async (outcome) => {
+    apiRequest.mockImplementation(async (path: string) => {
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
+      if (path === '/api/v2/agents/validate') {
+        if (outcome === 'failure') throw new Error('validation failed');
+        return { ...job, state: 'verified' };
+      }
+      if (path === '/api/v2/agent-enrollments/job-opaque-1') return { ...job, state: 'verified' };
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.type(await screen.findByLabelText('Display name'), 'Alpha');
+    await user.type(screen.getByLabelText('Agent URL'), 'https://10.0.0.4:8765');
+    await user.type(screen.getByLabelText('SSH user'), 'edaops');
+    await user.type(screen.getByLabelText('SSH host'), '10.0.0.4');
+    await user.click(screen.getByRole('button', { name: 'Use legacy token instead' }));
+    await user.type(screen.getByLabelText('Legacy admin token'), 'legacy-secret-never-rendered');
+    await user.click(screen.getByRole('button', { name: 'Validate legacy token' }));
+    await waitFor(() => expect(screen.queryByLabelText('Legacy admin token')).toBeNull());
+    expect(document.body.textContent).not.toContain('legacy-secret-never-rendered');
   });
 });
