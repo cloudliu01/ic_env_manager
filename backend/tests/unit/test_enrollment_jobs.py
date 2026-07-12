@@ -68,6 +68,16 @@ def advance(repository, job, *states):
                 }
                 else current.credential_temp_ref
             ),
+            validated_http_address=(
+                "10.20.30.40"
+                if state
+                in {
+                    EnrollmentState.CREDENTIAL_ISSUED,
+                    EnrollmentState.VERIFYING,
+                    EnrollmentState.VERIFIED,
+                }
+                else current.validated_http_address
+            ),
             remote_instance_id=(
                 "33333333-3333-4333-8333-333333333333"
                 if state is EnrollmentState.VERIFIED
@@ -267,6 +277,7 @@ def test_recovery_claim_is_exclusive_and_expired_lease_can_be_taken_over(setup):
             running,
             state=EnrollmentState.CREDENTIAL_ISSUED,
             credential_temp_ref="a" * 48,
+            validated_http_address="10.20.30.40",
         ),
         expected_state=EnrollmentState.RUNNING,
     )
@@ -427,6 +438,11 @@ def test_activation_residual_is_claimed_without_business_ttl_expiry(setup):
                     if state is not EnrollmentState.RUNNING
                     else current.credential_temp_ref
                 ),
+                validated_http_address=(
+                    "10.20.30.40"
+                    if state is not EnrollmentState.RUNNING
+                    else current.validated_http_address
+                ),
                 remote_instance_id=(
                     "33333333-3333-4333-8333-333333333333"
                     if state is EnrollmentState.VERIFIED
@@ -499,6 +515,7 @@ def test_public_projection_folds_internal_states_and_exposes_only_safe_error(
         pending,
         state=internal,
         credential_temp_ref="a" * 48,
+        validated_http_address="10.20.30.40",
         save_requested=internal
         in {EnrollmentState.ACTIVATION_REQUESTED, EnrollmentState.ACTIVATED},
         requested_display_name="Lab 01",

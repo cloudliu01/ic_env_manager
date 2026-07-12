@@ -34,7 +34,12 @@ CREDENTIAL_ID = "44444444-4444-4444-8444-444444444444"
 TOKEN = b"eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg"
 PROFILE = TrustedLanHttpProfile(id="lab-http", allowed_cidrs=["10.0.0.0/8"])
 VALIDATION_TARGET = type(
-    "ValidationTarget", (), {"normalized_endpoint": "http://10.20.30.40:8765"}
+    "ValidationTarget",
+    (),
+    {
+        "normalized_endpoint": "http://10.20.30.40:8765",
+        "pinned_address": "10.20.30.40",
+    },
 )()
 AUDIT_CONTEXT = AutoEnrollmentAuditContext(
     actor_id="local-admin",
@@ -122,9 +127,7 @@ def request():
     )
 
 
-def setup_services(
-    tmp_path, adapter, *, audit=None, store=None, shutdown_timeout_seconds=1.0
-):
+def setup_services(tmp_path, adapter, *, audit=None, store=None):
     database = tmp_path / "manager.db"
     run_control_plane_migrations(database)
     engine = create_sqlite_engine(database)
@@ -148,7 +151,6 @@ def setup_services(
         transport_profiles=(PROFILE,),
         auto_audit=audit or Audit(),
         clock=lambda: NOW,
-        background_shutdown_timeout_seconds=shutdown_timeout_seconds,
     )
     return orchestrator, jobs, journal, credential_store, client, engine
 
@@ -169,6 +171,7 @@ async def test_create_auto_returns_running_then_background_persists_and_verifies
         assert verified.state is EnrollmentState.VERIFIED
         assert verified.remote_instance_id == INSTANCE_ID
         assert verified.remote_credential_id == CREDENTIAL_ID
+        assert verified.validated_http_address == "10.20.30.40"
         assert store.read(verified.credential_temp_ref) == TOKEN
         assert client.calls == 1
         assert [event[0] for event in audit.events] == ["intent", "outcome"]
@@ -317,13 +320,13 @@ async def test_shutdown_is_bounded_when_adapter_swallows_cancel_and_late_result_
         Adapter(ignores_cancel),
         audit=audit,
         store=store,
-        shutdown_timeout_seconds=0.02,
     )
     try:
         created = orchestrator.create_auto(request(), AUDIT_CONTEXT)
         await started.wait()
         background = next(iter(orchestrator._background_tasks.values()))
 
+        asyncio.get_running_loop().call_later(0.05, release.set)
         await asyncio.wait_for(orchestrator.shutdown(), timeout=0.2)
 
         assert orchestrator.background_task_count == 0
@@ -608,6 +611,7 @@ async def test_http_validation_failure_keeps_recoverable_secret_and_exact_audit_
         current = journal.get(created.job.enrollment_id)
         assert current.state is EnrollmentState.VERIFYING
         assert current.credential_temp_ref is not None
+        assert current.validated_http_address == "10.20.30.40"
         assert store.read(current.credential_temp_ref) == TOKEN
         assert audit.events[-1][2:] == (
             "failure",

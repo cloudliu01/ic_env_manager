@@ -129,10 +129,9 @@ class EnrollmentOrchestrator:
         agent_client: EnrollmentAgentClient | None,
         registry: Any,
         clock: Callable[[], datetime] | None = None,
-        ssh_adapter: SshEnrollmentAdapter | Any | None = None,
+        ssh_adapter: SshEnrollmentAdapter | None = None,
         transport_profiles: tuple[TransportProfile, ...] = (),
         auto_audit: Any | None = None,
-        background_shutdown_timeout_seconds: float = 1.0,
     ) -> None:
         self.jobs = jobs
         self.journal = journal
@@ -147,7 +146,6 @@ class EnrollmentOrchestrator:
         self._auto_audit = auto_audit
         self._background_tasks: dict[str, asyncio.Task[None]] = {}
         self._closing = False
-        self._background_shutdown_timeout_seconds = background_shutdown_timeout_seconds
         self._validation_cache: dict[str, EnrollmentValidation] = {}
         self._recovery_owner = str(uuid4())
         max_operation = getattr(agent_client, "max_network_operation_seconds", 10.0)
@@ -201,20 +199,7 @@ class EnrollmentOrchestrator:
         tasks = tuple(self._background_tasks.values())
         for task in tasks:
             task.cancel()
-        if not tasks:
-            return
-        _done, pending = await asyncio.wait(
-            tasks, timeout=self._background_shutdown_timeout_seconds
-        )
-        for task in pending:
-            task.cancel()
-        if pending:
-            _done, pending = await asyncio.wait(
-                pending, timeout=self._background_shutdown_timeout_seconds
-            )
-        for enrollment_id, task in tuple(self._background_tasks.items()):
-            if task in pending:
-                self._background_tasks.pop(enrollment_id, None)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     def get(self, enrollment_id: str) -> EnrollmentPublicResult:
         return EnrollmentPublicResult(
@@ -495,6 +480,9 @@ class EnrollmentOrchestrator:
                         remote_instance_id=helper.instance_id,
                         remote_credential_id=helper.credential_id,
                         credential_temp_ref=reference,
+                        validated_http_address=str(
+                            helper.validation_target.pinned_address
+                        ),
                         updated_at=self._now(),
                     ),
                     expected_state=EnrollmentState.RUNNING,
@@ -585,6 +573,12 @@ class EnrollmentOrchestrator:
         if not job.credential_temp_ref:
             self._fail_claim(job, "credential_store_unavailable")
             return
+        if job.enrollment_method is EnrollmentMethod.LEGACY_ADMIN_TOKEN:
+            self._fail_claim(job, "enrollment_recovery_unavailable")
+            return
+        if not job.validated_http_address:
+            self._fail_claim(job, "target_address_forbidden")
+            return
         current = job
         if current.state is EnrollmentState.CREDENTIAL_ISSUED:
             transitioned = self._transition_claimed(
@@ -594,8 +588,10 @@ class EnrollmentOrchestrator:
                 return
             current = transitioned
         try:
-            target = self.agent_client.prepare(
-                current.normalized_endpoint, current.transport_profile_id
+            target = self.agent_client.prepare_pinned(
+                current.normalized_endpoint,
+                current.transport_profile_id,
+                current.validated_http_address,
             )
             token = self.credential_store.read(current.credential_temp_ref)
         except EnrollmentValidationError as exc:
@@ -604,15 +600,12 @@ class EnrollmentOrchestrator:
         except CredentialStoreError:
             self._fail_claim(current, "credential_store_unavailable")
             return
-        if current.enrollment_method is EnrollmentMethod.LEGACY_ADMIN_TOKEN:
-            operation = self.agent_client.validate_legacy(target, token)
-        else:
-            if not current.remote_instance_id:
-                self._fail_claim(current, "agent_identity_missing")
-                return
-            operation = self.agent_client.validate_pending(
-                target, token, helper_instance_id=current.remote_instance_id
-            )
+        if not current.remote_instance_id:
+            self._fail_claim(current, "agent_identity_missing")
+            return
+        operation = self.agent_client.validate_pending(
+            target, token, helper_instance_id=current.remote_instance_id
+        )
         outcome = await self._run_with_recovery_lease(current, operation)
         if outcome is None:
             return
@@ -740,12 +733,18 @@ class EnrollmentOrchestrator:
         current = job
         if current.state is EnrollmentState.ACTIVATION_REQUESTED:
             if current.enrollment_method is not EnrollmentMethod.LEGACY_ADMIN_TOKEN:
-                if self.agent_client is None or not current.remote_credential_id:
+                if (
+                    self.agent_client is None
+                    or not current.remote_credential_id
+                    or not current.validated_http_address
+                ):
                     self._fail_claim(current, "enrollment_unavailable")
                     return
                 try:
-                    target = self.agent_client.prepare(
-                        current.normalized_endpoint, current.transport_profile_id
+                    target = self.agent_client.prepare_pinned(
+                        current.normalized_endpoint,
+                        current.transport_profile_id,
+                        current.validated_http_address,
                     )
                     token = self.credential_store.read(current.credential_temp_ref)
                 except EnrollmentValidationError as exc:

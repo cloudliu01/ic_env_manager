@@ -22,6 +22,7 @@ from ic_env_guard.config.models import (
     ServerConfig,
     TrustedLanHttpServerConfig,
 )
+from ic_env_guard.enrollment.ssh import SshEnrollmentAdapter
 from ic_env_guard.services.manager import ServiceManager
 from ic_env_guard.terminal.manager import TerminalManager
 
@@ -119,6 +120,7 @@ def test_build_manager_container_constructs_control_plane_dependencies(tmp_path)
     assert container.config is config
     assert isinstance(container.agent_registry, AgentRegistry)
     assert isinstance(container.agent_availability, AgentAvailabilityService)
+    assert isinstance(container.ssh_enrollment_adapter, SshEnrollmentAdapter)
     assert container.control_plane_session_factory.kw["bind"] is container.database_engine
     assert config.control_plane.audit_database.exists()
     container.database_engine.dispose()

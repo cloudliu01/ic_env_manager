@@ -123,3 +123,4 @@ class EnrollmentJob:
     recovery_owner: str | None = None
     recovery_lease_until: datetime | None = None
     recovery_revision: int = 0
+    validated_http_address: str | None = None

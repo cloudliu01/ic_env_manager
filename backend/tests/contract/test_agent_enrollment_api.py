@@ -220,7 +220,12 @@ def test_create_and_background_auto_have_separate_durable_audit_events(
             token=b"eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg",
             expires_at=min(request.expires_at, datetime.now(UTC) + timedelta(minutes=5)),
             validation_target=type(
-                "ValidationTarget", (), {"normalized_endpoint": request.base_url}
+                "ValidationTarget",
+                (),
+                {
+                    "normalized_endpoint": request.base_url,
+                    "pinned_address": "10.20.30.40",
+                },
             )(),
         )
 

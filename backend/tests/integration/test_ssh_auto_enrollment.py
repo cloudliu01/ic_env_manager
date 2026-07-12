@@ -379,6 +379,36 @@ async def test_issue_kills_child_that_ignores_term_after_timeout(tmp_path):
 
 
 @pytest.mark.integration
+async def test_cancellation_kills_and_reaps_real_adapter_child_that_ignores_term(
+    tmp_path, monkeypatch
+):
+    executable = _script(
+        tmp_path,
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+    )
+    processes = []
+    real_spawn = asyncio.create_subprocess_exec
+
+    async def capture_spawn(*args, **kwargs):
+        process = await real_spawn(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(
+        "ic_env_guard.enrollment.ssh.asyncio.create_subprocess_exec", capture_spawn
+    )
+    task = asyncio.create_task(_adapter(executable, timeout=10).issue(_request(), TRUSTED))
+    while len(processes) < 2:
+        await asyncio.sleep(0.01)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert processes[1].returncode is not None
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "actual",
     (

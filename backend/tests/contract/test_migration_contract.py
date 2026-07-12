@@ -72,7 +72,7 @@ def _create_applied_parent_fleet_schema(connection):
             'https://lab-01.example:8765', 'system-tls', NULL, 'lab-01', 'Lab 01',
             'agent', 'lab-01.example', 22, 'ssh_auto',
             '11111111-1111-1111-1111-111111111111', 'remote-1',
-            'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', NULL, NULL, 1,
+            NULL, NULL, NULL, 1,
             '2026-07-12T10:10:00.000000Z', NULL,
             '2026-07-12T10:00:00.000000Z', '2026-07-12T10:00:00.000000Z'
         );
@@ -172,6 +172,7 @@ def test_fleet_registry_migration_has_exact_control_plane_tables(tmp_path):
                     "credential_temp_ref", "old_credential_ref", "old_remote_credential_id",
                     "save_requested", "expires_at", "last_error_code", "created_at", "updated_at",
                     "recovery_owner", "recovery_lease_until", "recovery_revision",
+                    "validated_http_address",
             ),
         }
         for table, columns in expected_columns.items():
@@ -251,7 +252,7 @@ def test_fleet_hardening_forward_migration_preserves_parent_schema_data(tmp_path
         ).fetchone() == ("ready", "healthy")
         assert connection.execute(
             "SELECT state, credential_temp_ref FROM agent_enrollment_jobs"
-        ).fetchone() == ("consumed", "b" * 48)
+        ).fetchone() == ("consumed", None)
         versions = connection.execute(
             "SELECT version FROM schema_versions ORDER BY version"
         ).fetchall()
@@ -379,7 +380,7 @@ def test_legacy_manual_migration_preserves_rows_indexes_fks_and_checks(tmp_path)
             item[2] == "agents" and item[6] == "CASCADE"
             for item in connection.execute("PRAGMA foreign_key_list(agent_status)")
         )
-        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (7,)
         status_indexes = {
             row[1] for row in connection.execute("PRAGMA index_list(agent_status)")
         }
@@ -683,5 +684,97 @@ def test_enrollment_recovery_migration_rejects_invalid_old_phase_without_changes
             "WHERE version='0005_enrollment_recovery_hardening'"
         ).fetchone() is None
         assert len(connection.execute("PRAGMA table_info(agent_enrollment_jobs)").fetchall()) == 22
+    finally:
+        connection.close()
+
+
+@pytest.mark.contract
+def test_validated_address_migration_preserves_legal_pending_ssh_row(tmp_path):
+    db_path = tmp_path / "control-plane.db"
+    connection = sqlite3.connect(db_path)
+    try:
+        _run_control_plane_through(connection, "0006_enrollment_recovery_fencing.py")
+        connection.execute(
+            """INSERT INTO agent_enrollment_jobs (
+                enrollment_id, manager_id, state, normalized_endpoint,
+                transport_profile_id, ssh_user, ssh_host, ssh_port, enrollment_method,
+                save_requested, expires_at, created_at, updated_at, recovery_revision
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "pending-pin", "22222222-2222-4222-8222-222222222222", "pending",
+                "https://agent.example:8765", "system-tls", "edaops",
+                "agent.example", 22, "ssh_auto", 0,
+                "2026-07-12T12:10:00.000000Z", "2026-07-12T12:00:00.000000Z",
+                "2026-07-12T12:00:00.000000Z", 0,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    run_control_plane_migrations(db_path)
+    connection = sqlite3.connect(db_path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone() == (7,)
+        assert connection.execute(
+            "SELECT validated_http_address FROM agent_enrollment_jobs"
+        ).fetchone() == (None,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.contract
+def test_validated_address_migration_rejects_unbound_ssh_credential_atomically(tmp_path):
+    db_path = tmp_path / "control-plane.db"
+    connection = sqlite3.connect(db_path)
+    try:
+        _run_control_plane_through(connection, "0006_enrollment_recovery_fencing.py")
+        connection.execute(
+            """INSERT INTO agent_enrollment_jobs (
+                enrollment_id, manager_id, state, normalized_endpoint,
+                transport_profile_id, ssh_user, ssh_host, ssh_port, enrollment_method,
+                remote_instance_id, credential_temp_ref, save_requested,
+                expires_at, created_at, updated_at, recovery_revision
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "issued-no-pin", "22222222-2222-4222-8222-222222222222",
+                "credential_issued", "https://agent.example:8765", "system-tls",
+                "edaops", "agent.example", 22, "ssh_auto", "instance-1", "a" * 48,
+                0, "2026-07-12T12:10:00.000000Z", "2026-07-12T12:00:00.000000Z",
+                "2026-07-12T12:00:00.000000Z", 0,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(sqlite3.IntegrityError, match="validated address"):
+        run_control_plane_migrations(db_path)
+    connection = sqlite3.connect(db_path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
+        assert "validated_http_address" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(agent_enrollment_jobs)")
+        }
+    finally:
+        connection.close()
+
+
+@pytest.mark.contract
+def test_validated_address_downgrade_is_forward_only_without_mutation(tmp_path):
+    db_path = tmp_path / "control-plane.db"
+    run_control_plane_migrations(db_path)
+    migration = _load_migration(
+        CONTROL_PLANE_MIGRATIONS / "0007_enrollment_validated_http_address.py"
+    )
+    connection = sqlite3.connect(db_path)
+    before = connection.execute("SELECT * FROM schema_versions ORDER BY version").fetchall()
+    try:
+        with pytest.raises(sqlite3.NotSupportedError):
+            migration.downgrade(connection)
+        assert connection.execute("PRAGMA user_version").fetchone() == (7,)
+        assert connection.execute(
+            "SELECT * FROM schema_versions ORDER BY version"
+        ).fetchall() == before
     finally:
         connection.close()

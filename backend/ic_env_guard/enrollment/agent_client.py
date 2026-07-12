@@ -65,6 +65,21 @@ class EnrollmentAgentClient:
                 exc.code, dispatch_state="not_dispatched"
             ) from exc
 
+    def prepare_pinned(
+        self, endpoint: str, profile_id: str, stored_ip: str
+    ) -> ValidatedTarget:
+        try:
+            profile = self._profiles[profile_id]
+            return self._policy.revalidate_pinned_target(endpoint, profile, stored_ip)
+        except KeyError as exc:
+            raise EnrollmentValidationError(
+                "transport_profile_invalid", dispatch_state="not_dispatched"
+            ) from exc
+        except TargetPolicyError as exc:
+            raise EnrollmentValidationError(
+                exc.code, dispatch_state="not_dispatched"
+            ) from exc
+
     async def validate_legacy(
         self, target: ValidatedTarget, token: bytes
     ) -> EnrollmentValidation:

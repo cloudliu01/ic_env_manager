@@ -103,9 +103,11 @@ async def test_legacy_credential_is_journaled_before_network_validation(tmp_path
         assert "legacy-never-serialized" not in journal.dump_serialized_rows()
         orchestrator._validation_cache.clear()
         await orchestrator.recover()
-        assert orchestrator.get(result.job.enrollment_id).to_public_dict()["preview"][
-            "agent"
-        ]["api_version"] == "1"
+        recovered = orchestrator.get(result.job.enrollment_id)
+        assert recovered.job.state is EnrollmentState.FAILED
+        assert recovered.job.last_error_code == "enrollment_recovery_unavailable"
+        assert recovered.job.credential_temp_ref is None
+        assert len(observations) == 1
     finally:
         engine.dispose()
 
@@ -157,11 +159,85 @@ async def test_startup_recovery_resumes_verification_before_orphan_cleanup(tmp_p
 
         await orchestrator.recover_and_cleanup()
 
-        assert calls == ["prepare", "validate"]
-        assert journal.get(pending.enrollment_id).state is EnrollmentState.VERIFIED
-        assert store.read(reference) == b"recover-me"
+        assert calls == []
+        residual = journal.get(pending.enrollment_id)
+        assert residual.state is EnrollmentState.FAILED
+        assert residual.last_error_code == "enrollment_recovery_unavailable"
+        assert residual.credential_temp_ref is None
+        with pytest.raises(Exception, match="credential not found"):
+            store.read(reference)
         with pytest.raises(Exception, match="credential not found"):
             store.read(orphan)
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_ssh_recovery_uses_durable_pin_without_prepare_or_dns(tmp_path):
+    calls = []
+
+    class Client:
+        def prepare(self, *_args):
+            raise AssertionError("recovery must not resolve DNS")
+
+        def prepare_pinned(self, endpoint, profile, stored_ip):
+            calls.append(("pinned", endpoint, profile, stored_ip))
+            return SimpleNamespace(normalized_endpoint=endpoint)
+
+        async def validate_pending(self, _target, token, *, helper_instance_id):
+            calls.append(("validate", token, helper_instance_id))
+            return validation()
+
+    orchestrator, jobs, journal, _registry, store, engine = setup_services(
+        tmp_path, Client()
+    )
+    try:
+        pending = jobs.create(
+            EnrollmentJobRequest(
+                normalized_endpoint="https://agent.example:8765",
+                transport_profile_id="system-tls",
+                ssh_user="edaops",
+                ssh_host="agent.example",
+                ssh_port=22,
+                enrollment_method=EnrollmentMethod.SSH_AUTO,
+            ),
+            now=NOW,
+        )
+        reference = store.put(b"durably-pinned")
+        running = journal.replace_if_state(
+            replace(pending, state=EnrollmentState.RUNNING),
+            expected_state=EnrollmentState.PENDING,
+        )
+        journal.replace_if_state(
+            replace(
+                running,
+                state=EnrollmentState.CREDENTIAL_ISSUED,
+                credential_temp_ref=reference,
+                remote_instance_id="33333333-3333-4333-8333-333333333333",
+                remote_credential_id="remote-credential",
+                validated_http_address="10.20.30.40",
+            ),
+            expected_state=EnrollmentState.RUNNING,
+        )
+
+        await orchestrator.recover()
+
+        recovered = journal.get(pending.enrollment_id)
+        assert recovered.state is EnrollmentState.VERIFIED
+        assert recovered.validated_http_address == "10.20.30.40"
+        assert calls == [
+            (
+                "pinned",
+                "https://agent.example:8765",
+                "system-tls",
+                "10.20.30.40",
+            ),
+            (
+                "validate",
+                b"durably-pinned",
+                "33333333-3333-4333-8333-333333333333",
+            ),
+        ]
     finally:
         engine.dispose()
 
@@ -574,9 +650,11 @@ async def test_recovery_transport_failure_retains_visible_credential_residual(tm
         await orchestrator.recover_and_cleanup()
 
         residual = journal.get(pending.enrollment_id)
-        assert residual.state is EnrollmentState.VERIFYING
-        assert residual.credential_temp_ref == reference
-        assert store.read(reference) == b"retain-on-network-failure"
+        assert residual.state is EnrollmentState.FAILED
+        assert residual.last_error_code == "enrollment_recovery_unavailable"
+        assert residual.credential_temp_ref is None
+        with pytest.raises(Exception, match="credential not found"):
+            store.read(reference)
     finally:
         engine.dispose()
 
@@ -631,8 +709,11 @@ async def test_concurrent_recovery_claim_dispatches_network_once(tmp_path):
 
         await asyncio.gather(first.recover(), second.recover())
 
-        assert calls == 1
-        assert journal.get(pending.enrollment_id).state is EnrollmentState.VERIFIED
+        assert calls == 0
+        assert journal.get(pending.enrollment_id).last_error_code == (
+            "enrollment_recovery_unavailable"
+        )
+        assert journal.get(pending.enrollment_id).state is EnrollmentState.FAILED
     finally:
         engine.dispose()
 
@@ -696,8 +777,8 @@ async def test_recovery_renews_one_second_lease_during_slow_network_call(tmp_pat
         await second.recover()
         await first_recovery
 
-        assert calls == 1
-        assert journal.get(pending.enrollment_id).state is EnrollmentState.VERIFIED
+        assert calls == 0
+        assert journal.get(pending.enrollment_id).state is EnrollmentState.FAILED
     finally:
         engine.dispose()
 
@@ -751,8 +832,8 @@ async def test_recovery_discards_network_result_when_renewal_fence_is_lost(
         await orchestrator.recover()
 
         current = journal.get(pending.enrollment_id)
-        assert cancelled is True
-        assert current.state is EnrollmentState.VERIFYING
+        assert cancelled is False
+        assert current.state is EnrollmentState.FAILED
         assert pending.enrollment_id not in orchestrator._validation_cache
     finally:
         engine.dispose()

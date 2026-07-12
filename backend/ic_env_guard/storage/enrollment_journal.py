@@ -2,6 +2,7 @@ import json
 import re
 import sqlite3
 from datetime import datetime, timedelta
+from ipaddress import ip_address
 from typing import Any
 from uuid import UUID
 
@@ -25,7 +26,7 @@ _COLUMNS = (
     "ssh_port, enrollment_method, remote_instance_id, remote_credential_id, "
     "credential_temp_ref, old_credential_ref, old_remote_credential_id, save_requested, "
     "expires_at, last_error_code, created_at, updated_at, recovery_owner, "
-    "recovery_lease_until, recovery_revision"
+    "recovery_lease_until, recovery_revision, validated_http_address"
 )
 _ENROLLMENT_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _CREDENTIAL_REF = re.compile(r"^[0-9a-f]{48}$")
@@ -144,6 +145,21 @@ def _validate_job(job: EnrollmentJob) -> None:
         raise RegistryInvariantError("recovery revision must not be negative")
     if job.last_error_code is not None and not _ERROR_CODE.fullmatch(job.last_error_code):
         raise RegistryInvariantError("enrollment error code is invalid")
+    pinned = job.validated_http_address
+    if pinned is not None:
+        try:
+            if str(ip_address(pinned)) != pinned:
+                raise ValueError
+        except ValueError as exc:
+            raise RegistryInvariantError("validated HTTP address is invalid") from exc
+    credential_pin_required = job.state in credential_states or (
+        job.state.terminal and job.credential_temp_ref is not None
+    )
+    if job.enrollment_method is EnrollmentMethod.LEGACY_ADMIN_TOKEN:
+        if pinned is not None:
+            raise RegistryInvariantError("legacy enrollment cannot store a pinned address")
+    elif credential_pin_required != (pinned is not None):
+        raise RegistryInvariantError("SSH credential phase requires a pinned address")
     for reference in (
         job.credential_temp_ref,
         job.old_credential_ref,
@@ -182,6 +198,7 @@ def _job(row: Any) -> EnrollmentJob:
         recovery_owner=row[22],
         recovery_lease_until=_parse_time(row[23]),
         recovery_revision=row[24],
+        validated_http_address=row[25],
     )
 
 
@@ -195,7 +212,7 @@ class EnrollmentJournalRepository(_SQLiteRepository):
             with self._write() as connection:
                 connection.execute(
                     f"INSERT INTO agent_enrollment_jobs ({_COLUMNS}) "
-                    f"VALUES ({','.join('?' * 25)})",
+                    f"VALUES ({','.join('?' * 26)})",
                     self._values(job),
                 )
             return job
@@ -239,7 +256,7 @@ class EnrollmentJournalRepository(_SQLiteRepository):
                     raise RegistryConflict("agent_enrollment_capacity")
                 connection.execute(
                     f"INSERT INTO agent_enrollment_jobs ({_COLUMNS}) "
-                    f"VALUES ({','.join('?' * 25)})",
+                    f"VALUES ({','.join('?' * 26)})",
                     self._values(job),
                 )
             return job
@@ -590,12 +607,13 @@ class EnrollmentJournalRepository(_SQLiteRepository):
         try:
             with self._write() as connection:
                 cursor = connection.execute(
-                    "UPDATE agent_enrollment_jobs SET recovery_owner=NULL, "
+                    "UPDATE agent_enrollment_jobs SET state=?, recovery_owner=NULL, "
                     "recovery_lease_until=NULL, recovery_revision=recovery_revision+1, "
                     "last_error_code=?, updated_at=? WHERE enrollment_id=? "
                     "AND recovery_owner=? AND recovery_revision=? "
                     "AND recovery_lease_until>?",
                     (
+                        EnrollmentState.FAILED.value,
                         error_code,
                         _format_time(now),
                         enrollment_id,
@@ -644,6 +662,7 @@ class EnrollmentJournalRepository(_SQLiteRepository):
             with self._write() as connection:
                 cursor = connection.execute(
                     "UPDATE agent_enrollment_jobs SET credential_temp_ref=NULL, "
+                    "validated_http_address=NULL, "
                     "last_error_code=CASE WHEN last_error_code='credential_cleanup_failed' "
                     "THEN NULL ELSE last_error_code END, updated_at=? "
                     "WHERE enrollment_id=? AND state=? "
@@ -760,4 +779,5 @@ class EnrollmentJournalRepository(_SQLiteRepository):
             job.recovery_owner,
             _format_time(job.recovery_lease_until),
             job.recovery_revision,
+            job.validated_http_address,
         )

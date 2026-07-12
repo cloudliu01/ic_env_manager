@@ -216,7 +216,7 @@ def enrollment_job(**changes) -> EnrollmentJob:
         "enrollment_method": EnrollmentMethod.SSH_AUTO,
         "remote_instance_id": None,
         "remote_credential_id": None,
-        "credential_temp_ref": "b" * 48,
+        "credential_temp_ref": None,
         "old_credential_ref": None,
         "old_remote_credential_id": None,
         "save_requested": False,
@@ -255,7 +255,7 @@ def test_enrollment_journal_enforces_method_and_recovery_invariants(repositories
 
     valid = journal.create(enrollment_job())
     assert journal.get(valid.enrollment_id) == valid
-    assert journal.non_terminal_credential_references() == {"b" * 48}
+    assert journal.non_terminal_credential_references() == set()
 
     journal.set_state(
         valid.enrollment_id,
@@ -263,7 +263,7 @@ def test_enrollment_journal_enforces_method_and_recovery_invariants(repositories
         NOW + timedelta(seconds=1),
         expected_state=EnrollmentState.PENDING,
     )
-    assert journal.recovery_credential_references() == {"b" * 48}
+    assert journal.recovery_credential_references() == set()
 
 
 @pytest.mark.unit

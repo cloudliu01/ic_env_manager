@@ -147,3 +147,44 @@ def test_dns_failure_has_stable_safe_error():
         ).resolve("https://agent.example", VERIFIED_TLS)
     assert error.value.code == "agent_network_error"
     assert "secret" not in error.value.message
+
+
+@pytest.mark.unit
+def test_revalidate_pinned_target_never_resolves_and_preserves_http_identity():
+    def must_not_resolve(_host, _port):
+        raise AssertionError("recovery must not perform DNS")
+
+    policy = AgentTargetPolicy(
+        allowed_agent_cidrs=["10.0.0.0/8"],
+        resolver=must_not_resolve,
+        self_targets=[("10.0.0.1", 8765)],
+    )
+    target = policy.revalidate_pinned_target(
+        "https://Agent.Example:9443", VERIFIED_TLS, "10.20.30.40"
+    )
+
+    assert str(target.pinned_address) == "10.20.30.40"
+    assert target.host_header == "agent.example:9443"
+    assert target.sni_hostname == "agent.example"
+
+
+@pytest.mark.unit
+def test_revalidate_pinned_target_requires_canonical_current_policy_address():
+    policy = AgentTargetPolicy(
+        allowed_agent_cidrs=["fd20::/16"],
+        resolver=lambda *_args: (_ for _ in ()).throw(AssertionError("no DNS")),
+        self_targets=[("fd20::1", 8765)],
+    )
+    target = policy.revalidate_pinned_target(
+        "https://agent.example:8765", VERIFIED_TLS, "fd20::30"
+    )
+    assert target.pinned_url == "https://[fd20::30]:8765"
+
+    with pytest.raises(TargetPolicyError, match="target_address_forbidden"):
+        policy.revalidate_pinned_target(
+            "https://agent.example:8765", VERIFIED_TLS, "fd20:0:0::30"
+        )
+    with pytest.raises(TargetPolicyError, match="target_address_not_allowed"):
+        policy.revalidate_pinned_target(
+            "https://agent.example:8765", VERIFIED_TLS, "10.20.30.40"
+        )

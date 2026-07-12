@@ -77,6 +77,51 @@ class AgentTargetPolicy:
         safety = self.validate_safety(endpoint)
         return self.resolve_validated(safety, profile)
 
+    def revalidate_pinned_target(
+        self, endpoint: str, profile: TransportProfile, stored_ip: str
+    ) -> ValidatedTarget:
+        scheme, hostname, port = _parse_endpoint(endpoint)
+        _validate_profile_scheme(scheme, profile)
+        try:
+            address = ip_address(stored_ip)
+        except ValueError:
+            raise TargetPolicyError(
+                "target_address_forbidden", "the stored Agent address is invalid"
+            ) from None
+        if str(address) != stored_ip or _is_forbidden(address):
+            raise TargetPolicyError(
+                "target_address_forbidden", "the stored Agent address is forbidden"
+            )
+        if (address, port) in self._self_targets:
+            raise TargetPolicyError("target_is_manager", "the Agent target is the Manager")
+        profile_allowlist = (
+            tuple(profile.allowed_cidrs)
+            if isinstance(profile, TrustedLanHttpProfile)
+            else self._allowed
+        )
+        if not _in_any(address, self._allowed) or not _in_any(address, profile_allowlist):
+            raise TargetPolicyError(
+                "target_address_not_allowed", "the Agent address is outside the allowlist"
+            )
+        explicit_host = _url_host(hostname)
+        default_port = 443 if scheme == "https" else 80
+        return ValidatedTarget(
+            normalized_endpoint=f"{scheme}://{explicit_host}:{port}",
+            scheme=scheme,
+            hostname=hostname,
+            port=port,
+            resolved_addresses=(address,),
+            pinned_address=address,
+            host_header=explicit_host if port == default_port else f"{explicit_host}:{port}",
+            sni_hostname=hostname if scheme == "https" else None,
+            warning_code=(
+                "trusted_lan_http_unencrypted"
+                if isinstance(profile, TrustedLanHttpProfile)
+                else None
+            ),
+            profile=profile,
+        )
+
     def validate_safety(self, endpoint: str) -> SafetyValidatedTarget:
         return self._validate_safety(endpoint, allow_loopback_http=False)
 
