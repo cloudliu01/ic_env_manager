@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, Integer, Select, String, Text, select
+from sqlalchemy import DateTime, Integer, Select, String, Text, select, update
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from ic_env_guard.db.repositories import bounded_text
@@ -91,6 +91,32 @@ class ControlPlaneAuditRepository:
         row.failure_category = bounded_text(failure_category, 64)
         row.failure_reason = bounded_text(failure_reason)
         return row
+
+    def finalize_pending(
+        self,
+        event_id: int,
+        *,
+        expected_operation: str,
+        expected_target: str,
+        result: str,
+        dispatch_state: str,
+        failure_category: str | None = None,
+    ) -> bool:
+        outcome = self.session.execute(
+            update(ControlPlaneAuditEvent)
+            .where(
+                ControlPlaneAuditEvent.id == event_id,
+                ControlPlaneAuditEvent.result == "pending",
+                ControlPlaneAuditEvent.operation == bounded_text(expected_operation, 255),
+                ControlPlaneAuditEvent.target == bounded_text(expected_target, 255),
+            )
+            .values(
+                result=bounded_text(result, 32) or result,
+                dispatch_state=bounded_text(dispatch_state, 32) or dispatch_state,
+                failure_category=bounded_text(failure_category, 64),
+            )
+        )
+        return outcome.rowcount == 1
 
     def query(
         self,

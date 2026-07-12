@@ -57,6 +57,58 @@ def test_control_plane_audit_repository_persists_and_filters(tmp_path):
 
 
 @pytest.mark.integration
+def test_finalize_pending_is_binding_checked_and_idempotent(tmp_path):
+    audit_database = tmp_path / "control-plane.db"
+    run_control_plane_migrations(audit_database)
+    engine = create_sqlite_engine(audit_database)
+    with create_session_factory(engine)() as session:
+        repo = ControlPlaneAuditRepository(session)
+        event = repo.record_intent(
+            ControlPlaneAuditEventCreate(
+                actor_id="local-admin",
+                source_addr="127.0.0.1",
+                agent_id=None,
+                operation="discovery.start",
+                target="discovery:lab",
+                correlation_id="corr-discovery",
+            )
+        )
+        session.commit()
+
+        assert not repo.finalize_pending(
+            event.id,
+            expected_operation="discovery.start",
+            expected_target="discovery:other",
+            result="failed",
+            dispatch_state="unknown",
+            failure_category="forged",
+        )
+        assert repo.finalize_pending(
+            event.id,
+            expected_operation="discovery.start",
+            expected_target="discovery:lab",
+            result="success",
+            dispatch_state="dispatched",
+        )
+        session.commit()
+        assert not repo.finalize_pending(
+            event.id,
+            expected_operation="discovery.start",
+            expected_target="discovery:lab",
+            result="failed",
+            dispatch_state="unknown",
+            failure_category="late_overwrite",
+        )
+        session.commit()
+        stored = repo.list_events(correlation_id="corr-discovery")[0]
+    engine.dispose()
+
+    assert stored["result"] == "success"
+    assert stored["dispatch_state"] == "dispatched"
+    assert stored["failure_category"] is None
+
+
+@pytest.mark.integration
 def test_control_plane_audit_route_returns_bounded_filtered_events(tmp_path):
     audit_database = tmp_path / "control-plane.db"
     run_control_plane_migrations(audit_database)

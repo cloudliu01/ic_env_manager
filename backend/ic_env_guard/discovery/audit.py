@@ -10,26 +10,31 @@ class DiscoveryAuditOutcomeRecorder:
         self._health = health
 
     def __call__(self, job: DiscoveryJob) -> None:
-        success = job.state in {DiscoveryState.COMPLETED, DiscoveryState.CANCELLED}
+        success = job.state is DiscoveryState.COMPLETED
+        if job.checked_targets:
+            dispatch_state = "dispatched"
+        elif job.state is DiscoveryState.CANCELLED:
+            dispatch_state = "not_dispatched"
+        else:
+            dispatch_state = "unknown"
+        failure_category = None
+        if job.state is DiscoveryState.CANCELLED:
+            failure_category = "discovery_cancelled"
+        elif job.state is DiscoveryState.FAILED:
+            failure_category = job.safe_error_code or "discovery_failed"
         try:
             with self._session_factory() as session:
-                ControlPlaneAuditRepository(session).finalize(
+                ControlPlaneAuditRepository(session).finalize_pending(
                     job.start_audit_event_id,
+                    expected_operation="discovery.start",
+                    expected_target=f"discovery:{job.scope_id}",
                     result="success" if success else "failed",
-                    dispatch_state=(
-                        "dispatched" if job.checked_targets else "not_dispatched"
-                    ),
-                    failure_category=(
-                        job.safe_error_code
-                        if not success
-                        else (
-                            "discovery_cancelled"
-                            if job.state is DiscoveryState.CANCELLED
-                            else None
-                        )
-                    ),
+                    dispatch_state=dispatch_state,
+                    failure_category=failure_category,
                 )
                 session.commit()
+            if self._health is not None:
+                self._health.mark_healthy()
         except Exception:
             if self._health is not None:
                 self._health.mark_unhealthy()

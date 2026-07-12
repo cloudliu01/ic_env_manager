@@ -149,6 +149,9 @@ class DiscoveryService:
         for job in terminal:
             if self._outcome_recorder is not None:
                 self._outcome_recorder(job)
+        if self._outcome_recorder is not None:
+            for job in self.repository.terminal_jobs_with_pending_audit():
+                self._outcome_recorder(job)
         self.repository.cleanup(
             retained_after=now - timedelta(seconds=self.config.retention_seconds)
         )

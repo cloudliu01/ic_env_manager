@@ -23,7 +23,13 @@ def _audit_id(database):
         cursor = connection.execute(
             "INSERT INTO control_plane_audit_events(timestamp,operation,target,result,"
             "dispatch_state) VALUES (?,?,?,?,?)",
-            (NOW.isoformat(), "discovery.start", "scope:lab", "pending", "not_dispatched"),
+            (
+                NOW.isoformat(),
+                "discovery.start",
+                "discovery:lab",
+                "pending",
+                "not_dispatched",
+            ),
         )
         connection.commit()
         return cursor.lastrowid

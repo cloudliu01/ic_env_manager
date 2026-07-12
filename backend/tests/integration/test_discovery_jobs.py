@@ -4,11 +4,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from ic_env_guard.api.audit_health import AuditStorageHealth
 from ic_env_guard.config.models import ControlPlaneConfig
 from ic_env_guard.db.control_plane_migrations import run_control_plane_migrations
-from ic_env_guard.db.session import create_sqlite_engine
+from ic_env_guard.db.session import create_session_factory, create_sqlite_engine
+from ic_env_guard.discovery.audit import DiscoveryAuditOutcomeRecorder
 from ic_env_guard.discovery.models import (
     DiscoveryFingerprint,
+    DiscoveryJob,
     DiscoveryState,
     DiscoveryTarget,
 )
@@ -53,13 +56,45 @@ def _audit_id(database):
             (
                 datetime.now(UTC).isoformat(),
                 "discovery.start",
-                "scope:lab",
+                "discovery:lab",
                 "pending",
                 "not_dispatched",
             ),
         )
         connection.commit()
         return cursor.lastrowid
+
+
+def _audit(database, event_id):
+    with sqlite3.connect(database) as connection:
+        return connection.execute(
+            "SELECT result,dispatch_state,failure_category FROM "
+            "control_plane_audit_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+
+
+def _finished_job(database, repository, *, job_id, state, now, checked=True):
+    job = DiscoveryJob(
+        job_id, "lab", DiscoveryState.QUEUED, 1, 0, 0, False, None,
+        _audit_id(database), now + timedelta(seconds=120), now, now,
+    )
+    repository.create_job(job)
+    repository.claim(job_id, now=now)
+    if checked:
+        repository.record_result(
+            job_id,
+            DiscoveryTarget("10.20.30.1", 8765, "eda-http", "http"),
+            None,
+            "network_error",
+            now=now,
+        )
+    return repository.finish(
+        job_id,
+        state,
+        now=now,
+        safe_error_code="job_timeout" if state is DiscoveryState.FAILED else None,
+    )
 
 
 @pytest.mark.integration
@@ -170,6 +205,167 @@ async def test_discovery_never_targets_manager_self_address(tmp_path):
         blocked = service.repository.list_results(job.job_id)[0]
         assert blocked.ip == "10.20.30.1"
         assert blocked.safe_error_code == "self_target_forbidden"
+    finally:
+        await service.shutdown()
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_restart_finalizes_terminal_pending_discovery_audit(tmp_path):
+    database = tmp_path / "manager.db"
+    run_control_plane_migrations(database)
+    engine = create_sqlite_engine(database)
+    repository = DiscoveryRepository(engine)
+    now = datetime.now(UTC)
+    finished = _finished_job(
+        database,
+        repository,
+        job_id="finished-before-outcome",
+        state=DiscoveryState.COMPLETED,
+        now=now,
+    )
+    service = DiscoveryService(
+        config=_config().discovery,
+        transport_profiles=_config().transport_profiles,
+        repository=repository,
+        fingerprinter=None,
+        outcome_recorder=DiscoveryAuditOutcomeRecorder(
+            create_session_factory(engine)
+        ),
+    )
+    try:
+        assert _audit(database, finished.start_audit_event_id) == (
+            "pending", "not_dispatched", None
+        )
+        await service.recover_and_cleanup()
+        assert _audit(database, finished.start_audit_event_id) == (
+            "success", "dispatched", None
+        )
+    finally:
+        await service.shutdown()
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_failed_audit_commit_is_retried_before_old_job_cleanup(tmp_path, monkeypatch):
+    database = tmp_path / "manager.db"
+    run_control_plane_migrations(database)
+    engine = create_sqlite_engine(database)
+    repository = DiscoveryRepository(engine)
+    old = datetime.now(UTC) - timedelta(days=2)
+    finished = _finished_job(
+        database,
+        repository,
+        job_id="failed-before-outcome",
+        state=DiscoveryState.FAILED,
+        now=old,
+        checked=False,
+    )
+    session_factory = create_session_factory(engine)
+    original_commit = session_factory.class_.commit
+    fail_commit = True
+
+    def commit_once_failed(session):
+        nonlocal fail_commit
+        if fail_commit:
+            fail_commit = False
+            raise RuntimeError("audit commit failed")
+        return original_commit(session)
+
+    monkeypatch.setattr(session_factory.class_, "commit", commit_once_failed)
+    audit_health = AuditStorageHealth()
+    recorder = DiscoveryAuditOutcomeRecorder(session_factory, audit_health)
+    service = DiscoveryService(
+        config=_config().discovery,
+        transport_profiles=_config().transport_profiles,
+        repository=repository,
+        fingerprinter=None,
+        outcome_recorder=recorder,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="audit commit failed"):
+            await service.recover_and_cleanup()
+        assert not audit_health.healthy
+        assert repository.get_job(finished.job_id) is not None
+        assert _audit(database, finished.start_audit_event_id)[0] == "pending"
+
+        await service.recover_and_cleanup()
+        assert audit_health.healthy
+        assert repository.get_job(finished.job_id) is None
+        assert _audit(database, finished.start_audit_event_id) == (
+            "failed", "unknown", "job_timeout"
+        )
+    finally:
+        await service.shutdown()
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_cleanup_retains_terminal_job_until_pending_audit_is_finalized(tmp_path):
+    database = tmp_path / "manager.db"
+    run_control_plane_migrations(database)
+    engine = create_sqlite_engine(database)
+    repository = DiscoveryRepository(engine)
+    old = datetime.now(UTC) - timedelta(days=2)
+    finished = _finished_job(
+        database,
+        repository,
+        job_id="old-pending",
+        state=DiscoveryState.CANCELLED,
+        now=old,
+        checked=False,
+    )
+    try:
+        repository.cleanup(retained_after=datetime.now(UTC) - timedelta(days=1))
+        assert repository.get_job(finished.job_id) is not None
+        DiscoveryAuditOutcomeRecorder(create_session_factory(engine))(finished)
+        repository.cleanup(retained_after=datetime.now(UTC) - timedelta(days=1))
+        assert repository.get_job(finished.job_id) is None
+        assert _audit(database, finished.start_audit_event_id) == (
+            "failed", "not_dispatched", "discovery_cancelled"
+        )
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("forged", ["operation", "target"])
+async def test_restart_rejects_forged_discovery_audit_binding(tmp_path, forged):
+    database = tmp_path / "manager.db"
+    run_control_plane_migrations(database)
+    engine = create_sqlite_engine(database)
+    repository = DiscoveryRepository(engine)
+    old = datetime.now(UTC) - timedelta(days=2)
+    finished = _finished_job(
+        database,
+        repository,
+        job_id=f"forged-{forged}",
+        state=DiscoveryState.COMPLETED,
+        now=old,
+    )
+    with engine.begin() as connection:
+        column, value = (
+            ("operation", "agent.remove")
+            if forged == "operation"
+            else ("target", "discovery:other")
+        )
+        connection.exec_driver_sql(
+            f"UPDATE control_plane_audit_events SET {column}=? WHERE id=?",
+            (value, finished.start_audit_event_id),
+        )
+    service = DiscoveryService(
+        config=_config().discovery,
+        transport_profiles=_config().transport_profiles,
+        repository=repository,
+        fingerprinter=None,
+        outcome_recorder=DiscoveryAuditOutcomeRecorder(
+            create_session_factory(engine)
+        ),
+    )
+    try:
+        await service.recover_and_cleanup()
+        assert repository.get_job(finished.job_id) is not None
+        assert _audit(database, finished.start_audit_event_id)[0] == "pending"
     finally:
         await service.shutdown()
         engine.dispose()
@@ -370,6 +566,9 @@ async def test_discovery_restart_resumes_future_jobs_and_fails_expired_deadlines
         repository=repository,
         fingerprinter=Fingerprinter(),
         clock=lambda: datetime.now(UTC),
+        outcome_recorder=DiscoveryAuditOutcomeRecorder(
+            create_session_factory(engine)
+        ),
     )
     try:
         await service.recover_and_cleanup()

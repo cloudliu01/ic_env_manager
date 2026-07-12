@@ -162,6 +162,11 @@ class DiscoveryRepository(_SQLiteRepository):
                 cursor = connection.execute(
                     "DELETE FROM discovery_jobs WHERE state IN "
                     "('completed','cancelled','failed') AND completed_at<? "
+                    "AND EXISTS (SELECT 1 FROM control_plane_audit_events a "
+                    "WHERE a.id=discovery_jobs.start_audit_event_id "
+                    "AND a.operation='discovery.start' "
+                    "AND a.target='discovery:' || discovery_jobs.scope_id "
+                    "AND a.result IN ('success','failed')) "
                     "AND NOT EXISTS (SELECT 1 FROM discovery_results r "
                     "JOIN agent_enrollment_jobs e ON e.enrollment_id=r.linked_enrollment_id "
                     "WHERE r.job_id=discovery_jobs.job_id AND e.state NOT IN "
@@ -170,6 +175,21 @@ class DiscoveryRepository(_SQLiteRepository):
                 )
             return cursor.rowcount
         except (SQLAlchemyError, sqlite3.Error) as exc:
+            raise RegistryError("discovery storage unavailable") from exc
+
+    def terminal_jobs_with_pending_audit(self) -> tuple[DiscoveryJob, ...]:
+        try:
+            with self.engine.connect() as connection:
+                rows = connection.exec_driver_sql(
+                    f"SELECT {','.join(f'j.{name}' for name in _JOB_COLUMNS.split(','))} "
+                    "FROM discovery_jobs j JOIN control_plane_audit_events a "
+                    "ON a.id=j.start_audit_event_id "
+                    "WHERE j.state IN ('completed','cancelled','failed') "
+                    "AND a.result='pending' AND a.operation='discovery.start' "
+                    "AND a.target='discovery:' || j.scope_id ORDER BY j.created_at"
+                ).fetchall()
+            return tuple(_job(row) for row in rows)
+        except (SQLAlchemyError, sqlite3.Error, ValueError) as exc:
             raise RegistryError("discovery storage unavailable") from exc
 
     def claim(self, job_id: str, *, now: datetime) -> DiscoveryJob | None:
