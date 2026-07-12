@@ -120,3 +120,5 @@ class EnrollmentJob:
     last_error_code: str | None
     created_at: datetime
     updated_at: datetime
+    recovery_owner: str | None = None
+    recovery_lease_until: datetime | None = None

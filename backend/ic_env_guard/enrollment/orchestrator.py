@@ -1,6 +1,7 @@
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 from ic_env_guard.enrollment.agent_client import (
     EnrollmentAgentClient,
@@ -28,6 +29,11 @@ PHASES = (
     "capabilities",
     "readiness",
 )
+_PUBLIC_STATE = {
+    EnrollmentState.CREDENTIAL_ISSUED: "verifying",
+    EnrollmentState.ACTIVATION_REQUESTED: "running",
+    EnrollmentState.ACTIVATED: "running",
+}
 
 
 @dataclass(frozen=True)
@@ -77,8 +83,9 @@ class EnrollmentPublicResult:
             }
         return {
             "enrollment_id": self.job.enrollment_id,
-            "state": state.value,
+            "state": _PUBLIC_STATE.get(state, state.value),
             "expires_at": self.job.expires_at.isoformat().replace("+00:00", "Z"),
+            "last_error_code": self.job.last_error_code,
             "preview": {"agent": agent, "phases": phases},
         }
 
@@ -99,6 +106,8 @@ class EnrollmentOrchestrator:
         self.agent_client = agent_client
         self.registry = registry
         self._validation_cache: dict[str, EnrollmentValidation] = {}
+        self._recovery_owner = str(uuid4())
+        self._recovery_lease_seconds = 30
 
     def create(self, request: EnrollmentJobRequest) -> EnrollmentPublicResult:
         return EnrollmentPublicResult(self.jobs.create(request))
@@ -109,7 +118,7 @@ class EnrollmentOrchestrator:
         )
 
     def cancel(self, enrollment_id: str) -> EnrollmentPublicResult:
-        return EnrollmentPublicResult(self.jobs.cancel(enrollment_id))
+        return EnrollmentPublicResult(self._cleanup_terminal(self.jobs.cancel(enrollment_id)))
 
     async def validate_legacy(
         self, request: LegacyValidationRequest, token: str
@@ -165,7 +174,7 @@ class EnrollmentOrchestrator:
             current = self.journal.get(job.enrollment_id)
             if current is not None and not current.state.terminal:
                 try:
-                    self.journal.replace_if_state(
+                    failed = self.journal.replace_if_state(
                         replace(
                             current,
                             state=EnrollmentState.FAILED,
@@ -174,6 +183,7 @@ class EnrollmentOrchestrator:
                         ),
                         expected_state=current.state,
                     )
+                    self._cleanup_terminal(failed)
                 except Exception:
                     pass
             if isinstance(exc, CredentialStoreError):
@@ -183,15 +193,32 @@ class EnrollmentOrchestrator:
             raise
 
     async def recover(self) -> None:
-        for job in self.journal.list_non_terminal():
+        claimed = self.journal.expire_and_claim_recovery(
+            owner=self._recovery_owner,
+            now=datetime.now(UTC),
+            lease_seconds=self._recovery_lease_seconds,
+        )
+        for job in claimed:
             if job.state in {
                 EnrollmentState.ACTIVATION_REQUESTED,
                 EnrollmentState.ACTIVATED,
             } and job.save_requested:
                 try:
                     await self._recover_activation(job)
-                except (EnrollmentValidationError, CredentialStoreError):
-                    pass
+                except EnrollmentValidationError as exc:
+                    self.journal.fail_recovery_claim(
+                        job.enrollment_id,
+                        owner=self._recovery_owner,
+                        error_code=exc.code,
+                        now=datetime.now(UTC),
+                    )
+                except CredentialStoreError:
+                    self.journal.fail_recovery_claim(
+                        job.enrollment_id,
+                        owner=self._recovery_owner,
+                        error_code="credential_store_unavailable",
+                        now=datetime.now(UTC),
+                    )
                 continue
             if job.state not in {
                 EnrollmentState.CREDENTIAL_ISSUED,
@@ -200,14 +227,27 @@ class EnrollmentOrchestrator:
             }:
                 continue
             if self.agent_client is None:
+                self.journal.fail_recovery_claim(
+                    job.enrollment_id,
+                    owner=self._recovery_owner,
+                    error_code="enrollment_unavailable",
+                    now=datetime.now(UTC),
+                )
                 continue
             if not job.credential_temp_ref:
+                self.journal.fail_recovery_claim(
+                    job.enrollment_id,
+                    owner=self._recovery_owner,
+                    error_code="credential_store_unavailable",
+                    now=datetime.now(UTC),
+                )
                 continue
             current = job
             if current.state is EnrollmentState.CREDENTIAL_ISSUED:
                 current = self.journal.replace_if_state(
                     replace(current, state=EnrollmentState.VERIFYING, updated_at=datetime.now(UTC)),
                     expected_state=EnrollmentState.CREDENTIAL_ISSUED,
+                    expected_recovery_owner=self._recovery_owner,
                 )
             try:
                 target = self.agent_client.prepare(
@@ -218,20 +258,52 @@ class EnrollmentOrchestrator:
                     validation = await self.agent_client.validate_legacy(target, token)
                 else:
                     if not current.remote_instance_id:
+                        self.journal.fail_recovery_claim(
+                            current.enrollment_id,
+                            owner=self._recovery_owner,
+                            error_code="agent_identity_missing",
+                            now=datetime.now(UTC),
+                        )
                         continue
                     validation = await self.agent_client.validate_pending(
                         target, token, helper_instance_id=current.remote_instance_id
                     )
-            except (EnrollmentValidationError, CredentialStoreError):
+            except EnrollmentValidationError as exc:
+                self.journal.fail_recovery_claim(
+                    current.enrollment_id,
+                    owner=self._recovery_owner,
+                    error_code=exc.code,
+                    now=datetime.now(UTC),
+                )
+                continue
+            except CredentialStoreError:
+                self.journal.fail_recovery_claim(
+                    current.enrollment_id,
+                    owner=self._recovery_owner,
+                    error_code="credential_store_unavailable",
+                    now=datetime.now(UTC),
+                )
                 continue
             if current.state is EnrollmentState.VERIFIED:
                 self._validation_cache[current.enrollment_id] = validation
+                self.journal.release_recovery_claim(
+                    current.enrollment_id, owner=self._recovery_owner
+                )
                 continue
             verified = self.journal.replace_if_state(
-                replace(current, state=EnrollmentState.VERIFIED, updated_at=datetime.now(UTC)),
+                replace(
+                    current,
+                    state=EnrollmentState.VERIFIED,
+                    updated_at=datetime.now(UTC),
+                    recovery_owner=None,
+                    recovery_lease_until=None,
+                ),
                 expected_state=EnrollmentState.VERIFYING,
+                expected_recovery_owner=self._recovery_owner,
             )
             self._validation_cache[verified.enrollment_id] = validation
+        for terminal in self.journal.list_terminal_cleanup():
+            self._cleanup_terminal(terminal)
 
     async def _recover_activation(self, job: EnrollmentJob) -> None:
         if not job.credential_temp_ref or not job.requested_display_name:
@@ -240,7 +312,9 @@ class EnrollmentOrchestrator:
         if current.state is EnrollmentState.ACTIVATION_REQUESTED:
             if current.enrollment_method is not EnrollmentMethod.LEGACY_ADMIN_TOKEN:
                 if self.agent_client is None or not current.remote_credential_id:
-                    return
+                    raise EnrollmentValidationError(
+                        "enrollment_unavailable", dispatch_state="not_dispatched"
+                    )
                 target = self.agent_client.prepare(
                     current.normalized_endpoint, current.transport_profile_id
                 )
@@ -253,6 +327,7 @@ class EnrollmentOrchestrator:
             current = self.journal.replace_if_state(
                 replace(current, state=EnrollmentState.ACTIVATED, updated_at=datetime.now(UTC)),
                 expected_state=EnrollmentState.ACTIVATION_REQUESTED,
+                expected_recovery_owner=self._recovery_owner,
             )
         record = AgentRecord(
             agent_id=current.enrollment_id,
@@ -269,21 +344,46 @@ class EnrollmentOrchestrator:
             created_at=datetime.now(UTC),
             updated_at=datetime.now(UTC),
         )
-        try:
-            self.registry.create(record)
-        except RegistryConflict:
-            existing = self.registry.get(record.agent_id)
-            if existing is None or not _same_committed_agent(existing, record):
-                return
-        self.journal.replace_if_state(
-            replace(
-                current,
-                state=EnrollmentState.CONSUMED,
-                credential_temp_ref=None,
-                updated_at=datetime.now(UTC),
-            ),
-            expected_state=EnrollmentState.ACTIVATED,
-        )
+        with self.credential_store.lifecycle_lease():
+            try:
+                self.registry.create(record)
+            except RegistryConflict:
+                existing = self.registry.get(record.agent_id)
+                if existing is None or not _same_committed_agent(existing, record):
+                    return
+            self.journal.replace_if_state(
+                replace(
+                    current,
+                    state=EnrollmentState.CONSUMED,
+                    credential_temp_ref=None,
+                    updated_at=datetime.now(UTC),
+                    recovery_owner=None,
+                    recovery_lease_until=None,
+                ),
+                expected_state=EnrollmentState.ACTIVATED,
+                expected_recovery_owner=self._recovery_owner,
+            )
+
+    def _cleanup_terminal(self, job: EnrollmentJob) -> EnrollmentJob:
+        reference = job.credential_temp_ref
+        if reference is None:
+            return job
+        with self.credential_store.lifecycle_lease():
+            try:
+                self.credential_store.delete_if_exists(reference)
+            except CredentialStoreError:
+                return self.journal.mark_terminal_cleanup_failed(
+                    job.enrollment_id,
+                    state=job.state,
+                    expected_reference=reference,
+                    now=datetime.now(UTC),
+                )
+            return self.journal.finish_terminal_cleanup(
+                job.enrollment_id,
+                state=job.state,
+                expected_reference=reference,
+                now=datetime.now(UTC),
+            )
 
     async def recover_and_cleanup(self) -> None:
         await self.recover()

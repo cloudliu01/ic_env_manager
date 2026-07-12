@@ -1,3 +1,4 @@
+import multiprocessing
 import os
 import stat
 import threading
@@ -121,7 +122,9 @@ def test_put_fsync_failure_removes_unpublished_temporary_file(tmp_path, monkeypa
     with pytest.raises(CredentialStoreError, match="could not be published"):
         store.put(b"secret")
 
-    assert tuple(store.directory.iterdir()) == ()
+    assert tuple(path.name for path in store.directory.iterdir()) == (
+        ".credential-store.lock",
+    )
 
 
 @pytest.mark.unit
@@ -289,6 +292,165 @@ def test_cleanup_cannot_interleave_between_publish_and_journal_commit(tmp_path):
 
 
 @pytest.mark.unit
+def test_two_store_instances_share_directory_lease(tmp_path):
+    directory = tmp_path / "credentials"
+    first = CredentialStore(directory)
+    second = CredentialStore(directory)
+    registry = References()
+    journal = JournalReferences()
+    published = threading.Event()
+    release = threading.Event()
+    cleaned = threading.Event()
+
+    def mutation():
+        with first.lifecycle_lease():
+            reference = first.put(b"recoverable")
+            journal.values.add(reference)
+            published.set()
+            release.wait(timeout=2)
+
+    def cleanup():
+        second.cleanup_orphans(registry, journal)
+        cleaned.set()
+
+    mutation_thread = threading.Thread(target=mutation)
+    mutation_thread.start()
+    assert published.wait(timeout=2)
+    cleanup_thread = threading.Thread(target=cleanup)
+    cleanup_thread.start()
+    assert not cleaned.wait(timeout=0.1)
+    release.set()
+    mutation_thread.join(timeout=2)
+    cleanup_thread.join(timeout=2)
+    assert cleaned.is_set()
+
+
+def _hold_directory_lease(directory, acquired, release):
+    store = CredentialStore(directory)
+    with store.lifecycle_lease():
+        acquired.set()
+        release.wait(timeout=5)
+
+
+def _use_inherited_store_after_fork(store, started, finished):
+    started.set()
+    store.put(b"fork-child")
+    finished.set()
+
+
+@pytest.mark.unit
+def test_directory_lease_blocks_cleanup_across_processes(tmp_path):
+    directory = tmp_path / "credentials"
+    store = CredentialStore(directory)
+    orphan = store.put(b"orphan")
+    context = multiprocessing.get_context("spawn")
+    acquired = context.Event()
+    release = context.Event()
+    process = context.Process(
+        target=_hold_directory_lease,
+        args=(directory, acquired, release),
+    )
+    process.start()
+    try:
+        assert acquired.wait(timeout=5)
+        finished = threading.Event()
+
+        def cleanup():
+            store.cleanup_orphans(References(), JournalReferences())
+            finished.set()
+
+        thread = threading.Thread(target=cleanup)
+        thread.start()
+        assert not finished.wait(timeout=0.2)
+        assert store.resolve_for_test(orphan).exists()
+        release.set()
+        thread.join(timeout=5)
+        assert finished.is_set()
+    finally:
+        release.set()
+        process.join(timeout=5)
+        if process.is_alive():
+            process.terminate()
+
+
+@pytest.mark.unit
+@pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="no fork")
+def test_fork_child_drops_inherited_lock_fd_and_reacquires_after_parent(tmp_path):
+    store = CredentialStore(tmp_path / "credentials")
+    context = multiprocessing.get_context("fork")
+    started = context.Event()
+    finished = context.Event()
+    process = context.Process(
+        target=_use_inherited_store_after_fork,
+        args=(store, started, finished),
+    )
+
+    with store.lifecycle_lease():
+        process.start()
+        assert started.wait(timeout=5)
+        assert not finished.wait(timeout=0.2)
+
+    process.join(timeout=5)
+    try:
+        assert process.exitcode == 0
+        assert finished.is_set()
+    finally:
+        if process.is_alive():
+            process.terminate()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("unsafe_kind", ("symlink", "wrong_mode"))
+def test_directory_lock_file_fails_closed_when_unsafe(tmp_path, unsafe_kind):
+    directory = tmp_path / "credentials"
+    directory.mkdir(mode=0o700)
+    lock = directory / ".credential-store.lock"
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"outside")
+    if unsafe_kind == "symlink":
+        lock.symlink_to(outside)
+    else:
+        lock.write_bytes(b"")
+        lock.chmod(0o640)
+
+    with pytest.raises(CredentialStoreError, match="lock"):
+        CredentialStore(directory)
+    assert outside.read_bytes() == b"outside"
+
+
+@pytest.mark.unit
+def test_directory_lock_file_rejects_wrong_owner(tmp_path, monkeypatch):
+    directory = tmp_path / "credentials"
+    directory.mkdir(mode=0o700)
+    lock = directory / ".credential-store.lock"
+    lock.write_bytes(b"")
+    lock.chmod(0o600)
+    real_uid = os.geteuid()
+    calls = iter((real_uid, real_uid + 1))
+    monkeypatch.setattr(os, "geteuid", lambda: next(calls, real_uid + 1))
+
+    with pytest.raises(CredentialStoreError, match="lock"):
+        CredentialStore(directory)
+
+
+@pytest.mark.unit
+def test_directory_lease_releases_after_exception(tmp_path):
+    directory = tmp_path / "credentials"
+    first = CredentialStore(directory)
+    second = CredentialStore(directory)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with first.lifecycle_lease():
+            raise RuntimeError("boom")
+
+    reference = second.put(b"after-exception")
+    assert second.read(reference) == b"after-exception"
+    lock = directory / ".credential-store.lock"
+    assert lock.is_file()
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+
+
+@pytest.mark.unit
 def test_startup_removes_valid_unpublished_temporary_file(tmp_path):
     directory = tmp_path / "credentials"
     directory.mkdir(mode=0o700)
@@ -367,7 +529,7 @@ def test_startup_retains_wrong_owner_temporary_entry(tmp_path, monkeypatch):
     temporary.write_bytes(b"wrong-owner")
     temporary.chmod(0o600)
     real_uid = os.geteuid()
-    calls = iter((real_uid, real_uid + 1))
+    calls = iter((real_uid, real_uid, real_uid, real_uid + 1))
     monkeypatch.setattr(os, "geteuid", lambda: next(calls, real_uid + 1))
 
     with pytest.raises(CredentialStoreError, match="unsafe temporary"):

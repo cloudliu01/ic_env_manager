@@ -57,6 +57,15 @@ def _marker(engine):
     return row[0] if row else None
 
 
+def _credential_entries(store):
+    return {
+        entry.name
+        for entry in store.directory.iterdir()
+        if len(entry.name) == 48
+        and all(character in "0123456789abcdef" for character in entry.name)
+    }
+
+
 @pytest.mark.integration
 def test_first_import_commits_agents_and_initial_status_atomically(tmp_path, import_context):
     engine, store, registry, statuses = import_context
@@ -127,7 +136,7 @@ def test_import_rejects_duplicate_identity_fields_before_copy(
         import_yaml_agents_once(engine, store, [first, second], manager_token=b"manager")
 
     assert registry.list(AgentQuery()).items == ()
-    assert tuple(store.directory.iterdir()) == ()
+    assert _credential_entries(store) == set()
 
 
 @pytest.mark.integration
@@ -151,7 +160,7 @@ def test_import_rejects_unsafe_and_manager_shared_tokens(tmp_path, import_contex
                 engine, store, [agent], manager_token=b"manager-secret"
             )
         assert registry.list(AgentQuery()).items == ()
-        assert tuple(store.directory.iterdir()) == ()
+        assert _credential_entries(store) == set()
 
 
 @pytest.mark.integration
@@ -201,7 +210,7 @@ def test_copy_failure_removes_only_new_credentials_and_rolls_back_rows(
         )
 
     assert registry.list(AgentQuery()).items == ()
-    assert {entry.name for entry in store.directory.iterdir()} == {retained}
+    assert _credential_entries(store) == {retained}
 
 
 @pytest.mark.integration
@@ -221,7 +230,7 @@ def test_database_failure_removes_copied_credentials(
         )
 
     assert registry.list(AgentQuery()).items == ()
-    assert tuple(store.directory.iterdir()) == ()
+    assert _credential_entries(store) == set()
 
 
 @pytest.mark.integration
@@ -269,9 +278,7 @@ def test_mixed_commit_verification_preserves_referenced_ref_and_deletes_only_unr
     assert imported is False
     remaining = registry.get("lab-02")
     assert remaining is not None
-    assert {entry.name for entry in store.directory.iterdir()} == {
-        remaining.credential_ref
-    }
+    assert _credential_entries(store) == {remaining.credential_ref}
 
 
 @pytest.mark.integration
@@ -300,18 +307,7 @@ def test_commit_and_rollback_errors_keep_credentials_when_verification_is_unavai
         import_yaml_agents_once(
             engine, store, [_agent(tmp_path, "lab-01")], manager_token=b"manager"
         )
-    assert len(tuple(store.directory.iterdir())) == 1
-
-
-class _BarrierStore(CredentialStore):
-    def __init__(self, directory: Path, barrier: threading.Barrier) -> None:
-        super().__init__(directory)
-        self._barrier = barrier
-
-    def put(self, secret: bytes) -> str:
-        reference = super().put(secret)
-        self._barrier.wait(timeout=5)
-        return reference
+    assert len(_credential_entries(store)) == 1
 
 
 @pytest.mark.integration
@@ -321,11 +317,12 @@ def test_concurrent_initial_imports_converge_and_loser_cleans_only_its_credentia
     engine, _store, registry, _ = import_context
     barrier = threading.Barrier(2)
     stores = [
-        _BarrierStore(tmp_path / "concurrent-credentials", barrier),
-        _BarrierStore(tmp_path / "concurrent-credentials", barrier),
+        CredentialStore(tmp_path / "concurrent-credentials"),
+        CredentialStore(tmp_path / "concurrent-credentials"),
     ]
 
     def run(store):
+        barrier.wait(timeout=5)
         return import_yaml_agents_once(
             engine, store, [_agent(tmp_path, "lab-01")], manager_token=b"manager"
         )
@@ -335,9 +332,7 @@ def test_concurrent_initial_imports_converge_and_loser_cleans_only_its_credentia
 
     assert sorted(outcomes) == [False, True]
     record = registry.get("lab-01")
-    assert {entry.name for entry in stores[0].directory.iterdir()} == {
-        record.credential_ref
-    }
+    assert _credential_entries(stores[0]) == {record.credential_ref}
 
 
 @pytest.mark.integration
@@ -395,4 +390,4 @@ def test_source_token_read_rejects_symlink_swap_and_oversize(
             manager_token=b"manager",
         )
     assert registry.list(AgentQuery()).items == ()
-    assert tuple(store.directory.iterdir()) == ()
+    assert _credential_entries(store) == set()

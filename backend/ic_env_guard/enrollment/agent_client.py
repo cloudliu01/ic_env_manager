@@ -1,13 +1,17 @@
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID
 
 from ic_env_guard.agents.client import AgentClientError, AgentHttpClient
+from ic_env_guard.agents.models import AGENT_VERSION
 from ic_env_guard.fleet.target_policy import AgentTargetPolicy, TargetPolicyError, ValidatedTarget
 from ic_env_guard.fleet.transport import TransportProfile
 
 _CAPABILITY = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+_PENDING_CAPABILITIES = {"manager-enrollment.v1", "summary.v2"}
 
 
 class EnrollmentValidationError(Exception):
@@ -101,6 +105,15 @@ class EnrollmentAgentClient:
                     "agent_protocol_error", dispatch_state="dispatched"
                 )
             payload = _parse_capabilities(response.json(), expected_api="2", instance=True)
+            if not _is_canonical_uuid(helper_instance_id):
+                raise EnrollmentValidationError(
+                    "agent_protocol_error", dispatch_state="not_dispatched"
+                )
+            missing = _PENDING_CAPABILITIES - set(payload["capabilities"])
+            if missing:
+                raise EnrollmentValidationError(
+                    "missing_capabilities", dispatch_state="dispatched"
+                )
             if payload["instance_id"] != helper_instance_id:
                 raise EnrollmentValidationError(
                     "agent_identity_mismatch", dispatch_state="dispatched"
@@ -111,14 +124,19 @@ class EnrollmentAgentClient:
                 summary_response = await self._client.request(
                     target, token, "GET", "/api/v2/summary"
                 )
-                if summary_response.status_code != 200:
-                    raise ValueError
-                raw_summary = summary_response.json()
-                if not isinstance(raw_summary, dict):
-                    raise ValueError
-                summary = raw_summary
-            except (AgentClientError, TypeError, ValueError):
+            except AgentClientError as exc:
+                if exc.category == "agent_auth_error":
+                    raise EnrollmentValidationError(
+                        exc.category, dispatch_state=exc.dispatch_state
+                    ) from exc
                 warning = "agent_readiness_unavailable"
+            else:
+                if summary_response.status_code != 200:
+                    warning = "agent_readiness_unavailable"
+                else:
+                    summary = _parse_summary(summary_response.json())
+                    if _summary_unhealthy(summary):
+                        warning = "agent_readiness_unhealthy"
         except EnrollmentValidationError:
             raise
         except AgentClientError as exc:
@@ -170,13 +188,21 @@ class EnrollmentAgentClient:
 def _parse_capabilities(
     value: object, *, expected_api: str, instance: bool
 ) -> dict[str, Any]:
-    if not isinstance(value, dict) or value.get("api_version") != expected_api:
+    expected_keys = {"api_version", "agent_version", "capabilities"}
+    if instance:
+        expected_keys.update({"instance_id", "name"})
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected_keys
+        or value.get("api_version") != expected_api
+    ):
         raise ValueError
     agent_version = value.get("agent_version")
     capabilities = value.get("capabilities")
     if (
         not isinstance(agent_version, str)
         or not _VERSION.fullmatch(agent_version)
+        or (instance and agent_version != AGENT_VERSION)
         or not isinstance(capabilities, list)
         or len(capabilities) > 256
         or any(
@@ -192,7 +218,74 @@ def _parse_capabilities(
     }
     if instance:
         instance_id = value.get("instance_id")
-        if not isinstance(instance_id, str) or not 1 <= len(instance_id) <= 128:
+        name = value.get("name")
+        if (
+            not isinstance(instance_id, str)
+            or not _is_canonical_uuid(instance_id)
+            or not isinstance(name, str)
+            or not 1 <= len(name) <= 128
+        ):
             raise ValueError
         result["instance_id"] = instance_id
     return result
+
+
+def _is_canonical_uuid(value: str) -> bool:
+    try:
+        parsed = UUID(value)
+    except (TypeError, ValueError):
+        return False
+    return str(parsed) == value
+
+
+def _parse_summary(payload: object) -> dict[str, Any]:
+    if not isinstance(payload, dict) or set(payload) != {
+        "observed_at",
+        "observations",
+        "logs",
+        "services",
+        "terminals",
+    }:
+        raise ValueError
+    observed_at = payload["observed_at"]
+    if not isinstance(observed_at, str):
+        raise ValueError
+    parsed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError
+    expected = {
+        "observations": ("total", "warning", "critical", "stale"),
+        "logs": ("total", "stale"),
+        "services": ("total", "running", "unhealthy"),
+        "terminals": ("active",),
+    }
+    result: dict[str, Any] = {
+        "observed_at": parsed.astimezone(UTC)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    }
+    for section, fields in expected.items():
+        raw = payload[section]
+        if not isinstance(raw, dict) or set(raw) != set(fields):
+            raise ValueError
+        safe: dict[str, int] = {}
+        for field in fields:
+            count = raw[field]
+            if (
+                not isinstance(count, int)
+                or isinstance(count, bool)
+                or not 0 <= count <= 2**63 - 1
+            ):
+                raise ValueError
+            safe[field] = count
+        result[section] = safe
+    return result
+
+
+def _summary_unhealthy(summary: dict[str, Any]) -> bool:
+    return bool(
+        summary["observations"]["critical"]
+        or summary["observations"]["stale"]
+        or summary["logs"]["stale"]
+        or summary["services"]["unhealthy"]
+    )

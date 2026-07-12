@@ -169,8 +169,9 @@ def test_fleet_registry_migration_has_exact_control_plane_tables(tmp_path):
                 "transport_profile_id", "discovery_result_id", "replace_agent_id",
                 "requested_display_name", "ssh_user", "ssh_host", "ssh_port",
                 "enrollment_method", "remote_instance_id", "remote_credential_id",
-                "credential_temp_ref", "old_credential_ref", "old_remote_credential_id",
-                "save_requested", "expires_at", "last_error_code", "created_at", "updated_at",
+                    "credential_temp_ref", "old_credential_ref", "old_remote_credential_id",
+                    "save_requested", "expires_at", "last_error_code", "created_at", "updated_at",
+                    "recovery_owner", "recovery_lease_until",
             ),
         }
         for table, columns in expected_columns.items():
@@ -367,7 +368,18 @@ def test_legacy_manual_migration_preserves_rows_indexes_fks_and_checks(tmp_path)
             "remote-01", "system-tls", "ssh_auto", 0, "manual", 3,
         )
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
-        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        assert "idx_agent_status_updated" in {
+            item[1] for item in connection.execute("PRAGMA index_list(agent_status)")
+        }
+        assert "idx_enrollment_state_expiry" in {
+            item[1]
+            for item in connection.execute("PRAGMA index_list(agent_enrollment_jobs)")
+        }
+        assert any(
+            item[2] == "agents" and item[6] == "CASCADE"
+            for item in connection.execute("PRAGMA foreign_key_list(agent_status)")
+        )
+        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
         status_indexes = {
             row[1] for row in connection.execute("PRAGMA index_list(agent_status)")
         }
@@ -460,5 +472,184 @@ def test_control_plane_future_user_version_fails_closed_without_writes(tmp_path)
         assert connection.execute(
             "SELECT version, result FROM schema_versions ORDER BY version"
         ).fetchall() == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.contract
+def test_legacy_manual_downgrade_rebuilds_v3_schema_and_preserves_compatible_rows(
+    tmp_path,
+):
+    db_path = tmp_path / "control-plane.db"
+    connection = sqlite3.connect(db_path)
+    try:
+        _run_control_plane_through(connection, "0004_legacy_manual_enrollment.py")
+        connection.execute(
+            "INSERT INTO agents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "legacy-01", None, "Legacy", "https://legacy.example:8765", "c" * 48,
+                None, "system-tls", "legacy_admin_token", 1, "config_import", 7,
+                "2026-07-12T10:00:00.000000Z", "2026-07-12T11:00:00.000000Z",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO agents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "ssh-01", "instance-01", "SSH", "https://ssh.example:8765", "d" * 48,
+                "remote-01", "system-tls", "ssh_auto", 0, "manual", 3,
+                "2026-07-12T09:00:00.000000Z", "2026-07-12T09:30:00.000000Z",
+            ),
+        )
+        connection.commit()
+        migration = _load_migration(
+            CONTROL_PLANE_MIGRATIONS / "0004_legacy_manual_enrollment.py"
+        )
+
+        migration.downgrade(connection)
+
+        schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name='agents'"
+        ).fetchone()[0]
+        rows = connection.execute(
+            "SELECT agent_id, instance_id, display_name, normalized_endpoint, credential_ref, "
+            "remote_credential_id, transport_profile_id, enrollment_method, enabled, source, "
+            "revision, created_at, updated_at FROM agents ORDER BY agent_id"
+        ).fetchall()
+        assert "source = 'config_import'" in schema
+        assert [row[0] for row in rows] == ["legacy-01", "ssh-01"]
+        assert rows[0][1] is None
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert "idx_agent_status_updated" in {
+            item[1] for item in connection.execute("PRAGMA index_list(agent_status)")
+        }
+        assert "idx_enrollment_state_expiry" in {
+            item[1]
+            for item in connection.execute("PRAGMA index_list(agent_enrollment_jobs)")
+        }
+        assert any(
+            item[2] == "agents" and item[6] == "CASCADE"
+            for item in connection.execute("PRAGMA foreign_key_list(agent_status)")
+        )
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        assert connection.execute(
+            "SELECT 1 FROM schema_versions WHERE version='0004_legacy_manual_enrollment'"
+        ).fetchone() is None
+    finally:
+        connection.close()
+
+
+@pytest.mark.contract
+def test_legacy_manual_downgrade_rejects_incompatible_rows_without_changes(tmp_path):
+    db_path = tmp_path / "control-plane.db"
+    connection = sqlite3.connect(db_path)
+    try:
+        _run_control_plane_through(connection, "0004_legacy_manual_enrollment.py")
+        connection.execute(
+            "INSERT INTO agents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "manual-legacy", None, "Manual", "https://manual.example:8765", "e" * 48,
+                None, "system-tls", "legacy_admin_token", 1, "manual", 1,
+                "2026-07-12T12:00:00.000000Z", "2026-07-12T12:00:00.000000Z",
+            ),
+        )
+        connection.commit()
+        before_schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name='agents'"
+        ).fetchone()[0]
+        before_versions = connection.execute(
+            "SELECT version FROM schema_versions ORDER BY version"
+        ).fetchall()
+        migration = _load_migration(
+            CONTROL_PLANE_MIGRATIONS / "0004_legacy_manual_enrollment.py"
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="manual legacy"):
+            migration.downgrade(connection)
+
+        assert connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name='agents'"
+        ).fetchone()[0] == before_schema
+        assert connection.execute(
+            "SELECT version FROM schema_versions ORDER BY version"
+        ).fetchall() == before_versions
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+    finally:
+        connection.close()
+
+
+def _insert_legacy_enrollment_row(connection, *, reference):
+    connection.execute(
+        "INSERT INTO agent_enrollment_jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "enroll-legacy", "11111111-1111-4111-8111-111111111111", "verifying",
+            "https://legacy.example:8765", "system-tls", None, None, None, None, None,
+            None, "legacy_admin_token", None, None, reference, None, None, 0,
+            "2026-07-12T12:10:00.000000Z", None,
+            "2026-07-12T12:00:00.000000Z", "2026-07-12T12:00:00.000000Z",
+        ),
+    )
+
+
+@pytest.mark.contract
+def test_enrollment_recovery_migration_preserves_legal_rows_and_adds_constraints(tmp_path):
+    db_path = tmp_path / "control-plane.db"
+    connection = sqlite3.connect(db_path)
+    try:
+        _run_control_plane_through(connection, "0004_legacy_manual_enrollment.py")
+        _insert_legacy_enrollment_row(connection, reference="a" * 48)
+        connection.commit()
+    finally:
+        connection.close()
+
+    run_control_plane_migrations(db_path)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        row = connection.execute(
+            "SELECT state, credential_temp_ref, recovery_owner, recovery_lease_until "
+            "FROM agent_enrollment_jobs WHERE enrollment_id='enroll-legacy'"
+        ).fetchone()
+        assert row == ("verifying", "a" * 48, None, None)
+        indexes = {
+            item[1]
+            for item in connection.execute("PRAGMA index_list(agent_enrollment_jobs)")
+        }
+        assert {"idx_enrollment_state_expiry", "idx_enrollment_recovery_lease"} <= indexes
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE agent_enrollment_jobs SET credential_temp_ref=NULL "
+                "WHERE enrollment_id='enroll-legacy'"
+            )
+    finally:
+        connection.close()
+
+
+@pytest.mark.contract
+def test_enrollment_recovery_migration_rejects_invalid_old_phase_without_changes(tmp_path):
+    db_path = tmp_path / "control-plane.db"
+    connection = sqlite3.connect(db_path)
+    try:
+        _run_control_plane_through(connection, "0004_legacy_manual_enrollment.py")
+        _insert_legacy_enrollment_row(connection, reference=None)
+        connection.commit()
+        before_schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name='agent_enrollment_jobs'"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    with pytest.raises(sqlite3.IntegrityError, match="phase invariant.*enroll-legacy"):
+        run_control_plane_migrations(db_path)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        assert connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name='agent_enrollment_jobs'"
+        ).fetchone()[0] == before_schema
+        assert connection.execute(
+            "SELECT 1 FROM schema_versions "
+            "WHERE version='0005_enrollment_recovery_hardening'"
+        ).fetchone() is None
+        assert len(connection.execute("PRAGMA table_info(agent_enrollment_jobs)").fetchall()) == 22
     finally:
         connection.close()

@@ -1,3 +1,4 @@
+import fcntl
 import os
 import re
 import secrets
@@ -25,6 +26,7 @@ _REFERENCE = re.compile(r"^[0-9a-f]{48}$")
 _TEMPORARY = re.compile(r"^\.tmp-[0-9a-f]{48}$")
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_LOCK_FILE = ".credential-store.lock"
 
 
 class CredentialLifecycleCoordinator:
@@ -32,11 +34,47 @@ class CredentialLifecycleCoordinator:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._local = threading.local()
+        self._active_fd: int | None = None
+        if hasattr(os, "register_at_fork"):
+            os.register_at_fork(after_in_child=self._after_fork_child)
+
+    def _after_fork_child(self) -> None:
+        if self._active_fd is not None:
+            try:
+                os.close(self._active_fd)
+            except OSError:
+                pass
+        self._active_fd = None
+        self._lock = threading.RLock()
+        self._local = threading.local()
 
     @contextmanager
-    def exclusive_lease(self) -> Iterator[None]:
+    def exclusive_lease(self, open_lock) -> Iterator[None]:
         with self._lock:
-            yield
+            depth = getattr(self._local, "depth", 0)
+            if depth:
+                self._local.depth = depth + 1
+                try:
+                    yield
+                finally:
+                    self._local.depth -= 1
+                return
+            fd = open_lock()
+            self._active_fd = fd
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                self._local.depth = 1
+                try:
+                    yield
+                finally:
+                    self._local.depth = 0
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError as exc:
+                raise CredentialStoreError("credential directory lock is unavailable") from exc
+            finally:
+                self._active_fd = None
+                os.close(fd)
 
 
 class CredentialStore:
@@ -61,14 +99,16 @@ class CredentialStore:
         self._validate_directory()
         if created:
             self._fsync_parent_entry()
+        with self.lifecycle_lease():
+            pass
         self.startup_findings = self._recover_temporary_files()
 
     def lifecycle_lease(self) -> Iterator[None]:
-        return self._coordinator.exclusive_lease()
+        return self._coordinator.exclusive_lease(self._open_lock)
 
     def put(self, secret: bytes) -> str:
         self._validate_secret(secret)
-        with self._coordinator.exclusive_lease():
+        with self.lifecycle_lease():
             for _ in range(8):
                 reference = secrets.token_hex(24)
                 if self._publish_new(self.directory / reference, secret):
@@ -76,7 +116,7 @@ class CredentialStore:
         raise CredentialStoreError("could not allocate a credential reference")
 
     def read(self, reference: str) -> bytes:
-        with self._coordinator.exclusive_lease():
+        with self.lifecycle_lease():
             path = self._path(reference)
             fd = self._open_validated(path)
             try:
@@ -91,14 +131,14 @@ class CredentialStore:
 
     def replace(self, reference: str, secret: bytes) -> None:
         self._validate_secret(secret)
-        with self._coordinator.exclusive_lease():
+        with self.lifecycle_lease():
             path = self._path(reference)
             fd = self._open_validated(path)
             os.close(fd)
             self._publish_replace(path, secret)
 
     def delete(self, reference: str) -> None:
-        with self._coordinator.exclusive_lease():
+        with self.lifecycle_lease():
             path = self._path(reference)
             fd = self._open_validated(path)
             os.close(fd)
@@ -108,16 +148,30 @@ class CredentialStore:
             except OSError as exc:
                 raise CredentialStoreError("credential could not be deleted") from exc
 
+    def delete_if_exists(self, reference: str) -> bool:
+        with self.lifecycle_lease():
+            path = self._path(reference)
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                return False
+            except OSError as exc:
+                raise CredentialStoreError("credential file is unsafe") from exc
+            self.delete(reference)
+            return True
+
     def cleanup_orphans(
         self,
         registry: RegistryCredentialReferences,
         journal: JournalCredentialReferences,
     ) -> tuple[dict[str, str], ...]:
-        with self._coordinator.exclusive_lease():
+        with self.lifecycle_lease():
             retained = registry.credential_references()
             retained.update(journal.recovery_credential_references())
             findings: list[dict[str, str]] = []
             for entry in sorted(self.directory.iterdir(), key=lambda path: path.name):
+                if entry.name == _LOCK_FILE:
+                    continue
                 if not _REFERENCE.fullmatch(entry.name):
                     findings.append({"entry": "unrecognized", "action": "retained"})
                     continue
@@ -179,9 +233,44 @@ class CredentialStore:
             os.close(fd)
             raise
 
+    def _open_lock(self) -> int:
+        path = self.directory / _LOCK_FILE
+        created = False
+        try:
+            before = path.lstat()
+        except FileNotFoundError:
+            before = None
+            created = True
+        except OSError as exc:
+            raise CredentialStoreError("credential directory lock is unsafe") from exc
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | _NOFOLLOW, 0o600)
+        except OSError as exc:
+            raise CredentialStoreError("credential directory lock is unsafe") from exc
+        try:
+            metadata = os.fstat(fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or (
+                    before is not None
+                    and (metadata.st_dev, metadata.st_ino)
+                    != (before.st_dev, before.st_ino)
+                )
+            ):
+                raise CredentialStoreError("credential directory lock is unsafe")
+            if created:
+                os.fsync(fd)
+                self._fsync_directory()
+            return fd
+        except Exception:
+            os.close(fd)
+            raise
+
     def _recover_temporary_files(self) -> tuple[dict[str, str], ...]:
         findings: list[dict[str, str]] = []
-        with self._coordinator.exclusive_lease():
+        with self.lifecycle_lease():
             for temporary in sorted(self.directory.iterdir(), key=lambda path: path.name):
                 if not temporary.name.startswith(".tmp-"):
                     continue
