@@ -9,6 +9,7 @@ from ipaddress import ip_address
 from typing import Any
 from uuid import UUID, uuid4
 
+from ic_env_guard.agents.terminal_proxy import GatewayTicketStore
 from ic_env_guard.enrollment.agent_client import (
     EnrollmentAgentClient,
     EnrollmentValidation,
@@ -16,6 +17,7 @@ from ic_env_guard.enrollment.agent_client import (
 )
 from ic_env_guard.enrollment.credential_store import CredentialStore, CredentialStoreError
 from ic_env_guard.enrollment.jobs import (
+    EnrollmentConflict,
     EnrollmentJobRequest,
     EnrollmentJobs,
     job_input_fingerprint,
@@ -39,6 +41,7 @@ from ic_env_guard.fleet.models import (
 from ic_env_guard.fleet.target_policy import ValidatedTarget
 from ic_env_guard.fleet.transport import TransportProfile
 from ic_env_guard.storage.enrollment_journal import EnrollmentJournalRepository
+from ic_env_guard.storage.removal_journal import AgentRemovalRepository
 
 PHASES = (
     "network",
@@ -154,6 +157,8 @@ class EnrollmentOrchestrator:
         service_key_configured: bool = False,
         transport_profiles: tuple[TransportProfile, ...] = (),
         auto_audit: Any | None = None,
+        removal_repository: AgentRemovalRepository | None = None,
+        terminal_usage: GatewayTicketStore | None = None,
     ) -> None:
         self.jobs = jobs
         self.journal = journal
@@ -168,6 +173,8 @@ class EnrollmentOrchestrator:
             profile.id: profile for profile in transport_profiles
         }
         self._auto_audit = auto_audit
+        self._removals = removal_repository
+        self._terminal_usage = terminal_usage
         self._background_tasks: dict[str, asyncio.Task[None]] = {}
         self._closing = False
         self._validation_cache: dict[str, EnrollmentValidation] = {}
@@ -218,6 +225,63 @@ class EnrollmentOrchestrator:
         self._schedule_auto(running, audit_context)
         return EnrollmentPublicResult(running)
 
+    def start_rotation(
+        self,
+        agent_id: str,
+        *,
+        ssh_user: str,
+        ssh_host: str,
+        ssh_port: int,
+        audit_context: AutoEnrollmentAuditContext | None = None,
+    ) -> EnrollmentPublicResult:
+        method = (
+            EnrollmentMethod.SSH_SERVICE_KEY
+            if self._service_key_configured
+            else EnrollmentMethod.SSH_AUTO
+        )
+        pending = self.jobs.create_rotation(
+            EnrollmentJobRequest(
+                normalized_endpoint="rotation-captured",
+                transport_profile_id="rotation-captured",
+                ssh_user=ssh_user,
+                ssh_host=ssh_host,
+                ssh_port=ssh_port,
+                enrollment_method=method,
+                replace_agent_id=agent_id,
+            ),
+            now=self._clock(),
+        )
+        adapter = (
+            self.service_key_adapter
+            if method is EnrollmentMethod.SSH_SERVICE_KEY
+            else self.ssh_adapter
+        )
+        if self._closing or adapter is None or not adapter.healthy:
+            awaiting = self.journal.replace_if_state(
+                replace(
+                    pending,
+                    state=EnrollmentState.AWAITING_CLI,
+                    enrollment_method=EnrollmentMethod.SSH_CLI,
+                    last_error_code="ssh_unavailable",
+                    updated_at=self._clock(),
+                ),
+                expected_state=EnrollmentState.PENDING,
+            )
+            return EnrollmentPublicResult(awaiting)
+        running = self.journal.claim_pending_auto(
+            pending.enrollment_id, now=self._clock()
+        )
+        if running is None:
+            current = self.journal.get(pending.enrollment_id)
+            if current is None:
+                raise RegistryError("enrollment journal storage is unavailable")
+            return EnrollmentPublicResult(current)
+        self._schedule_auto(
+            running,
+            audit_context or AutoEnrollmentAuditContext(None, None, None),
+        )
+        return EnrollmentPublicResult(running)
+
     @property
     def background_task_count(self) -> int:
         return len(self._background_tasks)
@@ -240,6 +304,272 @@ class EnrollmentOrchestrator:
             self.jobs.get(enrollment_id, now=self._clock()),
             self._validation_cache.get(enrollment_id),
         )
+
+    async def consume(
+        self,
+        enrollment_id: str,
+        *,
+        display_name: str,
+        input_fingerprint: str,
+    ) -> AgentRecord:
+        current = self.jobs.get(enrollment_id, now=self._clock())
+        if current.state is EnrollmentState.CONSUMED:
+            raise EnrollmentConflict("agent_enrollment_consumed")
+        if current.state is EnrollmentState.EXPIRED:
+            raise EnrollmentConflict("agent_enrollment_expired")
+        if current.state is not EnrollmentState.VERIFIED:
+            raise EnrollmentConflict("agent_enrollment_not_verified")
+        if input_fingerprint != job_input_fingerprint(current):
+            raise EnrollmentConflict("agent_enrollment_input_changed")
+        duplicate = self.registry.find_duplicate(
+            instance_id=current.remote_instance_id,
+            normalized_endpoint=current.normalized_endpoint,
+        )
+        if duplicate is not None:
+            raise EnrollmentConflict("agent_already_registered")
+        requested = self.jobs.consume(
+            enrollment_id,
+            display_name=display_name,
+            input_fingerprint=input_fingerprint,
+            now=self._clock(),
+        )
+        await self.recover()
+        current = self.journal.get(requested.enrollment_id)
+        record = self.registry.get(requested.enrollment_id)
+        if current is None or current.state is not EnrollmentState.CONSUMED or record is None:
+            code = current.last_error_code if current is not None else None
+            raise EnrollmentConflict(code or "agent_enrollment_activation_pending")
+        return record
+
+    async def consume_rotation(
+        self, agent_id: str, enrollment_id: str
+    ) -> AgentRecord:
+        current = self.jobs.get(enrollment_id, now=self._clock())
+        registered = self.registry.get(agent_id)
+        if registered is None:
+            raise EnrollmentConflict("agent_not_found")
+        if current.replace_agent_id != agent_id:
+            raise EnrollmentConflict("agent_enrollment_conflict")
+        if (
+            current.old_enrollment_method is not EnrollmentMethod.LEGACY_ADMIN_TOKEN
+            and current.remote_instance_id != current.old_instance_id
+        ):
+            raise EnrollmentConflict("agent_identity_changed")
+        if (
+            registered.revision != current.old_registry_revision
+            or registered.credential_ref != current.old_credential_ref
+        ):
+            raise EnrollmentConflict("agent_changed")
+        requested = self.jobs.consume(
+            enrollment_id,
+            display_name=current.old_display_name or registered.display_name,
+            input_fingerprint=job_input_fingerprint(current),
+            now=self._clock(),
+        )
+        await self.recover()
+        finished = self.journal.get(requested.enrollment_id)
+        rotated = self.registry.get(agent_id)
+        if (
+            finished is None
+            or finished.state is not EnrollmentState.CONSUMED
+            or rotated is None
+        ):
+            code = finished.last_error_code if finished is not None else None
+            raise EnrollmentConflict(code or "agent_enrollment_activation_pending")
+        return rotated
+
+    async def update_agent(
+        self,
+        agent_id: str,
+        *,
+        display_name: str | None = None,
+        enabled: bool | None = None,
+        base_url: str | None = None,
+        transport_profile_id: str | None = None,
+    ) -> AgentRecord:
+        current = self.registry.get(agent_id)
+        if current is None:
+            raise EnrollmentConflict("agent_not_found")
+        endpoint = base_url or current.normalized_endpoint
+        profile = transport_profile_id or current.transport_profile_id
+        target_changed = (
+            endpoint != current.normalized_endpoint
+            or profile != current.transport_profile_id
+        )
+        if target_changed:
+            if current.instance_id is None:
+                raise EnrollmentConflict("legacy_revalidation_required")
+            if self.agent_client is None:
+                raise EnrollmentConflict("agent_validation_unavailable")
+            try:
+                target = self.agent_client.prepare(endpoint, profile)
+                token = self.credential_store.read(current.credential_ref)
+                validation = await self.agent_client.validate_pending(
+                    target, token, helper_instance_id=current.instance_id
+                )
+            except EnrollmentValidationError as exc:
+                raise EnrollmentConflict(exc.code) from exc
+            except CredentialStoreError as exc:
+                raise EnrollmentConflict("agent_credential_unavailable") from exc
+            if validation.instance_id != current.instance_id:
+                raise EnrollmentConflict("agent_identity_changed")
+            endpoint = validation.normalized_endpoint
+        candidate = replace(
+            current,
+            display_name=display_name or current.display_name,
+            enabled=current.enabled if enabled is None else enabled,
+            normalized_endpoint=endpoint,
+            transport_profile_id=profile,
+        )
+        try:
+            return self.registry.update_and_reset_status(
+                candidate,
+                expected_revision=current.revision,
+                now=self._clock(),
+            )
+        except RevisionConflict as exc:
+            raise EnrollmentConflict("agent_changed") from exc
+        except RegistryConflict as exc:
+            raise EnrollmentConflict("agent_already_registered") from exc
+        except RegistryError as exc:
+            raise EnrollmentConflict("agent_registry_unavailable") from exc
+
+    async def remove_agent(
+        self,
+        agent_id: str,
+        *,
+        audit_event_id: int,
+        local_only: bool,
+    ) -> None:
+        if self._removals is None:
+            raise EnrollmentConflict("agent_removal_unavailable")
+        if self._terminal_usage is not None and not self._terminal_usage.begin_removal(
+            agent_id
+        ):
+            raise EnrollmentConflict("agent_in_use")
+        try:
+            try:
+                job = self._removals.create_for_agent(
+                    agent_id,
+                    audit_event_id=audit_event_id,
+                    local_only=local_only,
+                    now=self._clock(),
+                )
+            except RegistryConflict as exc:
+                raise EnrollmentConflict(str(exc)) from exc
+            except RegistryError as exc:
+                raise EnrollmentConflict("agent_removal_unavailable") from exc
+            try:
+                await self._resume_removal(job)
+            except RegistryError as exc:
+                raise EnrollmentConflict("agent_registry_unavailable") from exc
+        finally:
+            if self._terminal_usage is not None:
+                self._terminal_usage.abort_removal(agent_id)
+
+    def removal_is_recoverable(self, audit_event_id: int) -> bool:
+        return self._removals is not None and self._removals.audit_is_recoverable(
+            audit_event_id
+        )
+
+    async def _resume_removal(self, job: Any) -> None:
+        if self._removals is None:
+            raise EnrollmentConflict("agent_removal_unavailable")
+        current = job
+        if current.phase in {"pending", "revoking", "residual"}:
+            if (
+                not current.local_only
+                and current.enrollment_method is not EnrollmentMethod.LEGACY_ADMIN_TOKEN
+            ):
+                if self.agent_client is None:
+                    raise EnrollmentConflict("agent_removal_unavailable")
+                if current.phase != "revoking":
+                    current = self._removals.transition(
+                        current, "revoking", now=self._clock()
+                    )
+                try:
+                    target = self.agent_client.prepare(
+                        current.normalized_endpoint,
+                        current.transport_profile_id,
+                    )
+                    token = self.credential_store.read(current.credential_ref)
+                    await self.agent_client.revoke(
+                        target,
+                        token,
+                        credential_id=current.remote_credential_id,
+                    )
+                except EnrollmentValidationError as exc:
+                    self._removals.transition(
+                        current,
+                        "residual",
+                        now=self._clock(),
+                        last_error_code=exc.code,
+                    )
+                    raise EnrollmentConflict(exc.code) from exc
+                except CredentialStoreError as exc:
+                    self._removals.transition(
+                        current,
+                        "residual",
+                        now=self._clock(),
+                        last_error_code="agent_credential_unavailable",
+                    )
+                    raise EnrollmentConflict("agent_credential_unavailable") from exc
+            current = self._removals.transition(current, "revoked", now=self._clock())
+        if current.phase == "revoked":
+            deleted = self.registry.delete_if_revision_and_credential(
+                current.agent_id,
+                expected_revision=current.captured_revision,
+                expected_credential_ref=current.credential_ref,
+            )
+            if not deleted:
+                existing = self.registry.get(current.agent_id)
+                if existing is not None:
+                    self._removals.transition(
+                        current,
+                        "residual",
+                        now=self._clock(),
+                        last_error_code="agent_changed",
+                    )
+                    raise EnrollmentConflict("agent_changed")
+            current = self._removals.transition(
+                current, "registry_deleted", now=self._clock()
+            )
+        if current.phase == "registry_deleted":
+            with self.credential_store.lifecycle_lease():
+                try:
+                    self.credential_store.delete_if_exists(current.credential_ref)
+                except CredentialStoreError as exc:
+                    self._removals.transition(
+                        current,
+                        "residual",
+                        now=self._clock(),
+                        last_error_code="credential_cleanup_failed",
+                    )
+                    raise EnrollmentConflict("credential_cleanup_failed") from exc
+            current = self._removals.transition(
+                current, "credential_deleted", now=self._clock()
+            )
+        if current.phase == "credential_deleted":
+            self._removals.transition(current, "completed", now=self._clock())
+
+    async def recover_removals(self) -> None:
+        if self._removals is None:
+            return
+        self._removals.finalize_orphaned_pending_audits()
+        for job in self._removals.list_recoverable():
+            if self._terminal_usage is not None and not self._terminal_usage.begin_removal(
+                job.agent_id
+            ):
+                continue
+            try:
+                try:
+                    await self._resume_removal(job)
+                except EnrollmentConflict:
+                    continue
+                self._removals.finalize_audit_if_pending(job, success=True)
+            finally:
+                if self._terminal_usage is not None:
+                    self._terminal_usage.finish_removal(job.agent_id)
 
     async def cancel(self, enrollment_id: str) -> EnrollmentPublicResult:
         task = self._background_tasks.get(enrollment_id)
@@ -1120,6 +1450,18 @@ class EnrollmentOrchestrator:
         except RegistryError:
             return
 
+    def _residual_claim(self, job: EnrollmentJob, code: str) -> None:
+        try:
+            self.journal.release_recovery_residual(
+                job.enrollment_id,
+                owner=self._recovery_owner,
+                expected_revision=job.recovery_revision,
+                error_code=code,
+                now=self._clock(),
+            )
+        except RegistryError:
+            return
+
     def _reload_after_fence_loss(self, enrollment_id: str) -> None:
         try:
             self.journal.get(enrollment_id)
@@ -1127,6 +1469,9 @@ class EnrollmentOrchestrator:
             return
 
     async def _recover_activation(self, job: EnrollmentJob) -> None:
+        if job.replace_agent_id is not None:
+            await self._recover_rotation(job)
+            return
         if not job.credential_temp_ref or not job.requested_display_name:
             self._fail_claim(job, "credential_store_unavailable")
             return
@@ -1201,17 +1546,193 @@ class EnrollmentOrchestrator:
             created_at=self._clock(),
             updated_at=self._clock(),
         )
+        receipt = None
+        if current.enrollment_method is EnrollmentMethod.SSH_CLI:
+            receipt = _cli_accept_receipt(
+                enrollment_id=current.enrollment_id,
+                nonce=current.cli_resume_nonce or "",
+                peer_uid=current.cli_peer_uid or 0,
+                input_fingerprint=current.cli_input_fingerprint or "",
+                pinned_address=current.cli_pinned_address or "",
+            )
+        compensate_conflict = False
         with self.credential_store.lifecycle_lease():
+            commit = getattr(self.registry, "commit_activated_enrollment", None)
+            if commit is None:
+                self._fail_claim(current, "agent_registry_unavailable")
+                return
             try:
-                self.registry.create(record)
+                commit(current, record, now=self._clock(), cli_accept_receipt=receipt)
             except RegistryConflict:
                 existing = self.registry.get(record.agent_id)
                 if existing is None or not _same_committed_agent(existing, record):
-                    return
+                    compensate_conflict = True
+            except (RegistryError, RevisionConflict):
+                return
+        if compensate_conflict:
+            await self._compensate_activated_add_conflict(current, target)
+
+    async def _compensate_activated_add_conflict(
+        self, job: EnrollmentJob, target: Any
+    ) -> None:
+        current = job
+        if current.enrollment_method is not EnrollmentMethod.LEGACY_ADMIN_TOKEN:
+            try:
+                token = self.credential_store.read(current.credential_temp_ref)
+            except CredentialStoreError:
+                self._residual_claim(current, "credential_store_unavailable")
+                return
+            outcome = await self._run_with_recovery_lease(
+                current,
+                self.agent_client.revoke(
+                    target,
+                    token,
+                    credential_id=current.remote_credential_id,
+                ),
+            )
+            if outcome is None:
+                return
+            current = outcome.job
+            if outcome.error is not None:
+                code = (
+                    outcome.error.code
+                    if isinstance(outcome.error, EnrollmentValidationError)
+                    else "agent_network_error"
+                )
+                self._residual_claim(current, code)
+                return
+        with self.credential_store.lifecycle_lease():
+            try:
+                self.credential_store.delete_if_exists(current.credential_temp_ref)
+            except CredentialStoreError:
+                self._residual_claim(current, "credential_cleanup_failed")
+                return
             self._transition_claimed(
                 replace(
                     current,
                     credential_temp_ref=None,
+                    validated_http_address=None,
+                    last_error_code="agent_already_registered",
+                ),
+                EnrollmentState.FAILED,
+                clear_claim=True,
+            )
+
+    async def _recover_rotation(self, job: EnrollmentJob) -> None:
+        if (
+            job.old_enrollment_method is not EnrollmentMethod.LEGACY_ADMIN_TOKEN
+            and job.remote_instance_id != job.old_instance_id
+        ):
+            self._residual_claim(job, "agent_identity_changed")
+            return
+        required = (
+            job.replace_agent_id,
+            job.credential_temp_ref,
+            job.old_credential_ref,
+            job.old_registry_revision,
+            job.old_enrollment_method,
+            job.old_display_name,
+            job.validated_http_address,
+        )
+        if self.agent_client is None or any(value is None for value in required):
+            self._residual_claim(job, "enrollment_unavailable")
+            return
+        try:
+            target = self.agent_client.prepare_pinned(
+                job.normalized_endpoint,
+                job.transport_profile_id,
+                job.validated_http_address,
+            )
+            token = self.credential_store.read(job.credential_temp_ref)
+        except EnrollmentValidationError as exc:
+            self._residual_claim(job, exc.code)
+            return
+        except CredentialStoreError:
+            self._residual_claim(job, "credential_store_unavailable")
+            return
+        current = job
+        if current.state is EnrollmentState.ACTIVATION_REQUESTED:
+            outcome = await self._run_with_recovery_lease(
+                current,
+                self.agent_client.activate(
+                    target,
+                    token,
+                    enrollment_id=current.enrollment_id,
+                    credential_id=current.remote_credential_id,
+                ),
+            )
+            if outcome is None:
+                return
+            current = outcome.job
+            if outcome.error is not None:
+                code = (
+                    outcome.error.code
+                    if isinstance(outcome.error, EnrollmentValidationError)
+                    else "agent_network_error"
+                )
+                self._residual_claim(current, code)
+                return
+            transitioned = self._transition_claimed(
+                current, EnrollmentState.ACTIVATED
+            )
+            if transitioned is None:
+                return
+            current = transitioned
+        registered = self.registry.get(current.replace_agent_id or "")
+        if registered is None:
+            self._residual_claim(current, "agent_not_found")
+            return
+        if (
+            registered.revision == current.old_registry_revision
+            and registered.credential_ref == current.old_credential_ref
+        ):
+            try:
+                registered = self.registry.swap_rotation(current, now=self._clock())
+            except RevisionConflict:
+                self._residual_claim(current, "agent_changed")
+                return
+            except RegistryError:
+                self._residual_claim(current, "agent_registry_unavailable")
+                return
+        elif registered.credential_ref != current.credential_temp_ref:
+            self._residual_claim(current, "agent_changed")
+            return
+        renewed = self._renew_claim(current)
+        if renewed is None:
+            return
+        current = renewed
+        if current.old_enrollment_method is not EnrollmentMethod.LEGACY_ADMIN_TOKEN:
+            outcome = await self._run_with_recovery_lease(
+                current,
+                self.agent_client.revoke(
+                    target,
+                    token,
+                    credential_id=current.old_remote_credential_id,
+                ),
+            )
+            if outcome is None:
+                return
+            current = outcome.job
+            if outcome.error is not None:
+                code = (
+                    outcome.error.code
+                    if isinstance(outcome.error, EnrollmentValidationError)
+                    else "agent_network_error"
+                )
+                self._residual_claim(current, code)
+                return
+        with self.credential_store.lifecycle_lease():
+            try:
+                self.credential_store.delete_if_exists(current.old_credential_ref)
+            except CredentialStoreError:
+                self._residual_claim(current, "credential_cleanup_failed")
+                return
+            self._transition_claimed(
+                replace(
+                    current,
+                    credential_temp_ref=None,
+                    old_credential_ref=None,
+                    old_remote_credential_id=None,
                     validated_http_address=None,
                 ),
                 EnrollmentState.CONSUMED,
@@ -1240,6 +1761,7 @@ class EnrollmentOrchestrator:
             )
 
     async def recover_and_cleanup(self) -> None:
+        await self.recover_removals()
         self._recover_auto_startup()
         await self.recover()
         self.credential_store.cleanup_orphans(self.registry, self.journal)

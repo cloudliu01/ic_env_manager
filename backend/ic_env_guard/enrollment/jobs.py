@@ -124,6 +124,49 @@ class EnrollmentJobs:
                 raise EnrollmentConflict(code) from exc
             raise EnrollmentConflict("agent_enrollment_conflict") from exc
 
+    def create_rotation(
+        self,
+        request: EnrollmentJobRequest,
+        *,
+        now: datetime | None = None,
+    ) -> EnrollmentJob:
+        now = now or datetime.now(UTC)
+        if request.replace_agent_id is None:
+            raise EnrollmentConflict("agent_not_found")
+        job = EnrollmentJob(
+            enrollment_id=str(uuid4()),
+            manager_id=self.manager_id,
+            state=EnrollmentState.PENDING,
+            normalized_endpoint=request.normalized_endpoint,
+            transport_profile_id=request.transport_profile_id,
+            discovery_result_id=None,
+            replace_agent_id=request.replace_agent_id,
+            requested_display_name=request.display_name,
+            ssh_user=request.ssh_user,
+            ssh_host=request.ssh_host,
+            ssh_port=request.ssh_port,
+            enrollment_method=request.enrollment_method,
+            remote_instance_id=None,
+            remote_credential_id=None,
+            credential_temp_ref=None,
+            old_credential_ref=None,
+            old_remote_credential_id=None,
+            save_requested=False,
+            expires_at=now + timedelta(seconds=self.pending_ttl_seconds),
+            last_error_code=None,
+            created_at=now,
+            updated_at=now,
+        )
+        try:
+            return self.repository.create_rotation_with_capacity(
+                job, now=now, max_active=self.max_active
+            )
+        except RegistryConflict as exc:
+            code = str(exc)
+            if code in {"agent_not_found", "agent_enrollment_capacity"}:
+                raise EnrollmentConflict(code) from exc
+            raise EnrollmentConflict("agent_enrollment_conflict") from exc
+
     def get(self, enrollment_id: str, *, now: datetime | None = None) -> EnrollmentJob:
         job = self.repository.get(enrollment_id)
         if job is None:

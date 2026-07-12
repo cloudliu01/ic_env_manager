@@ -67,6 +67,7 @@ from ic_env_guard.storage.manager_registry import (
     ManagerRegistryRepository as SQLiteManagerRegistryRepository,
 )
 from ic_env_guard.storage.observations import SQLiteObservationRepository
+from ic_env_guard.storage.removal_journal import AgentRemovalRepository
 from ic_env_guard.summary.service import SummaryService
 from ic_env_guard.terminal.manager import TerminalManager
 from ic_env_guard.terminal.tickets import TerminalTicketManager
@@ -124,6 +125,7 @@ class ManagerContainer:
     registry_repository: SQLiteManagerRegistryRepository
     status_repository: AgentStatusRepository
     enrollment_journal_repository: EnrollmentJournalRepository
+    removal_repository: AgentRemovalRepository
     credential_store: CredentialStore
     fleet_status_service: FleetStatusService
     fleet_probe_service: FleetProbeService | None
@@ -281,6 +283,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
     registry_repository = SQLiteManagerRegistryRepository(database_engine)
     status_repository = AgentStatusRepository(database_engine)
     enrollment_journal_repository = EnrollmentJournalRepository(database_engine)
+    removal_repository = AgentRemovalRepository(database_engine)
     manager_id = registry_repository.get_or_create_manager_id()
     # One ManagerContainer owns one Store/coordinator; enrollment mutations and startup cleanup
     # must share its lifecycle lease rather than constructing another Store for this directory.
@@ -388,6 +391,10 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         pending_ttl_seconds=config.enrollment.pending_ttl_seconds,
         max_active=config.enrollment.max_pending,
     )
+    gateway_ticket_store = GatewayTicketStore(
+        config.control_plane.max_outstanding_tickets,
+        durable_removal_blocker=removal_repository.blocks_usage,
+    )
     enrollment_orchestrator = EnrollmentOrchestrator(
         jobs=enrollment_jobs,
         journal=enrollment_journal_repository,
@@ -401,6 +408,8 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         ),
         transport_profiles=config.control_plane.transport_profiles,
         auto_audit=ManagerAutoEnrollmentAudit(control_plane_session_factory),
+        removal_repository=removal_repository,
+        terminal_usage=gateway_ticket_store,
     )
     manager_enrollment_socket = (
         ManagerEnrollmentSocket(
@@ -421,9 +430,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
             legacy_credential_loader=fleet_registry.load_credential
         ),
         agent_availability=agent_availability,
-        gateway_ticket_store=GatewayTicketStore(
-            config.control_plane.max_outstanding_tickets
-        ),
+        gateway_ticket_store=gateway_ticket_store,
         gateway_proxy_limiter=GatewayProxyLimiter(
             config.control_plane.max_active_terminal_proxies
         ),
@@ -441,6 +448,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         registry_repository=registry_repository,
         status_repository=status_repository,
         enrollment_journal_repository=enrollment_journal_repository,
+        removal_repository=removal_repository,
         credential_store=credential_store,
         fleet_status_service=fleet_status_service,
         fleet_probe_service=fleet_probe_service,

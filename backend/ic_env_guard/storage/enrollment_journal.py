@@ -1,6 +1,7 @@
 import json
 import re
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta
 from ipaddress import ip_address
 from typing import Any
@@ -18,7 +19,13 @@ from ic_env_guard.fleet.models import (
     RegistryInvariantError,
     RevisionConflict,
 )
-from ic_env_guard.storage.manager_registry import _format_time, _parse_time, _SQLiteRepository
+from ic_env_guard.storage.manager_registry import (
+    _AGENT_COLUMNS,
+    _agent,
+    _format_time,
+    _parse_time,
+    _SQLiteRepository,
+)
 
 _COLUMNS = (
     "enrollment_id, manager_id, state, normalized_endpoint, transport_profile_id, "
@@ -27,7 +34,9 @@ _COLUMNS = (
     "credential_temp_ref, old_credential_ref, old_remote_credential_id, save_requested, "
     "expires_at, last_error_code, created_at, updated_at, recovery_owner, "
     "recovery_lease_until, recovery_revision, validated_http_address, cli_resume_nonce, "
-    "cli_peer_uid, cli_input_fingerprint, cli_pinned_address, cli_accept_receipt"
+    "cli_peer_uid, cli_input_fingerprint, cli_pinned_address, cli_accept_receipt, "
+    "old_normalized_endpoint, old_transport_profile_id, old_instance_id, "
+    "old_registry_revision, old_enrollment_method, old_source, old_enabled, old_display_name"
 )
 _ENROLLMENT_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _CREDENTIAL_REF = re.compile(r"^[0-9a-f]{48}$")
@@ -111,6 +120,41 @@ def _validate_job(job: EnrollmentJob) -> None:
         raise RegistryInvariantError("saved enrollment requires a display name")
     if job.discovery_result_id is not None and job.replace_agent_id is not None:
         raise RegistryInvariantError("discovery enrollment cannot replace an agent")
+    rotation_metadata = (
+        job.old_normalized_endpoint,
+        job.old_transport_profile_id,
+        job.old_registry_revision,
+        job.old_enrollment_method,
+        job.old_source,
+        job.old_enabled,
+        job.old_display_name,
+    )
+    if job.replace_agent_id is None:
+        if any(value is not None for value in rotation_metadata) or any(
+            value is not None
+            for value in (
+                job.old_credential_ref,
+                job.old_remote_credential_id,
+                job.old_instance_id,
+            )
+        ):
+            raise RegistryInvariantError("non-rotation enrollment has an old Agent snapshot")
+    else:
+        if any(value is None for value in rotation_metadata):
+            raise RegistryInvariantError("rotation enrollment requires an old Agent snapshot")
+        if job.state is not EnrollmentState.CONSUMED:
+            if job.old_credential_ref is None:
+                raise RegistryInvariantError("rotation requires the old credential reference")
+            if job.old_enrollment_method is not EnrollmentMethod.LEGACY_ADMIN_TOKEN and (
+                job.old_remote_credential_id is None or job.old_instance_id is None
+            ):
+                raise RegistryInvariantError("managed rotation requires old remote identity")
+        if (
+            job.remote_instance_id is not None
+            and job.old_instance_id is not None
+            and job.remote_instance_id != job.old_instance_id
+        ):
+            raise RegistryInvariantError("rotation changed Agent identity")
     credential_states = {
         EnrollmentState.CREDENTIAL_ISSUED,
         EnrollmentState.VERIFYING,
@@ -259,6 +303,16 @@ def _job(row: Any) -> EnrollmentJob:
         cli_input_fingerprint=row[28],
         cli_pinned_address=row[29],
         cli_accept_receipt=row[30],
+        old_normalized_endpoint=row[31],
+        old_transport_profile_id=row[32],
+        old_instance_id=row[33],
+        old_registry_revision=row[34],
+        old_enrollment_method=(
+            EnrollmentMethod(row[35]) if row[35] is not None else None
+        ),
+        old_source=row[36],
+        old_enabled=bool(row[37]) if row[37] is not None else None,
+        old_display_name=row[38],
     )
 
 
@@ -272,7 +326,7 @@ class EnrollmentJournalRepository(_SQLiteRepository):
             with self._write() as connection:
                 connection.execute(
                     f"INSERT INTO agent_enrollment_jobs ({_COLUMNS}) "
-                    f"VALUES ({','.join('?' * 31)})",
+                    f"VALUES ({','.join('?' * 39)})",
                     self._values(job),
                 )
             return job
@@ -316,7 +370,7 @@ class EnrollmentJournalRepository(_SQLiteRepository):
                     raise RegistryConflict("agent_enrollment_capacity")
                 connection.execute(
                     f"INSERT INTO agent_enrollment_jobs ({_COLUMNS}) "
-                    f"VALUES ({','.join('?' * 31)})",
+                    f"VALUES ({','.join('?' * 39)})",
                     self._values(job),
                 )
             return job
@@ -324,6 +378,63 @@ class EnrollmentJournalRepository(_SQLiteRepository):
             raise
         except sqlite3.IntegrityError as exc:
             raise RegistryConflict("enrollment job conflicts with existing state") from exc
+        except (SQLAlchemyError, sqlite3.Error) as exc:
+            raise RegistryError("enrollment journal storage is unavailable") from exc
+
+    def create_rotation_with_capacity(
+        self,
+        job: EnrollmentJob,
+        *,
+        now: datetime,
+        max_active: int,
+    ) -> EnrollmentJob:
+        if job.replace_agent_id is None:
+            raise RegistryInvariantError("rotation requires a replacement Agent")
+        terminal = tuple(state.value for state in EnrollmentState if state.terminal)
+        terminal_placeholders = ",".join("?" for _ in terminal)
+        try:
+            with self._write() as connection:
+                row = connection.execute(
+                    f"SELECT {_AGENT_COLUMNS} FROM agents WHERE agent_id=?",
+                    (job.replace_agent_id,),
+                ).fetchone()
+                if row is None:
+                    raise RegistryConflict("agent_not_found")
+                old = _agent(row)
+                captured = replace(
+                    job,
+                    normalized_endpoint=old.normalized_endpoint,
+                    transport_profile_id=old.transport_profile_id,
+                    requested_display_name=old.display_name,
+                    old_credential_ref=old.credential_ref,
+                    old_remote_credential_id=old.remote_credential_id,
+                    old_normalized_endpoint=old.normalized_endpoint,
+                    old_transport_profile_id=old.transport_profile_id,
+                    old_instance_id=old.instance_id,
+                    old_registry_revision=old.revision,
+                    old_enrollment_method=old.enrollment_method,
+                    old_source=old.source,
+                    old_enabled=old.enabled,
+                    old_display_name=old.display_name,
+                )
+                _validate_job(captured)
+                count = connection.execute(
+                    f"SELECT COUNT(*) FROM agent_enrollment_jobs "
+                    f"WHERE state NOT IN ({terminal_placeholders})",
+                    terminal,
+                ).fetchone()[0]
+                if count >= max_active:
+                    raise RegistryConflict("agent_enrollment_capacity")
+                connection.execute(
+                    f"INSERT INTO agent_enrollment_jobs ({_COLUMNS}) "
+                    f"VALUES ({','.join('?' * 39)})",
+                    self._values(captured),
+                )
+            return captured
+        except RegistryConflict:
+            raise
+        except sqlite3.IntegrityError as exc:
+            raise RegistryConflict("agent_enrollment_conflict") from exc
         except (SQLAlchemyError, sqlite3.Error) as exc:
             raise RegistryError("enrollment journal storage is unavailable") from exc
 
@@ -742,6 +853,37 @@ class EnrollmentJournalRepository(_SQLiteRepository):
         except (SQLAlchemyError, sqlite3.Error) as exc:
             raise RegistryError("enrollment journal storage is unavailable") from exc
 
+    def release_recovery_residual(
+        self,
+        enrollment_id: str,
+        *,
+        owner: str,
+        expected_revision: int,
+        error_code: str,
+        now: datetime,
+    ) -> bool:
+        if not _ERROR_CODE.fullmatch(error_code):
+            raise RegistryInvariantError("enrollment error code is invalid")
+        try:
+            with self._write() as connection:
+                cursor = connection.execute(
+                    "UPDATE agent_enrollment_jobs SET last_error_code=?, "
+                    "recovery_owner=NULL, recovery_lease_until=NULL, "
+                    "recovery_revision=recovery_revision+1, updated_at=? "
+                    "WHERE enrollment_id=? AND recovery_owner=? AND recovery_revision=? "
+                    "AND state IN ('activation_requested','activated')",
+                    (
+                        error_code,
+                        _format_time(now),
+                        enrollment_id,
+                        owner,
+                        expected_revision,
+                    ),
+                )
+            return cursor.rowcount == 1
+        except (SQLAlchemyError, sqlite3.Error) as exc:
+            raise RegistryError("enrollment journal storage is unavailable") from exc
+
     def list_terminal_cleanup(self) -> tuple[EnrollmentJob, ...]:
         states = (
             EnrollmentState.CANCELLED.value,
@@ -916,4 +1058,16 @@ class EnrollmentJournalRepository(_SQLiteRepository):
             job.cli_input_fingerprint,
             job.cli_pinned_address,
             job.cli_accept_receipt,
+            job.old_normalized_endpoint,
+            job.old_transport_profile_id,
+            job.old_instance_id,
+            job.old_registry_revision,
+            (
+                job.old_enrollment_method.value
+                if job.old_enrollment_method is not None
+                else None
+            ),
+            job.old_source,
+            int(job.old_enabled) if job.old_enabled is not None else None,
+            job.old_display_name,
         )

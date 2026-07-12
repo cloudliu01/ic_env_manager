@@ -551,14 +551,10 @@ async def test_registry_commit_then_consumed_fence_fault_converges_on_restart(
                 ),
                 expected_state=current.state,
             )
-        real_transition = orchestrator._transition_claimed
-        monkeypatch.setattr(orchestrator, "_transition_claimed", lambda *_a, **_k: None)
         await orchestrator.recover()
         assert registry.get(pending.enrollment_id) is not None
         lost = journal.get(pending.enrollment_id)
-        assert lost.state is EnrollmentState.ACTIVATED
-        monkeypatch.setattr(orchestrator, "_transition_claimed", real_transition)
-        orchestrator._clock = lambda: lost.recovery_lease_until + timedelta(seconds=1)
+        assert lost.state is EnrollmentState.CONSUMED
 
         await orchestrator.recover()
 

@@ -18,6 +18,9 @@ from ic_env_guard.api.agent_enrollments import router as agent_enrollments_route
 from ic_env_guard.api.agent_http import get_agent_http_client
 from ic_env_guard.api.agent_monitoring import router as agent_monitoring_router
 from ic_env_guard.api.agent_registry import (
+    get_enrollment_orchestrator as get_registry_enrollment_orchestrator,
+)
+from ic_env_guard.api.agent_registry import (
     get_fleet_probe_service,
     get_fleet_status_service,
 )
@@ -478,6 +481,9 @@ def create_app(
     app.dependency_overrides[get_fleet_status_service] = configured_fleet_status_service
     app.dependency_overrides[get_fleet_probe_service] = configured_fleet_probe_service
     app.dependency_overrides[get_enrollment_orchestrator] = (
+        configured_enrollment_orchestrator
+    )
+    app.dependency_overrides[get_registry_enrollment_orchestrator] = (
         configured_enrollment_orchestrator
     )
     app.dependency_overrides[get_audit_query_repository] = configured_audit_query_repository

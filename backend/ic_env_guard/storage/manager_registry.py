@@ -18,7 +18,9 @@ from ic_env_guard.fleet.models import (
     AgentQuery,
     AgentRecord,
     AgentStatus,
+    EnrollmentJob,
     EnrollmentMethod,
+    EnrollmentState,
     RegistryConflict,
     RegistryError,
     RegistryInvariantError,
@@ -229,12 +231,93 @@ class ManagerRegistryRepository(_SQLiteRepository):
         except (SQLAlchemyError, sqlite3.Error) as exc:
             raise RegistryError("agent registry storage is unavailable") from exc
 
+    def commit_activated_enrollment(
+        self,
+        job: EnrollmentJob,
+        record: AgentRecord,
+        *,
+        now: datetime,
+        cli_accept_receipt: str | None = None,
+    ) -> AgentRecord:
+        if job.state is not EnrollmentState.ACTIVATED:
+            raise RegistryInvariantError("enrollment is not activated")
+        _validate_record(record)
+        now_text = _format_time(now)
+        try:
+            with self._write() as connection:
+                existing = connection.execute(
+                    f"SELECT {_AGENT_COLUMNS} FROM agents WHERE agent_id=?",
+                    (record.agent_id,),
+                ).fetchone()
+                if existing is None:
+                    connection.execute(
+                        f"INSERT INTO agents ({_AGENT_COLUMNS}) "
+                        f"VALUES ({','.join('?' * 13)})",
+                        self._values(record),
+                    )
+                elif _agent(existing) != record:
+                    raise RegistryConflict("agent ID, identity, or endpoint already exists")
+                connection.execute(
+                    "INSERT INTO agent_status (agent_id, target_revision, connection_status, "
+                    "workload_status, observed_at, stale_after, api_version, agent_version, "
+                    "capabilities_json, summary_json, last_error_code, updated_at) "
+                    "VALUES (?, ?, 'unknown', 'unknown', NULL, NULL, NULL, NULL, '[]', '{}', "
+                    "NULL, ?) ON CONFLICT(agent_id) DO NOTHING",
+                    (record.agent_id, record.revision, now_text),
+                )
+                cursor = connection.execute(
+                    "UPDATE agent_enrollment_jobs SET state='consumed', "
+                    "credential_temp_ref=NULL, validated_http_address=NULL, "
+                    "recovery_owner=NULL, recovery_lease_until=NULL, "
+                    "recovery_revision=recovery_revision+1, cli_resume_nonce=NULL, "
+                    "cli_peer_uid=NULL, cli_input_fingerprint=NULL, cli_pinned_address=NULL, "
+                    "cli_accept_receipt=?, updated_at=? WHERE enrollment_id=? "
+                    "AND state='activated' AND recovery_owner=? AND recovery_revision=?",
+                    (
+                        cli_accept_receipt,
+                        now_text,
+                        job.enrollment_id,
+                        job.recovery_owner,
+                        job.recovery_revision,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RevisionConflict("enrollment recovery claim changed")
+            return record
+        except (RegistryConflict, RevisionConflict):
+            raise
+        except sqlite3.IntegrityError as exc:
+            raise RegistryConflict("agent ID, identity, or endpoint already exists") from exc
+        except (SQLAlchemyError, sqlite3.Error) as exc:
+            raise RegistryError("agent registry storage is unavailable") from exc
+
     def get(self, agent_id: str) -> AgentRecord | None:
         try:
             with self.engine.connect() as connection:
                 row = connection.exec_driver_sql(
                     f"SELECT {_AGENT_COLUMNS} FROM agents WHERE agent_id = ?", (agent_id,)
                 ).first()
+            return _agent(row) if row is not None else None
+        except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise RegistryError("agent registry storage is unavailable") from exc
+
+    def find_duplicate(
+        self, *, instance_id: str | None, normalized_endpoint: str
+    ) -> AgentRecord | None:
+        try:
+            with self.engine.connect() as connection:
+                if instance_id is None:
+                    row = connection.exec_driver_sql(
+                        f"SELECT {_AGENT_COLUMNS} FROM agents WHERE normalized_endpoint=? "
+                        "LIMIT 1",
+                        (normalized_endpoint,),
+                    ).first()
+                else:
+                    row = connection.exec_driver_sql(
+                        f"SELECT {_AGENT_COLUMNS} FROM agents WHERE instance_id=? "
+                        "OR normalized_endpoint=? LIMIT 1",
+                        (instance_id, normalized_endpoint),
+                    ).first()
             return _agent(row) if row is not None else None
         except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
             raise RegistryError("agent registry storage is unavailable") from exc
@@ -287,10 +370,149 @@ class ManagerRegistryRepository(_SQLiteRepository):
         except (SQLAlchemyError, sqlite3.Error) as exc:
             raise RegistryError("agent registry storage is unavailable") from exc
 
+    def update_and_reset_status(
+        self,
+        record: AgentRecord,
+        *,
+        expected_revision: int,
+        now: datetime,
+    ) -> AgentRecord:
+        updated = replace(
+            record,
+            revision=expected_revision + 1,
+            updated_at=now,
+        )
+        _validate_record(updated)
+        values = self._values(updated)
+        connection_status = "unknown" if updated.enabled else "disabled"
+        try:
+            with self._write() as connection:
+                cursor = connection.execute(
+                    "UPDATE agents SET instance_id=?, display_name=?, normalized_endpoint=?, "
+                    "credential_ref=?, remote_credential_id=?, transport_profile_id=?, "
+                    "enrollment_method=?, enabled=?, source=?, revision=?, created_at=?, "
+                    "updated_at=? WHERE agent_id=? AND revision=?",
+                    (*values[1:], record.agent_id, expected_revision),
+                )
+                if cursor.rowcount != 1:
+                    raise RevisionConflict("agent registry revision changed")
+                connection.execute(
+                    "INSERT INTO agent_status (agent_id, target_revision, connection_status, "
+                    "workload_status, observed_at, stale_after, api_version, agent_version, "
+                    "capabilities_json, summary_json, last_error_code, updated_at) "
+                    "VALUES (?, ?, ?, 'unknown', NULL, NULL, NULL, NULL, '[]', '{}', NULL, ?) "
+                    "ON CONFLICT(agent_id) DO UPDATE SET target_revision=excluded.target_revision, "
+                    "connection_status=excluded.connection_status, workload_status='unknown', "
+                    "observed_at=NULL, stale_after=NULL, api_version=NULL, agent_version=NULL, "
+                    "capabilities_json='[]', summary_json='{}', last_error_code=NULL, "
+                    "updated_at=excluded.updated_at",
+                    (
+                        updated.agent_id,
+                        updated.revision,
+                        connection_status,
+                        _format_time(now),
+                    ),
+                )
+            return updated
+        except RevisionConflict:
+            raise
+        except sqlite3.IntegrityError as exc:
+            raise RegistryConflict("agent identity or endpoint already exists") from exc
+        except (SQLAlchemyError, sqlite3.Error) as exc:
+            raise RegistryError("agent registry storage is unavailable") from exc
+
+    def swap_rotation(self, job: EnrollmentJob, *, now: datetime) -> AgentRecord:
+        required = (
+            job.replace_agent_id,
+            job.credential_temp_ref,
+            job.old_credential_ref,
+            job.old_registry_revision,
+            job.old_enrollment_method,
+            job.old_source,
+            job.old_display_name,
+        )
+        if job.state is not EnrollmentState.ACTIVATED or any(
+            value is None for value in required
+        ):
+            raise RegistryInvariantError("rotation snapshot is incomplete")
+        old = self.get(job.replace_agent_id or "")
+        if old is None:
+            raise RegistryConflict("agent_not_found")
+        updated = AgentRecord(
+            agent_id=old.agent_id,
+            instance_id=job.remote_instance_id,
+            display_name=job.old_display_name or old.display_name,
+            normalized_endpoint=job.normalized_endpoint,
+            credential_ref=job.credential_temp_ref or "",
+            remote_credential_id=job.remote_credential_id,
+            transport_profile_id=job.transport_profile_id,
+            enrollment_method=job.enrollment_method,
+            enabled=bool(job.old_enabled),
+            source=job.old_source or old.source,
+            revision=job.old_registry_revision or old.revision,
+            created_at=old.created_at,
+            updated_at=now,
+        )
+        _validate_record(replace(updated, revision=updated.revision + 1))
+        try:
+            with self._write() as connection:
+                values = self._values(replace(updated, revision=updated.revision + 1))
+                cursor = connection.execute(
+                    "UPDATE agents SET instance_id=?, display_name=?, normalized_endpoint=?, "
+                    "credential_ref=?, remote_credential_id=?, transport_profile_id=?, "
+                    "enrollment_method=?, enabled=?, source=?, revision=?, created_at=?, "
+                    "updated_at=? WHERE agent_id=? AND revision=? AND credential_ref=?",
+                    (
+                        *values[1:],
+                        updated.agent_id,
+                        job.old_registry_revision,
+                        job.old_credential_ref,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RevisionConflict("Agent changed during credential rotation")
+                connection.execute(
+                    "INSERT INTO agent_status (agent_id, target_revision, connection_status, "
+                    "workload_status, observed_at, stale_after, api_version, agent_version, "
+                    "capabilities_json, summary_json, last_error_code, updated_at) "
+                    "VALUES (?, ?, 'unknown', 'unknown', NULL, NULL, NULL, NULL, '[]', '{}', "
+                    "NULL, ?) ON CONFLICT(agent_id) DO UPDATE SET "
+                    "target_revision=excluded.target_revision, "
+                    "connection_status='unknown', workload_status='unknown', observed_at=NULL, "
+                    "stale_after=NULL, api_version=NULL, agent_version=NULL, "
+                    "capabilities_json='[]', "
+                    "summary_json='{}', last_error_code=NULL, updated_at=excluded.updated_at",
+                    (updated.agent_id, updated.revision + 1, _format_time(now)),
+                )
+            return replace(updated, revision=updated.revision + 1)
+        except RevisionConflict:
+            raise
+        except sqlite3.IntegrityError as exc:
+            raise RegistryConflict("agent identity or endpoint already exists") from exc
+        except (SQLAlchemyError, sqlite3.Error) as exc:
+            raise RegistryError("agent registry storage is unavailable") from exc
+
     def delete(self, agent_id: str) -> None:
         try:
             with self._write() as connection:
                 connection.execute("DELETE FROM agents WHERE agent_id = ?", (agent_id,))
+        except (SQLAlchemyError, sqlite3.Error) as exc:
+            raise RegistryError("agent registry storage is unavailable") from exc
+
+    def delete_if_revision_and_credential(
+        self,
+        agent_id: str,
+        *,
+        expected_revision: int,
+        expected_credential_ref: str,
+    ) -> bool:
+        try:
+            with self._write() as connection:
+                cursor = connection.execute(
+                    "DELETE FROM agents WHERE agent_id=? AND revision=? AND credential_ref=?",
+                    (agent_id, expected_revision, expected_credential_ref),
+                )
+            return cursor.rowcount == 1
         except (SQLAlchemyError, sqlite3.Error) as exc:
             raise RegistryError("agent registry storage is unavailable") from exc
 

@@ -129,3 +129,29 @@ class EnrollmentJob:
     cli_input_fingerprint: str | None = None
     cli_pinned_address: str | None = None
     cli_accept_receipt: str | None = None
+    old_normalized_endpoint: str | None = None
+    old_transport_profile_id: str | None = None
+    old_instance_id: str | None = None
+    old_registry_revision: int | None = None
+    old_enrollment_method: EnrollmentMethod | None = None
+    old_source: str | None = None
+    old_enabled: bool | None = None
+    old_display_name: str | None = None
+
+
+@dataclass(frozen=True)
+class AgentRemovalJob:
+    removal_id: str
+    agent_id: str
+    captured_revision: int
+    credential_ref: str
+    remote_credential_id: str | None
+    normalized_endpoint: str
+    transport_profile_id: str
+    enrollment_method: EnrollmentMethod
+    phase: str
+    local_only: bool
+    audit_event_id: int
+    last_error_code: str | None
+    created_at: datetime
+    updated_at: datetime

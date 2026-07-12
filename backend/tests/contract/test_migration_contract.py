@@ -175,6 +175,16 @@ def test_fleet_registry_migration_has_exact_control_plane_tables(tmp_path):
                     "validated_http_address",
                     "cli_resume_nonce", "cli_peer_uid", "cli_input_fingerprint",
                     "cli_pinned_address", "cli_accept_receipt",
+                    "old_normalized_endpoint", "old_transport_profile_id",
+                    "old_instance_id", "old_registry_revision",
+                    "old_enrollment_method", "old_source", "old_enabled",
+                    "old_display_name",
+                ),
+                "agent_removal_jobs": (
+                    "removal_id", "agent_id", "captured_revision", "credential_ref",
+                    "remote_credential_id", "normalized_endpoint",
+                    "transport_profile_id", "enrollment_method", "phase", "local_only",
+                    "audit_event_id", "last_error_code", "created_at", "updated_at",
                 ),
         }
         for table, columns in expected_columns.items():
@@ -382,7 +392,7 @@ def test_legacy_manual_migration_preserves_rows_indexes_fks_and_checks(tmp_path)
             item[2] == "agents" and item[6] == "CASCADE"
             for item in connection.execute("PRAGMA foreign_key_list(agent_status)")
         )
-        assert connection.execute("PRAGMA user_version").fetchone() == (8,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (9,)
         status_indexes = {
             row[1] for row in connection.execute("PRAGMA index_list(agent_status)")
         }
@@ -717,7 +727,7 @@ def test_validated_address_migration_preserves_legal_pending_ssh_row(tmp_path):
     run_control_plane_migrations(db_path)
     connection = sqlite3.connect(db_path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone() == (8,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (9,)
         assert connection.execute(
             "SELECT validated_http_address FROM agent_enrollment_jobs"
         ).fetchone() == (None,)
@@ -774,7 +784,7 @@ def test_validated_address_downgrade_is_forward_only_without_mutation(tmp_path):
     try:
         with pytest.raises(sqlite3.NotSupportedError):
             migration.downgrade(connection)
-        assert connection.execute("PRAGMA user_version").fetchone() == (8,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (9,)
         assert connection.execute(
             "SELECT * FROM schema_versions ORDER BY version"
         ).fetchall() == before
@@ -800,7 +810,7 @@ def test_cli_resume_migration_adds_peer_bound_durable_claim_fields(tmp_path):
             "cli_pinned_address",
             "cli_accept_receipt",
         } <= columns
-        assert connection.execute("PRAGMA user_version").fetchone() == (8,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (9,)
     finally:
         connection.close()
 

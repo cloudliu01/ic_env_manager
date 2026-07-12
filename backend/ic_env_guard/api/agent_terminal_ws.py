@@ -318,6 +318,7 @@ async def agent_terminal_websocket(
         await websocket.close(code=4429)
         return
 
+    gateway_ticket = None
     try:
         try:
             agent = registry.get(agent_id)
@@ -470,4 +471,6 @@ async def agent_terminal_websocket(
         audit_repo.finalize(audit.id, result="success", dispatch_state="dispatched")
         commit_audit_outcome(audit_repo, audit_health)
     finally:
+        if gateway_ticket is not None:
+            tickets.release_active(gateway_ticket)
         limiter.release()

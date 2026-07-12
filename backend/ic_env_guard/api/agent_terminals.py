@@ -375,7 +375,7 @@ async def create_agent_terminal_connect_token(
     audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
     tickets: Annotated[GatewayTicketStore, Depends(get_gateway_ticket_store)],
 ) -> Response:
-    reservation = tickets.reserve()
+    reservation = tickets.reserve(agent_id)
     if reservation is None:
         _record_pre_dispatch_failure(
             audit_repo=audit_repo,

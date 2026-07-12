@@ -253,6 +253,31 @@ class EnrollmentAgentClient:
                 exc.category, dispatch_state=exc.dispatch_state
             ) from exc
 
+    async def revoke(
+        self,
+        target: ValidatedTarget,
+        token: bytes,
+        *,
+        credential_id: str,
+    ) -> None:
+        try:
+            response = await self._client.request(
+                target,
+                token,
+                "DELETE",
+                f"/api/v2/manager-credentials/{credential_id}",
+            )
+            if response.status_code not in {200, 204, 404}:
+                raise EnrollmentValidationError(
+                    "agent_credential_revoke_failed", dispatch_state="dispatched"
+                )
+        except EnrollmentValidationError:
+            raise
+        except AgentClientError as exc:
+            raise EnrollmentValidationError(
+                exc.category, dispatch_state=exc.dispatch_state
+            ) from exc
+
 
 def _parse_capabilities(
     value: object, *, expected_api: str, instance: bool
