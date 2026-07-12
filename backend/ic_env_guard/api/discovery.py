@@ -114,26 +114,39 @@ def list_results(
         results = service.results(job_id)
     except RegistryConflict as exc:
         raise V2ApiError(404, str(exc), "discovery job not found") from exc
-    projected = []
-    for item in results:
-        status, enrollment_status = service.classify(item)
-        projected.append(
-            {
-                "result_id": item.result_id,
-                "candidate_url": item.canonical_url,
-                "ip": item.ip,
-                "port": item.port,
-                "transport_profile_id": item.transport_profile_id,
-                "fingerprint_version": item.fingerprint_version,
-                "first_seen_at": item.first_seen_at,
-                "last_seen_at": item.last_seen_at,
-                "status": status,
-                "enrollment_status": enrollment_status,
-                "linked_enrollment_id": item.linked_enrollment_id,
-                "error_code": item.safe_error_code,
-            }
-        )
-    return {"results": projected}
+    return {"results": [_result(service, item, include_timestamps=True) for item in results]}
+
+
+@router.get("/results/{result_id}")
+def get_result(
+    result_id: str,
+    _: Annotated[AuthContext, Depends(require_v2_auth)],
+    service: Annotated[DiscoveryService, Depends(get_discovery_service)],
+):
+    result = service.result(result_id)
+    if result is None:
+        raise V2ApiError(404, "discovery_result_not_found", "discovery result not found")
+    return {"result": _result(service, result)}
+
+
+def _result(service: DiscoveryService, item, *, include_timestamps: bool = False):
+    status, enrollment_status = service.classify(item)
+    projected = {
+        "result_id": item.result_id,
+        "candidate_url": item.canonical_url,
+        "ip": item.ip,
+        "port": item.port,
+        "transport_profile_id": item.transport_profile_id,
+        "fingerprint_version": item.fingerprint_version,
+        "status": status,
+        "enrollment_status": enrollment_status,
+        "error_code": item.safe_error_code,
+    }
+    if include_timestamps:
+        projected["first_seen_at"] = item.first_seen_at
+        projected["last_seen_at"] = item.last_seen_at
+        projected["linked_enrollment_id"] = item.linked_enrollment_id
+    return projected
 
 
 def _job(job: DiscoveryJob):

@@ -554,6 +554,57 @@ button:disabled {
   padding: var(--space-4);
 }
 
+.form-stack,
+.form-field {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.form-stack {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  padding: var(--space-4);
+}
+
+.form-stack legend {
+  padding: 0 var(--space-1);
+  font-weight: 700;
+}
+
+.form-field input,
+.form-field select {
+  min-height: 44px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-raised);
+  color: var(--color-text);
+  padding: var(--space-2);
+}
+
+.form-field:has(input[type="checkbox"]) {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.form-field input[type="checkbox"] {
+  width: 1.25rem;
+  min-height: 1.25rem;
+}
+
+.field-error {
+  color: var(--color-danger-text);
+}
+
+.form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+}
+
 .detail-panel h2 {
   margin-top: 0;
   font-size: 1rem;

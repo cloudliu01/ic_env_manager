@@ -191,6 +191,53 @@ def test_discovery_result_handoff_is_one_time_and_exact(tmp_path):
 
 
 @pytest.mark.contract
+def test_discovery_result_can_be_rehydrated_by_opaque_id_with_safe_projection(tmp_path):
+    client = _client(tmp_path, enabled=True)
+    container = client.app.state.container
+    now = datetime.now(UTC)
+    with sqlite3.connect(tmp_path / "manager.db") as connection:
+        audit = connection.execute(
+            "INSERT INTO control_plane_audit_events(timestamp,operation,target,result,"
+            "dispatch_state) VALUES (?,?,?,?,?)",
+            (now.isoformat(), "discovery.start", "scope:lab", "success", "dispatched"),
+        ).lastrowid
+        connection.commit()
+    job = DiscoveryJob(
+        "rehydrate-job", "lab", DiscoveryState.QUEUED, 1, 0, 0, False, None,
+        audit, now + timedelta(seconds=120), now, now,
+    )
+    container.discovery_repository.create_job(job)
+    container.discovery_repository.claim(job.job_id, now=now)
+    container.discovery_repository.record_result(
+        job.job_id,
+        DiscoveryTarget("10.20.30.1", 8765, "eda-http", "http"),
+        DiscoveryFingerprint("2"), None, now=now,
+    )
+    container.discovery_repository.finish(job.job_id, DiscoveryState.COMPLETED, now=now)
+    result = container.discovery_repository.list_results(job.job_id)[0]
+
+    response = client.get(f"/api/v2/discovery/results/{result.result_id}", headers=AUTH)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "result": {
+            "result_id": result.result_id,
+            "candidate_url": "http://10.20.30.1:8765",
+            "ip": "10.20.30.1",
+            "port": 8765,
+            "transport_profile_id": "eda-http",
+            "fingerprint_version": "2",
+            "status": "new",
+            "enrollment_status": "enrollment_required",
+            "error_code": None,
+        }
+    }
+    serialized = response.text
+    for forbidden in ("credential", "token", "private_key", "ssh", "path"):
+        assert forbidden not in serialized.lower()
+
+
+@pytest.mark.contract
 def test_discovery_finish_finalizes_start_audit_with_real_counts(tmp_path):
     client = _client(tmp_path, enabled=True)
 

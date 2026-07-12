@@ -111,6 +111,9 @@ class DiscoveryService:
             raise RegistryConflict("discovery_job_not_found")
         return self.repository.list_results(job_id)
 
+    def result(self, result_id: str):
+        return self.repository.get_result(result_id)
+
     def classify(self, result) -> tuple[str, str | None]:
         if (
             result.found

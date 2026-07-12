@@ -7,8 +7,10 @@ import { useAgentObservations } from '../features/agent-registry/queries';
 import { AgentLayout, useRouteAgent } from '../features/agent-registry/AgentLayout';
 import { AgentOverviewPage } from '../features/agent-registry/AgentOverviewPage';
 import { AgentSettingsPage } from '../features/agent-registry/AgentSettingsPage';
+import { AddAgentPage } from '../features/agent-registry/AddAgentPage';
 import { FleetPage } from '../features/fleet/FleetPage';
 import { MonitoringPage } from '../features/fleet/MonitoringPage';
+import { DiscoveryPage } from '../features/discovery/DiscoveryPage';
 import { CapabilityRoute } from '../shared/components/CapabilityRoute';
 import { RouteFocus } from '../shared/components/RouteFocus';
 import AgentEntry from './AgentEntry';
@@ -79,8 +81,8 @@ function ManagerEntry() {
   return <Routes>
     <Route element={<ManagerLayout />}>
       <Route path="/fleet" element={<FleetPage />} />
-      <Route path="/agents/new" element={<PlaceholderPage title="Add agent" />} />
-      <Route path="/discovery" element={<PlaceholderPage title="Discovery" />} />
+      <Route path="/agents/new" element={<AddAgentPage />} />
+      <Route path="/discovery" element={<DiscoveryPage />} />
       <Route path="/monitoring" element={<MonitoringPage />} />
       <Route path="/audit" element={<PlaceholderPage title="Audit" />} />
       {AgentRoutes()}
