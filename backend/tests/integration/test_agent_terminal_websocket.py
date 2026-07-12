@@ -1,7 +1,9 @@
 import asyncio
 import ssl
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from ipaddress import ip_address
 
 import httpx
 import pytest
@@ -23,7 +25,10 @@ from ic_env_guard.config.models import (
     AuthConfig,
     ControlPlaneConfig,
 )
+from ic_env_guard.fleet.target_policy import ValidatedTarget
+from ic_env_guard.fleet.transport import SYSTEM_TLS_PROFILE
 from ic_env_guard.main import create_app
+from ic_env_guard.proxy.http import AgentRouteSnapshot
 
 CAPABILITIES = {
     "api_version": "1",
@@ -69,6 +74,61 @@ def test_websocket_connector_uses_injected_credential_loader(tmp_path, monkeypat
         failing.connect(agent, "term-1", "ticket", 0, "corr-1")
 
 
+@pytest.mark.integration
+def test_websocket_connector_snapshot_pins_ip_and_preserves_host_sni(monkeypatch):
+    captured = {}
+
+    class FakeConnection:
+        process_redirect = None
+
+    def fake_connect(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return FakeConnection()
+
+    monkeypatch.setattr("ic_env_guard.api.agent_terminal_ws.websockets.connect", fake_connect)
+    monkeypatch.setattr(
+        "ic_env_guard.api.agent_terminal_ws.ssl.create_default_context",
+        lambda **_kwargs: "verified-context",
+    )
+    target = ValidatedTarget(
+        normalized_endpoint="https://agent.example:8765",
+        scheme="https",
+        hostname="agent.example",
+        port=8765,
+        resolved_addresses=(ip_address("10.20.30.8"),),
+        pinned_address=ip_address("10.20.30.8"),
+        host_header="agent.example:8765",
+        sni_hostname="agent.example",
+        warning_code=None,
+        profile=SYSTEM_TLS_PROFILE,
+    )
+
+    AgentWebSocketConnector().connect_snapshot(
+        AgentRouteSnapshot(target, b"stored-secret"),
+        "term-1",
+        "upstream-ticket",
+        4,
+        "corr-1",
+    )
+
+    assert captured["url"].startswith("wss://agent.example:8765/ws/terminals/term-1")
+    assert captured["host"] == "10.20.30.8"
+    assert captured["port"] == 8765
+    assert captured["server_hostname"] == "agent.example"
+    assert captured["ssl"] == "verified-context"
+    assert captured["proxy"] is None
+    assert captured["additional_headers"]["Authorization"] == "Bearer stored-secret"
+    with pytest.raises(AgentCredentialError, match="credential unavailable"):
+        AgentWebSocketConnector().connect_snapshot(
+            AgentRouteSnapshot(target, b"invalid token"),
+            "term-1",
+            "upstream-ticket",
+            4,
+            "corr-1",
+        )
+
+
 def _token_file(tmp_path, name="token"):
     token_file = tmp_path / name
     token = "secret-token" if name == "token" else "agent-secret-token"
@@ -82,7 +142,7 @@ def _config(tmp_path, *, include_lab_02: bool = False):
         AgentConfig(
             id="lab-01",
             name="Lab 01",
-            base_url="https://lab-01.example",
+            base_url="https://10.20.30.1:8765",
             token_file=_token_file(tmp_path, "lab-01.token"),
         )
     ]
@@ -91,14 +151,17 @@ def _config(tmp_path, *, include_lab_02: bool = False):
             AgentConfig(
                 id="lab-02",
                 name="Lab 02",
-                base_url="https://lab-02.example",
+                base_url="https://10.20.30.2:8765",
                 token_file=_token_file(tmp_path, "lab-02.token"),
             )
         )
     return AppConfig(
         auth=AuthConfig(token_file=_token_file(tmp_path)),
         mode="control-plane",
-        control_plane=ControlPlaneConfig(audit_database=tmp_path / "control-plane.db"),
+        control_plane=ControlPlaneConfig(
+            audit_database=tmp_path / "control-plane.db",
+            allowed_agent_cidrs=["10.20.30.0/24"],
+        ),
         agents=agents,
     )
 
@@ -139,6 +202,15 @@ class FakeConnectContext:
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         return None
+
+
+class DelayedUpstream(FakeUpstreamWebSocket):
+    async def __anext__(self) -> str:
+        if self._output_sent:
+            raise StopAsyncIteration
+        await asyncio.sleep(0.3)
+        self._output_sent = True
+        return "late-output"
 
 
 class FakeConnector:
@@ -267,7 +339,7 @@ def test_agent_terminal_websocket_rejects_oversized_browser_frames_and_audits(tm
 
 
 @pytest.mark.integration
-def test_agent_terminal_websocket_rejects_proxy_capacity_with_audit(tmp_path):
+def test_agent_terminal_websocket_rejects_unreserved_ticket_with_audit(tmp_path):
     config = _config(tmp_path)
     config.control_plane.max_active_terminal_proxies = 0
     app = create_app(config=config)
@@ -286,11 +358,11 @@ def test_agent_terminal_websocket_rejects_proxy_capacity_with_audit(tmp_path):
             params={"agent_id": "lab-01", "operation": "terminals.attach"},
         )
 
-    assert exc.value.code == 4429
+    assert exc.value.code == 4401
     event = audit.json()["events"][0]
     assert event["result"] == "failed"
     assert event["dispatch_state"] == "not_dispatched"
-    assert event["failure_category"] == "gateway_capacity_exceeded"
+    assert event["failure_category"] == "invalid_ticket"
     assert event["correlation_id"]
 
 
@@ -499,7 +571,7 @@ def test_agent_terminal_websocket_rejects_mismatched_authenticated_actor(tmp_pat
 @pytest.mark.integration
 def test_agent_terminal_ticket_is_agent_bound_and_single_use(tmp_path):
     async def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.host == "lab-01.example"
+        assert request.url.host == "10.20.30.1"
         assert request.url.path == "/api/terminals/term-1/connect-token"
         return httpx.Response(201, json={"ticket": "upstream-ticket", "expires_in_seconds": 60})
 
@@ -545,6 +617,83 @@ def test_agent_terminal_ticket_is_agent_bound_and_single_use(tmp_path):
 
     assert replay.value.code == 4401
     assert connector.calls[0][:4] == ("lab-01", "term-1", "upstream-ticket", 0)
+
+
+@pytest.mark.integration
+def test_agent_terminal_ticket_rejects_registry_revision_change_before_attach(tmp_path):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/capabilities":
+            return httpx.Response(200, json=CAPABILITIES)
+        return httpx.Response(201, json={"ticket": "upstream-ticket", "expires_in_seconds": 60})
+
+    config = _config(tmp_path)
+    app = create_app(config=config)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
+    )
+    app.dependency_overrides[get_agent_availability] = lambda: _availability(
+        config, tuple(CAPABILITIES["capabilities"])
+    )
+    connector = FakeConnector(FakeUpstreamWebSocket())
+    app.dependency_overrides[get_agent_ws_connector] = lambda: connector
+
+    with TestClient(app) as client:
+        ticket = client.post(
+            "/api/agents/lab-01/terminals/term-1/connect-token",
+            headers={"Authorization": "Bearer secret-token"},
+        ).json()["ticket"]
+        record = app.state.container.registry_repository.get("lab-01")
+        app.state.container.registry_repository.update_if_revision(
+            replace(record, display_name="Changed"), record.revision
+        )
+        with pytest.raises(WebSocketDisconnect) as mismatch:
+            with client.websocket_connect(
+                f"/ws/agents/lab-01/terminals/term-1?ticket={ticket}&cursor=0",
+                headers=_ws_headers(),
+            ):
+                pass
+
+    assert mismatch.value.code == 4409
+    assert connector.calls == []
+
+
+@pytest.mark.integration
+def test_active_terminal_proxy_closes_and_releases_slot_on_registry_change(tmp_path):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/capabilities":
+            return httpx.Response(200, json=CAPABILITIES)
+        return httpx.Response(201, json={"ticket": "upstream-ticket", "expires_in_seconds": 60})
+
+    config = _config(tmp_path)
+    config.control_plane.max_active_terminal_proxies = 1
+    app = create_app(config=config)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
+    )
+    app.dependency_overrides[get_agent_availability] = lambda: _availability(
+        config, tuple(CAPABILITIES["capabilities"])
+    )
+    app.dependency_overrides[get_agent_ws_connector] = lambda: FakeConnector(DelayedUpstream())
+
+    with TestClient(app) as client:
+        ticket = client.post(
+            "/api/agents/lab-01/terminals/term-1/connect-token",
+            headers={"Authorization": "Bearer secret-token"},
+        ).json()["ticket"]
+        with client.websocket_connect(
+            f"/ws/agents/lab-01/terminals/term-1?ticket={ticket}&cursor=0",
+            headers=_ws_headers(),
+        ) as websocket:
+            record = app.state.container.registry_repository.get("lab-01")
+            app.state.container.registry_repository.update_if_revision(
+                replace(record, enabled=False), record.revision
+            )
+            with pytest.raises(WebSocketDisconnect) as closed:
+                websocket.receive_text()
+        assert closed.value.code == 4409
+        slot = app.state.container.gateway_proxy_limiter.reserve()
+        assert slot is not None
+        slot.release()
 
 
 @pytest.mark.integration

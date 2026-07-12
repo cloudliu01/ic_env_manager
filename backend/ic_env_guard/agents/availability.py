@@ -23,6 +23,12 @@ class AgentObservation:
     dispatch_state: str = "unknown"
 
 
+@dataclass(frozen=True)
+class CapabilityCheck:
+    supported: bool
+    dispatch_state: str
+
+
 class AgentAvailabilityService:
     def __init__(
         self,
@@ -42,6 +48,7 @@ class AgentAvailabilityService:
         self._status_repository = status_repository
         self._persist_probe_status = persist_probe_status
         self._observations: dict[str, AgentObservation] = {}
+        self._last_probe_dispatch: dict[str, str] = {}
         self._probe_delegate: Callable[[str], Awaitable[object]] | None = None
 
     def set_probe_delegate(
@@ -127,9 +134,20 @@ class AgentAvailabilityService:
         return observation.capabilities
 
     async def ensure_capability(self, agent_id: str, capability: str) -> bool:
-        if self._fresh_capabilities(agent_id) is None:
-            await self.probe(agent_id)
-        return self.has_capability(agent_id, capability)
+        return (await self.check_capability(agent_id, capability)).supported
+
+    async def check_capability(
+        self, agent_id: str, capability: str
+    ) -> CapabilityCheck:
+        capabilities = self._fresh_capabilities(agent_id)
+        if capabilities is not None:
+            return CapabilityCheck(capability in capabilities, "not_dispatched")
+        self._last_probe_dispatch.pop(agent_id, None)
+        await self.probe(agent_id)
+        return CapabilityCheck(
+            self.has_capability(agent_id, capability),
+            self._last_probe_dispatch.get(agent_id, "unknown"),
+        )
 
     async def probe_all(self) -> None:
         semaphore = asyncio.Semaphore(self._max_parallel_probes)
@@ -153,10 +171,17 @@ class AgentAvailabilityService:
         if not agent.enabled:
             return self._registry.summary(agent_id)
         if self._probe_delegate is not None:
-            await self._probe_delegate(agent_id)
+            outcome = await self._probe_delegate(agent_id)
+            dispatch_state = getattr(outcome, "dispatch_state", "unknown")
+            self._last_probe_dispatch[agent_id] = (
+                dispatch_state
+                if dispatch_state in {"not_dispatched", "unknown", "dispatched"}
+                else "unknown"
+            )
             return self.summary(agent_id)
         observation = await self.probe_legacy(agent_id)
         self._observations[agent_id] = observation
+        self._last_probe_dispatch[agent_id] = observation.dispatch_state
         self._persist_observation(agent_id, observation)
         return self.summary(agent_id)
 

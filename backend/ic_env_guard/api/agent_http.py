@@ -11,8 +11,10 @@ MUTATING_METHODS = {"DELETE", "PATCH", "POST", "PUT"}
 
 
 def failure_category_for_client_error(method: str, category: str) -> str:
-    if category == "agent_timeout" and method.upper() in MUTATING_METHODS:
+    if category in {"agent_timeout", "agent_network_error"} and method.upper() in MUTATING_METHODS:
         return "agent_operation_indeterminate"
+    if category in {"agent_network_error", "agent_tls_error"}:
+        return "agent_unavailable"
     return category
 
 

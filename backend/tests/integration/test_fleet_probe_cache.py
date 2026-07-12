@@ -90,13 +90,22 @@ async def test_legacy_capability_reads_durable_status_and_ensure_uses_fleet_dele
             updated_at=datetime.now(UTC),
         )
         container.status_repository.update_if_target_revision(status, 1)
+        return type("ProbeOutcome", (), {"dispatch_state": "dispatched"})()
 
     container.agent_availability.set_probe_delegate(fleet_probe)
 
     assert not container.agent_availability.has_capability("alpha", "services.v1")
-    assert await container.agent_availability.ensure_capability("alpha", "services.v1")
+    checked = await container.agent_availability.check_capability(
+        "alpha", "services.v1"
+    )
+    assert checked.supported
+    assert checked.dispatch_state == "dispatched"
     assert calls == ["alpha"]
     assert container.agent_availability.has_capability("alpha", "services.v1")
+    cached = await container.agent_availability.check_capability("alpha", "services.v1")
+    assert cached.supported
+    assert cached.dispatch_state == "not_dispatched"
+    assert calls == ["alpha"]
 
 
 @pytest.mark.integration

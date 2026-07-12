@@ -59,6 +59,7 @@ from ic_env_guard.metrics.observability import ObservabilityCollector
 from ic_env_guard.metrics.registry import create_registry
 from ic_env_guard.monitoring.machines import MachineRegistry
 from ic_env_guard.observations.service import ObservationService
+from ic_env_guard.proxy.http import AgentHttpProxy
 from ic_env_guard.services.manager import ServiceManager
 from ic_env_guard.storage.discovery import DiscoveryRepository
 from ic_env_guard.storage.enrollment_journal import EnrollmentJournalRepository
@@ -113,6 +114,7 @@ class ManagerContainer:
     agent_client: AgentHttpClient
     agent_ws_connector: AgentWebSocketConnector
     agent_availability: AgentAvailabilityService
+    agent_http_proxy: AgentHttpProxy
     gateway_ticket_store: GatewayTicketStore
     gateway_proxy_limiter: GatewayProxyLimiter
     control_plane_session_factory: sessionmaker
@@ -334,6 +336,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
     service_key_enrollment_adapter = None
     manager_self_addresses = {"127.0.0.1", "::1"}
     discovery_available = True
+    target_policy = None
     try:
         manager_targets = _manager_self_targets(config.server.bind, config.server.port)
         manager_self_addresses.update(address for address, _port in manager_targets)
@@ -440,6 +443,14 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         self_targets=manager_self_addresses,
         available=discovery_available,
     )
+    agent_http_proxy = AgentHttpProxy(
+        registry=registry_repository,
+        availability=agent_availability,
+        credential_store=credential_store,
+        target_policy=target_policy,
+        transport_profiles=config.control_plane.transport_profiles,
+        client=agent_client,
+    )
     manager_enrollment_socket = (
         ManagerEnrollmentSocket(
             path=config.enrollment.manager_socket_path,
@@ -459,6 +470,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
             legacy_credential_loader=fleet_registry.load_credential
         ),
         agent_availability=agent_availability,
+        agent_http_proxy=agent_http_proxy,
         gateway_ticket_store=gateway_ticket_store,
         gateway_proxy_limiter=GatewayProxyLimiter(
             config.control_plane.max_active_terminal_proxies

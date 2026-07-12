@@ -28,10 +28,11 @@ def _token_file(tmp_path, name="token", value="secret-token"):
 
 
 def _agent(tmp_path, agent_id):
+    address = {"lab-01": "10.20.30.1", "lab-02": "10.20.30.2"}[agent_id]
     return AgentConfig(
         id=agent_id,
         name=agent_id,
-        base_url=f"https://{agent_id}.example",
+        base_url=f"https://{address}:8765",
         token_file=_token_file(tmp_path, f"{agent_id}.token", "agent-secret-token"),
     )
 
@@ -48,7 +49,9 @@ def test_overlapping_service_ids_stay_scoped_by_agent(tmp_path):
     seen: list[tuple[str, str]] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        agent_name = request.url.host.split(".")[0]
+        agent_name = {"10.20.30.1": "lab-01", "10.20.30.2": "lab-02"}[
+            request.url.host
+        ]
         seen.append((request.url.host, request.url.path))
         return httpx.Response(
             200,
@@ -68,7 +71,10 @@ def test_overlapping_service_ids_stay_scoped_by_agent(tmp_path):
     config = AppConfig(
         auth=AuthConfig(token_file=_token_file(tmp_path)),
         mode="control-plane",
-        control_plane=ControlPlaneConfig(audit_database=tmp_path / "control-plane.db"),
+        control_plane=ControlPlaneConfig(
+            audit_database=tmp_path / "control-plane.db",
+            allowed_agent_cidrs=["10.20.30.0/24"],
+        ),
         agents=[_agent(tmp_path, "lab-01"), _agent(tmp_path, "lab-02")],
     )
     app = create_app(config=config)
@@ -88,6 +94,6 @@ def test_overlapping_service_ids_stay_scoped_by_agent(tmp_path):
     assert first.json()["services"][0]["name"] == "Demo on lab-01"
     assert second.json()["services"][0]["name"] == "Demo on lab-02"
     assert seen == [
-        ("lab-01.example", "/api/services"),
-        ("lab-02.example", "/api/services"),
+        ("10.20.30.1", "/api/services"),
+        ("10.20.30.2", "/api/services"),
     ]

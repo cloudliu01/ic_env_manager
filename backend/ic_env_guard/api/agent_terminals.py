@@ -9,15 +9,16 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response
 
 from ic_env_guard.agents.availability import AgentAvailabilityService
-from ic_env_guard.agents.client import AgentClientError, AgentHttpClient
-from ic_env_guard.agents.registry import AgentNotFoundError, AgentRegistry
-from ic_env_guard.agents.terminal_proxy import GatewayTicketStore
+from ic_env_guard.agents.client import AgentHttpClient
+from ic_env_guard.agents.registry import AgentRegistry
+from ic_env_guard.agents.terminal_proxy import GatewayProxyLimiter, GatewayTicketStore
 from ic_env_guard.api.agent_http import (
     ERROR_STATUS,
     augment_upstream_error_body,
     failure_category_for_client_error,
     get_agent_http_client,
 )
+from ic_env_guard.api.agent_proxy import get_agent_http_proxy
 from ic_env_guard.api.agents import get_agent_availability, get_agent_registry
 from ic_env_guard.api.audit_health import (
     AuditStorageHealth,
@@ -32,12 +33,17 @@ from ic_env_guard.db.control_plane_audit import (
     ControlPlaneAuditEventCreate,
     ControlPlaneAuditRepository,
 )
+from ic_env_guard.proxy.http import AgentHttpProxy, AgentProxyError
 
 router = APIRouter(prefix="/api/agents/{agent_id}/terminals", tags=["agent-terminals"])
 
 
 def get_gateway_ticket_store() -> GatewayTicketStore:
     raise RuntimeError("GatewayTicketStore dependency was not configured")
+
+
+def get_gateway_proxy_limiter() -> GatewayProxyLimiter:
+    raise RuntimeError("GatewayProxyLimiter dependency was not configured")
 
 
 def _record_pre_dispatch_failure(
@@ -80,9 +86,9 @@ async def _dispatch(
     operation: str,
     target: str,
     actor: AuthContext,
-    registry: AgentRegistry,
     availability: AgentAvailabilityService,
     client: AgentHttpClient,
+    proxy: AgentHttpProxy,
     audit_repo: ControlPlaneAuditRepository,
     audit_health: AuditStorageHealth,
     json: object | None = None,
@@ -92,48 +98,6 @@ async def _dispatch(
     validate_response: Callable[[httpx.Response], str | None] | None = None,
 ) -> Response:
     correlation_id = correlation_id or str(uuid4())
-    try:
-        agent = registry.get(agent_id)
-    except AgentNotFoundError as exc:
-        _record_pre_dispatch_failure(
-            audit_repo=audit_repo,
-            audit_health=audit_health,
-            actor=actor,
-            agent_id=agent_id,
-            operation=operation,
-            target=target,
-            correlation_id=correlation_id,
-            source_addr=source_addr,
-            failure_category="agent_not_found",
-        )
-        raise ApiError(404, "agent_not_found", "agent not found") from exc
-    if not agent.enabled:
-        _record_pre_dispatch_failure(
-            audit_repo=audit_repo,
-            audit_health=audit_health,
-            actor=actor,
-            agent_id=agent_id,
-            operation=operation,
-            target=target,
-            correlation_id=correlation_id,
-            source_addr=source_addr,
-            failure_category="agent_disabled",
-        )
-        raise ApiError(409, "agent_disabled", "agent is disabled")
-    if not await availability.ensure_capability(agent_id, "terminals.v1"):
-        _record_pre_dispatch_failure(
-            audit_repo=audit_repo,
-            audit_health=audit_health,
-            actor=actor,
-            agent_id=agent_id,
-            operation=operation,
-            target=target,
-            correlation_id=correlation_id,
-            source_addr=source_addr,
-            failure_category="missing_capability",
-        )
-        raise ApiError(409, "agent_capability_missing", "agent does not support terminals")
-
     audit = audit_repo.record_intent(
         ControlPlaneAuditEventCreate(
             actor_id=actor.actor_id,
@@ -146,28 +110,40 @@ async def _dispatch(
     )
     commit_audit_intent(audit_repo, audit_health)
     try:
-        response = await client.request(
-            agent,
-            method,
-            upstream_path,
+        response = await proxy.with_runtime(client, availability).request_json(
+            agent_id=agent_id,
+            capability="terminals.v1",
+            method=method,
+            upstream_path=upstream_path,
+            query=params or {},
             correlation_id=correlation_id,
-            params=params,
             json=json,
         )
-    except AgentClientError as exc:
-        failure_category = failure_category_for_client_error(method, exc.category)
+    except AgentProxyError as exc:
+        failure_category = failure_category_for_client_error(method, exc.code)
+        audit_failure_category = (
+            "missing_capability"
+            if failure_category == "agent_capability_missing"
+            else failure_category
+        )
         audit_repo.finalize(
             audit.id,
             result="failed",
             dispatch_state=exc.dispatch_state,
-            failure_category=failure_category,
+            upstream_status=exc.upstream_status,
+            failure_category=audit_failure_category,
         )
         commit_audit_outcome(audit_repo, audit_health)
         raise ApiError(
-            ERROR_STATUS.get(failure_category, 502), failure_category, "agent request failed"
+            ERROR_STATUS.get(failure_category, exc.status_code),
+            failure_category,
+            "agent request failed",
         ) from exc
 
-    failure_category = validate_response(response) if validate_response is not None else None
+    validation_response = httpx.Response(response.status_code, json=response.body)
+    failure_category = (
+        validate_response(validation_response) if validate_response is not None else None
+    )
     if failure_category is not None:
         audit_repo.finalize(
             audit.id,
@@ -193,7 +169,7 @@ async def _dispatch(
     return JSONResponse(
         status_code=response.status_code,
         content=augment_upstream_error_body(
-            response.json(),
+            response.body,
             agent_id=agent_id,
             correlation_id=correlation_id,
             status_code=response.status_code,
@@ -220,9 +196,9 @@ async def list_agent_terminals(
     agent_id: str,
     request: Request,
     actor: Annotated[AuthContext, Depends(require_auth)],
-    registry: Annotated[AgentRegistry, Depends(get_agent_registry)],
     availability: Annotated[AgentAvailabilityService, Depends(get_agent_availability)],
     client: Annotated[AgentHttpClient, Depends(get_agent_http_client)],
+    proxy: Annotated[AgentHttpProxy, Depends(get_agent_http_proxy)],
     audit_repo: Annotated[ControlPlaneAuditRepository, Depends(get_control_plane_audit_repository)],
     audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
 ) -> Response:
@@ -233,9 +209,9 @@ async def list_agent_terminals(
         operation="terminals.list",
         target="terminals",
         actor=actor,
-        registry=registry,
         availability=availability,
         client=client,
+        proxy=proxy,
         audit_repo=audit_repo,
         audit_health=audit_health,
         correlation_id=getattr(request.state, "correlation_id", None),
@@ -248,9 +224,9 @@ async def create_agent_terminal(
     agent_id: str,
     request: Request,
     actor: Annotated[AuthContext, Depends(require_auth)],
-    registry: Annotated[AgentRegistry, Depends(get_agent_registry)],
     availability: Annotated[AgentAvailabilityService, Depends(get_agent_availability)],
     client: Annotated[AgentHttpClient, Depends(get_agent_http_client)],
+    proxy: Annotated[AgentHttpProxy, Depends(get_agent_http_proxy)],
     audit_repo: Annotated[ControlPlaneAuditRepository, Depends(get_control_plane_audit_repository)],
     audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
 ) -> Response:
@@ -261,9 +237,9 @@ async def create_agent_terminal(
         operation="terminals.create",
         target="terminals",
         actor=actor,
-        registry=registry,
         availability=availability,
         client=client,
+        proxy=proxy,
         audit_repo=audit_repo,
         audit_health=audit_health,
         json=await request.json(),
@@ -278,9 +254,9 @@ async def get_agent_terminal(
     terminal_id: str,
     request: Request,
     actor: Annotated[AuthContext, Depends(require_auth)],
-    registry: Annotated[AgentRegistry, Depends(get_agent_registry)],
     availability: Annotated[AgentAvailabilityService, Depends(get_agent_availability)],
     client: Annotated[AgentHttpClient, Depends(get_agent_http_client)],
+    proxy: Annotated[AgentHttpProxy, Depends(get_agent_http_proxy)],
     audit_repo: Annotated[ControlPlaneAuditRepository, Depends(get_control_plane_audit_repository)],
     audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
 ) -> Response:
@@ -291,9 +267,9 @@ async def get_agent_terminal(
         operation="terminals.detail",
         target=f"terminal:{terminal_id}",
         actor=actor,
-        registry=registry,
         availability=availability,
         client=client,
+        proxy=proxy,
         audit_repo=audit_repo,
         audit_health=audit_health,
         correlation_id=getattr(request.state, "correlation_id", None),
@@ -308,9 +284,9 @@ async def get_agent_terminal_history(
     request: Request,
     cursor: int,
     actor: Annotated[AuthContext, Depends(require_auth)],
-    registry: Annotated[AgentRegistry, Depends(get_agent_registry)],
     availability: Annotated[AgentAvailabilityService, Depends(get_agent_availability)],
     client: Annotated[AgentHttpClient, Depends(get_agent_http_client)],
+    proxy: Annotated[AgentHttpProxy, Depends(get_agent_http_proxy)],
     audit_repo: Annotated[ControlPlaneAuditRepository, Depends(get_control_plane_audit_repository)],
     audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
 ) -> Response:
@@ -321,9 +297,9 @@ async def get_agent_terminal_history(
         operation="terminals.history",
         target=f"terminal:{terminal_id}",
         actor=actor,
-        registry=registry,
         availability=availability,
         client=client,
+        proxy=proxy,
         audit_repo=audit_repo,
         audit_health=audit_health,
         params={"cursor": cursor},
@@ -338,9 +314,9 @@ async def resize_agent_terminal(
     terminal_id: str,
     request: Request,
     actor: Annotated[AuthContext, Depends(require_auth)],
-    registry: Annotated[AgentRegistry, Depends(get_agent_registry)],
     availability: Annotated[AgentAvailabilityService, Depends(get_agent_availability)],
     client: Annotated[AgentHttpClient, Depends(get_agent_http_client)],
+    proxy: Annotated[AgentHttpProxy, Depends(get_agent_http_proxy)],
     audit_repo: Annotated[ControlPlaneAuditRepository, Depends(get_control_plane_audit_repository)],
     audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
 ) -> Response:
@@ -351,9 +327,9 @@ async def resize_agent_terminal(
         operation="terminals.resize",
         target=f"terminal:{terminal_id}",
         actor=actor,
-        registry=registry,
         availability=availability,
         client=client,
+        proxy=proxy,
         audit_repo=audit_repo,
         audit_health=audit_health,
         json=await request.json(),
@@ -371,12 +347,37 @@ async def create_agent_terminal_connect_token(
     registry: Annotated[AgentRegistry, Depends(get_agent_registry)],
     availability: Annotated[AgentAvailabilityService, Depends(get_agent_availability)],
     client: Annotated[AgentHttpClient, Depends(get_agent_http_client)],
+    proxy: Annotated[AgentHttpProxy, Depends(get_agent_http_proxy)],
     audit_repo: Annotated[ControlPlaneAuditRepository, Depends(get_control_plane_audit_repository)],
     audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
     tickets: Annotated[GatewayTicketStore, Depends(get_gateway_ticket_store)],
+    limiter: Annotated[GatewayProxyLimiter, Depends(get_gateway_proxy_limiter)],
 ) -> Response:
-    reservation = tickets.reserve(agent_id)
+    slot = limiter.reserve()
+    if slot is None:
+        _record_pre_dispatch_failure(
+            audit_repo=audit_repo,
+            audit_health=audit_health,
+            actor=actor,
+            agent_id=agent_id,
+            operation="terminals.connect-token",
+            target=f"terminal:{terminal_id}",
+            correlation_id=getattr(request.state, "correlation_id", None),
+            source_addr=request.client.host if request.client else None,
+            failure_category="gateway_capacity_exceeded",
+        )
+        raise ApiError(429, "gateway_capacity_exceeded", "gateway proxy capacity exceeded")
+    record = registry.record(agent_id)
+    reservation = tickets.reserve(
+        agent_id,
+        revision=record.revision if record else None,
+        credential_ref=record.credential_ref if record else None,
+        transport_profile_id=record.transport_profile_id if record else None,
+        normalized_endpoint=record.normalized_endpoint if record else None,
+        slot=slot,
+    )
     if reservation is None:
+        slot.release()
         _record_pre_dispatch_failure(
             audit_repo=audit_repo,
             audit_health=audit_health,
@@ -398,9 +399,9 @@ async def create_agent_terminal_connect_token(
             operation="terminals.connect-token",
             target=f"terminal:{terminal_id}",
             actor=actor,
-            registry=registry,
             availability=availability,
             client=client,
+            proxy=proxy,
             audit_repo=audit_repo,
             audit_health=audit_health,
             correlation_id=getattr(request.state, "correlation_id", None),
@@ -441,9 +442,9 @@ async def close_agent_terminal(
     terminal_id: str,
     request: Request,
     actor: Annotated[AuthContext, Depends(require_auth)],
-    registry: Annotated[AgentRegistry, Depends(get_agent_registry)],
     availability: Annotated[AgentAvailabilityService, Depends(get_agent_availability)],
     client: Annotated[AgentHttpClient, Depends(get_agent_http_client)],
+    proxy: Annotated[AgentHttpProxy, Depends(get_agent_http_proxy)],
     audit_repo: Annotated[ControlPlaneAuditRepository, Depends(get_control_plane_audit_repository)],
     audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
 ) -> Response:
@@ -454,9 +455,9 @@ async def close_agent_terminal(
         operation="terminals.close",
         target=f"terminal:{terminal_id}",
         actor=actor,
-        registry=registry,
         availability=availability,
         client=client,
+        proxy=proxy,
         audit_repo=audit_repo,
         audit_health=audit_health,
         correlation_id=getattr(request.state, "correlation_id", None),

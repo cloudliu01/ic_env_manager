@@ -13,10 +13,14 @@ from ic_env_guard.agents.registry import AgentRegistry
 from ic_env_guard.agents.terminal_proxy import GatewayProxyLimiter, GatewayTicketStore
 from ic_env_guard.api import terminal_ws
 from ic_env_guard.api.agent_audit import router as agent_audit_router
+from ic_env_guard.api.agent_audit import v2_router as agent_audit_v2_router
 from ic_env_guard.api.agent_enrollments import get_enrollment_orchestrator
 from ic_env_guard.api.agent_enrollments import router as agent_enrollments_router
 from ic_env_guard.api.agent_http import get_agent_http_client
+from ic_env_guard.api.agent_logs import router as agent_logs_router
 from ic_env_guard.api.agent_monitoring import router as agent_monitoring_router
+from ic_env_guard.api.agent_observations import router as agent_observations_router
+from ic_env_guard.api.agent_proxy import get_agent_http_proxy
 from ic_env_guard.api.agent_registry import (
     get_enrollment_orchestrator as get_registry_enrollment_orchestrator,
 )
@@ -26,13 +30,16 @@ from ic_env_guard.api.agent_registry import (
 )
 from ic_env_guard.api.agent_registry import router as agent_registry_v2_router
 from ic_env_guard.api.agent_services import router as agent_services_router
+from ic_env_guard.api.agent_services import v2_router as agent_services_v2_router
 from ic_env_guard.api.agent_terminal_ws import (
     AgentWebSocketConnector,
     get_agent_ws_connector,
-    get_gateway_proxy_limiter,
 )
 from ic_env_guard.api.agent_terminal_ws import router as agent_terminal_ws_router
-from ic_env_guard.api.agent_terminals import get_gateway_ticket_store
+from ic_env_guard.api.agent_terminals import (
+    get_gateway_proxy_limiter,
+    get_gateway_ticket_store,
+)
 from ic_env_guard.api.agent_terminals import router as agent_terminals_router
 from ic_env_guard.api.agents import (
     control_plane_agents_router,
@@ -215,6 +222,7 @@ def create_app(
         gateway_ticket_store = None
         gateway_proxy_limiter = None
         agent_ws_connector = None
+        agent_http_proxy = None
         login_audit_recorder = AgentLoginAuditRecorder(container.session_factory)
         auth_state = AuthState(
             token_file=auth_token_file,
@@ -237,6 +245,7 @@ def create_app(
         gateway_ticket_store = container.gateway_ticket_store
         gateway_proxy_limiter = container.gateway_proxy_limiter
         agent_ws_connector = container.agent_ws_connector
+        agent_http_proxy = container.agent_http_proxy
         login_audit_recorder = ManagerLoginAuditRecorder(
             container.control_plane_session_factory
         )
@@ -307,7 +316,17 @@ def create_app(
             correlation_id = request.headers.get("X-Correlation-ID") or str(uuid4())
         request.state.correlation_id = correlation_id
         try:
+            path_parts = request.url.path.split("/")
             if (
+                mode == "control-plane"
+                and len(path_parts) == 6
+                and path_parts[1:4] == ["api", "v2", "agents"]
+                and path_parts[5] == "proxy"
+            ):
+                response = v2_error_response(
+                    404, "not_found", "resource not found", correlation_id
+                )
+            elif (
                 mode == "agent"
                 and request.method == "PUT"
                 and (
@@ -417,6 +436,11 @@ def create_app(
             raise RuntimeError("agent client is not configured in agent mode")
         return agent_client
 
+    def configured_agent_http_proxy():
+        if agent_http_proxy is None:
+            raise RuntimeError("Agent proxy is not configured in agent mode")
+        return agent_http_proxy
+
     def configured_gateway_ticket_store() -> GatewayTicketStore:
         if gateway_ticket_store is None:
             raise RuntimeError("gateway ticket store is not configured in agent mode")
@@ -487,6 +511,7 @@ def create_app(
     app.dependency_overrides[get_agent_registry] = configured_agent_registry
     app.dependency_overrides[get_agent_availability] = configured_agent_availability
     app.dependency_overrides[get_agent_http_client] = configured_agent_http_client
+    app.dependency_overrides[get_agent_http_proxy] = configured_agent_http_proxy
     app.dependency_overrides[get_gateway_ticket_store] = configured_gateway_ticket_store
     app.dependency_overrides[get_gateway_proxy_limiter] = configured_gateway_proxy_limiter
     app.dependency_overrides[get_agent_ws_connector] = configured_agent_ws_connector
@@ -543,8 +568,12 @@ def create_app(
         app.include_router(fleet_router)
         app.include_router(control_plane_agents_router)
         app.include_router(agent_audit_router)
+        app.include_router(agent_audit_v2_router)
         app.include_router(agent_services_router)
+        app.include_router(agent_services_v2_router)
         app.include_router(agent_monitoring_router)
+        app.include_router(agent_observations_router)
+        app.include_router(agent_logs_router)
         app.include_router(agent_terminals_router)
         app.include_router(agent_terminal_ws_router)
         app.include_router(control_plane_audit_router)

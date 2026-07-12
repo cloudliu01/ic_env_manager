@@ -1,4 +1,5 @@
 from ic_env_guard.config.models import AgentConfig
+from ic_env_guard.fleet.models import AgentRecord
 from ic_env_guard.fleet.registry import (
     FleetRegistry,
     FleetRegistryConfigurationError,
@@ -42,6 +43,9 @@ class AgentRegistry:
             return None
         record = self._fleet.record(agent_id)
         return record.revision if record is not None else None
+
+    def record(self, agent_id: str) -> AgentRecord | None:
+        return self._fleet.record(agent_id) if self._fleet is not None else None
 
     def list_summaries(self) -> list[dict[str, object]]:
         return [self._summary(agent) for agent in self.list_configs()]

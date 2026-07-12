@@ -332,29 +332,43 @@ async def _read_bounded_response(
     content_encoding = streamed.headers.get("content-encoding", "").strip().lower()
     if content_encoding not in {"", "identity"}:
         raise AgentClientError(
-            "agent_protocol_error", "agent response content encoding is invalid"
+            "agent_protocol_error",
+            "agent response content encoding is invalid",
+            dispatch_state="dispatched",
         )
     content_length = streamed.headers.get("content-length")
     if content_length is not None:
         if re.fullmatch(r"[0-9]+", content_length) is None:
             raise AgentClientError(
-                "agent_protocol_error", "agent response content length is invalid"
+                "agent_protocol_error",
+                "agent response content length is invalid",
+                dispatch_state="dispatched",
             )
         declared_length = int(content_length)
         if declared_length < 0 or declared_length > max_response_bytes:
-            raise AgentClientError("agent_protocol_error", "agent response is too large")
+            raise AgentClientError(
+                "agent_protocol_error",
+                "agent response is too large",
+                dispatch_state="dispatched",
+            )
     content = bytearray()
     if streamed.is_stream_consumed:
         content.extend(streamed.content)
         if len(content) > max_response_bytes:
-            raise AgentClientError("agent_protocol_error", "agent response is too large")
+            raise AgentClientError(
+                "agent_protocol_error",
+                "agent response is too large",
+                dispatch_state="dispatched",
+            )
     else:
         chunk_size = min(STREAM_CHUNK_BYTES, max_response_bytes + 1)
         async for chunk in streamed.aiter_raw(chunk_size=chunk_size):
             content.extend(chunk)
             if len(content) > max_response_bytes:
                 raise AgentClientError(
-                    "agent_protocol_error", "agent response is too large"
+                    "agent_protocol_error",
+                    "agent response is too large",
+                    dispatch_state="dispatched",
                 )
     return httpx.Response(
         streamed.status_code,
@@ -369,12 +383,24 @@ def _validate_response(
     response: httpx.Response, max_response_bytes: int
 ) -> httpx.Response:
     if 300 <= response.status_code < 400:
-        raise AgentClientError("agent_protocol_error", "agent redirects are not allowed")
+        raise AgentClientError(
+            "agent_protocol_error",
+            "agent redirects are not allowed",
+            dispatch_state="dispatched",
+        )
     if len(response.content) > max_response_bytes:
-        raise AgentClientError("agent_protocol_error", "agent response is too large")
+        raise AgentClientError(
+            "agent_protocol_error",
+            "agent response is too large",
+            dispatch_state="dispatched",
+        )
     content_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
     if response.status_code != 204 and content_type != "application/json":
-        raise AgentClientError("agent_protocol_error", "agent response content type is invalid")
+        raise AgentClientError(
+            "agent_protocol_error",
+            "agent response content type is invalid",
+            dispatch_state="dispatched",
+        )
     if response.status_code != 204:
         try:
             _validate_json_nesting(response.content)
@@ -384,7 +410,9 @@ def _validate_response(
             )
         except (UnicodeDecodeError, ValueError, RecursionError) as exc:
             raise AgentClientError(
-                "agent_protocol_error", "agent response JSON is invalid"
+                "agent_protocol_error",
+                "agent response JSON is invalid",
+                dispatch_state="dispatched",
             ) from exc
     return response
 
@@ -407,6 +435,7 @@ def _validate_upstream_path(path: str) -> None:
         or "?" in path
         or "#" in path
         or "\\" in path
+        or any(segment in {".", ".."} for segment in path.split("/"))
         or any(ord(character) < 0x20 for character in path)
     ):
         raise AgentClientError("agent_protocol_error", "agent request path is invalid")

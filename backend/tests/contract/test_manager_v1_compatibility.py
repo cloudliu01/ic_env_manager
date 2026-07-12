@@ -29,12 +29,15 @@ def manager_client(tmp_path) -> Iterator[tuple[TestClient, list[tuple[str, str, 
     config = AppConfig(
         auth=AuthConfig(token_file=manager_token),
         mode="control-plane",
-        control_plane=ControlPlaneConfig(audit_database=tmp_path / "control-plane.db"),
+        control_plane=ControlPlaneConfig(
+            audit_database=tmp_path / "control-plane.db",
+            allowed_agent_cidrs=["10.20.30.0/24"],
+        ),
         agents=[
             AgentConfig(
                 id="lab-01",
                 name="Lab 01",
-                base_url="https://lab-01.example",
+                base_url="https://10.20.30.1:8765",
                 token_file=agent_token,
             )
         ],
@@ -92,7 +95,7 @@ def test_manager_v1_inventory_and_scoped_routes_remain_available(manager_client)
         assert "credential_ref" not in response.text
         assert "manager-secret" not in response.text
         assert "agent-secret" not in response.text
-    assert seen == [("lab-01.example", "/api/services", "Bearer agent-secret")]
+    assert seen == [("10.20.30.1", "/api/services", "Bearer agent-secret")]
 
 
 @pytest.mark.contract

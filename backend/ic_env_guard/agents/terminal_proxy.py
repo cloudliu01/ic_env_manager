@@ -11,6 +11,11 @@ MAX_TERMINAL_FRAME_BYTES = 64 * 1024
 class GatewayTicketReservation:
     id: str
     agent_id: str
+    revision: int | None = None
+    credential_ref: str | None = None
+    transport_profile_id: str | None = None
+    normalized_endpoint: str | None = None
+    slot: object | None = None
 
 
 @dataclass(frozen=True)
@@ -22,6 +27,11 @@ class GatewayTicket:
     intended_ws_path: str
     upstream_ticket: str
     expires_at: datetime
+    revision: int | None = None
+    credential_ref: str | None = None
+    transport_profile_id: str | None = None
+    normalized_endpoint: str | None = None
+    slot: object | None = None
 
 
 class GatewayTicketStore:
@@ -41,21 +51,35 @@ class GatewayTicketStore:
         self._removing: set[str] = set()
         self._lock = threading.Lock()
 
-    def reserve(self, agent_id: str = "") -> GatewayTicketReservation | None:
+    def reserve(
+        self,
+        agent_id: str = "",
+        *,
+        revision: int | None = None,
+        credential_ref: str | None = None,
+        transport_profile_id: str | None = None,
+        normalized_endpoint: str | None = None,
+        slot: object | None = None,
+    ) -> GatewayTicketReservation | None:
         with self._lock:
             self._prune_expired_unlocked()
             if agent_id in self._removing or self._durably_blocked(agent_id):
                 return None
             if len(self._reservations) + len(self._tickets) >= self._max_outstanding:
                 return None
-            reservation = GatewayTicketReservation(secrets.token_urlsafe(16), agent_id)
+            reservation = GatewayTicketReservation(
+                secrets.token_urlsafe(16), agent_id, revision, credential_ref,
+                transport_profile_id, normalized_endpoint, slot,
+            )
             self._reservations[reservation.id] = reservation
             return reservation
 
     def release_reservation(self, reservation: GatewayTicketReservation | None) -> None:
         with self._lock:
             if reservation is not None:
-                self._reservations.pop(reservation.id, None)
+                removed = self._reservations.pop(reservation.id, None)
+                if removed is not None:
+                    _release_slot(removed.slot)
 
     def commit(
         self,
@@ -74,7 +98,7 @@ class GatewayTicketStore:
                 raise ValueError("gateway ticket reservation is not active")
             if stored.agent_id and stored.agent_id != agent_id:
                 raise ValueError("gateway ticket reservation belongs to another agent")
-            if agent_id in self._removing:
+            if agent_id in self._removing or self._durably_blocked(agent_id):
                 raise ValueError("agent removal is in progress")
             self._reservations.pop(reservation.id)
             record = GatewayTicket(
@@ -85,6 +109,11 @@ class GatewayTicketStore:
                 intended_ws_path=intended_ws_path,
                 upstream_ticket=upstream_ticket,
                 expires_at=expires_at,
+                revision=stored.revision,
+                credential_ref=stored.credential_ref,
+                transport_profile_id=stored.transport_profile_id,
+                normalized_endpoint=stored.normalized_endpoint,
+                slot=stored.slot,
             )
             self._tickets[record.ticket] = record
             return record
@@ -118,8 +147,12 @@ class GatewayTicketStore:
     ) -> tuple[str, GatewayTicket | None]:
         with self._lock:
             record = self._tickets.get(ticket)
-            if record is None or record.expires_at <= self._clock():
-                self._tickets.pop(ticket, None)
+            if record is None:
+                return "invalid", None
+            if record.expires_at <= self._clock():
+                expired = self._tickets.pop(ticket, None)
+                if expired is not None:
+                    _release_slot(expired.slot)
                 return "invalid", None
             if actor_id is not None and record.actor_id != actor_id:
                 return "actor_mismatch", record
@@ -135,7 +168,9 @@ class GatewayTicketStore:
 
     def release_active(self, ticket: GatewayTicket) -> None:
         with self._lock:
-            self._active.pop(ticket.ticket, None)
+            removed = self._active.pop(ticket.ticket, None)
+            if removed is not None:
+                _release_slot(removed.slot)
 
     def begin_removal(self, agent_id: str) -> bool:
         with self._lock:
@@ -180,23 +215,54 @@ class GatewayTicketStore:
         now = self._clock()
         expired = [ticket for ticket, record in self._tickets.items() if record.expires_at <= now]
         for ticket in expired:
-            self._tickets.pop(ticket, None)
+            record = self._tickets.pop(ticket, None)
+            if record is not None:
+                _release_slot(record.slot)
+
+
+def _release_slot(slot: object | None) -> None:
+    release = getattr(slot, "release", None)
+    if callable(release):
+        release()
+
+
+class GatewayProxySlot:
+    def __init__(self, limiter: "GatewayProxyLimiter", identifier: str) -> None:
+        self._limiter = limiter
+        self.id = identifier
+
+    def release(self) -> None:
+        self._limiter.release(self)
 
 
 class GatewayProxyLimiter:
     def __init__(self, max_active: int = 64) -> None:
         self._max_active = max_active
-        self._active = 0
+        self._slots: set[str] = set()
+        self._legacy: list[GatewayProxySlot] = []
         self._lock = threading.Lock()
 
     def try_acquire(self) -> bool:
+        slot = self.reserve()
+        if slot is None:
+            return False
         with self._lock:
-            if self._active >= self._max_active:
-                return False
-            self._active += 1
-            return True
+            self._legacy.append(slot)
+        return True
 
-    def release(self) -> None:
+    def reserve(self) -> GatewayProxySlot | None:
         with self._lock:
-            if self._active > 0:
-                self._active -= 1
+            if len(self._slots) >= self._max_active:
+                return None
+            identifier = secrets.token_urlsafe(16)
+            self._slots.add(identifier)
+            return GatewayProxySlot(self, identifier)
+
+    def release(self, slot: GatewayProxySlot | None = None) -> None:
+        with self._lock:
+            if slot is None:
+                slot = self._legacy.pop() if self._legacy else None
+            elif slot in self._legacy:
+                self._legacy.remove(slot)
+            if slot is not None:
+                self._slots.discard(slot.id)

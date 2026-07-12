@@ -28,10 +28,13 @@ def _token_file(tmp_path, name="token"):
 
 
 def _agent(tmp_path, agent_id: str, *, enabled: bool = True) -> AgentConfig:
+    address = {"lab-01": "10.20.30.1", "lab-02": "10.20.30.2"}.get(
+        agent_id, "10.20.30.3"
+    )
     return AgentConfig(
         id=agent_id,
         name=agent_id,
-        base_url=f"https://{agent_id}.example",
+        base_url=f"https://{address}:8765",
         token_file=_token_file(tmp_path, f"{agent_id}.token") if enabled else None,
         enabled=enabled,
     )
@@ -41,7 +44,10 @@ def _config(tmp_path) -> AppConfig:
     return AppConfig(
         auth=AuthConfig(token_file=_token_file(tmp_path)),
         mode="control-plane",
-        control_plane=ControlPlaneConfig(audit_database=tmp_path / "control-plane.db"),
+        control_plane=ControlPlaneConfig(
+            audit_database=tmp_path / "control-plane.db",
+            allowed_agent_cidrs=["10.20.30.0/24"],
+        ),
         agents=[
             _agent(tmp_path, "lab-01"),
             _agent(tmp_path, "lab-02"),
@@ -119,7 +125,7 @@ def test_agent_audit_route_keeps_agent_results_isolated(tmp_path):
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/capabilities":
             return httpx.Response(200, json=CAPABILITIES)
-        agent_id = request.url.host.split(".")[0]
+        agent_id = {"10.20.30.1": "lab-01", "10.20.30.2": "lab-02"}[request.url.host]
         return httpx.Response(
             200,
             json={"events": [_audit_event("service.stop", f"demo-{agent_id}")]},

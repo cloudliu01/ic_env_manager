@@ -33,12 +33,15 @@ def _config(tmp_path):
     return AppConfig(
         auth=AuthConfig(token_file=_token_file(tmp_path)),
         mode="control-plane",
-        control_plane=ControlPlaneConfig(audit_database=tmp_path / "control-plane.db"),
+        control_plane=ControlPlaneConfig(
+            audit_database=tmp_path / "control-plane.db",
+            allowed_agent_cidrs=["10.20.30.0/24"],
+        ),
         agents=[
             AgentConfig(
                 id="lab-01",
                 name="Lab 01",
-                base_url="https://lab-01.example",
+                base_url="https://10.20.30.1:8765",
                 token_file=_token_file(tmp_path, "lab-01.token"),
             )
         ],

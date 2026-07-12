@@ -7,7 +7,9 @@ from fastapi.testclient import TestClient
 from ic_env_guard.agents.availability import AgentAvailabilityService
 from ic_env_guard.agents.client import AgentHttpClient
 from ic_env_guard.agents.registry import AgentRegistry
+from ic_env_guard.agents.terminal_proxy import GatewayProxyLimiter
 from ic_env_guard.api.agent_http import get_agent_http_client
+from ic_env_guard.api.agent_terminals import get_gateway_proxy_limiter
 from ic_env_guard.api.agents import get_agent_availability
 from ic_env_guard.config.models import AgentConfig, AppConfig, AuthConfig, ControlPlaneConfig
 from ic_env_guard.main import create_app
@@ -34,12 +36,13 @@ def _config(tmp_path):
         control_plane=ControlPlaneConfig(
             audit_database=tmp_path / "control-plane.db",
             max_outstanding_tickets=1,
+            allowed_agent_cidrs=["10.20.30.0/24"],
         ),
         agents=[
             AgentConfig(
                 id="lab-01",
                 name="Lab 01",
-                base_url="https://lab-01.example",
+                base_url="https://10.20.30.1:8765",
                 token_file=_token_file(tmp_path, "lab-01.token"),
             ),
             AgentConfig(
@@ -165,6 +168,33 @@ def test_gateway_connect_token_capacity_fails_before_upstream_dispatch(tmp_path)
     assert second.status_code == 429
     assert second.json()["error"] == "gateway_capacity_exceeded"
     assert dispatched_paths == ["/api/terminals/term-1/connect-token"]
+
+
+@pytest.mark.contract
+def test_gateway_proxy_slot_is_reserved_before_upstream_ticket_request(tmp_path):
+    dispatched = False
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal dispatched
+        dispatched = True
+        return httpx.Response(201, json={"ticket": "upstream", "expires_in_seconds": 60})
+
+    config = _config(tmp_path)
+    app = create_app(config=config)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
+    )
+    app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
+    app.dependency_overrides[get_gateway_proxy_limiter] = lambda: GatewayProxyLimiter(0)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agents/lab-01/terminals/term-1/connect-token",
+            headers={"Authorization": "Bearer secret-token"},
+        )
+
+    assert response.status_code == 429
+    assert dispatched is False
 
 
 @pytest.mark.contract

@@ -1,3 +1,4 @@
+import re
 from typing import Annotated
 from uuid import uuid4
 
@@ -5,15 +6,15 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response
 
 from ic_env_guard.agents.availability import AgentAvailabilityService
-from ic_env_guard.agents.client import AgentClientError, AgentHttpClient
-from ic_env_guard.agents.registry import AgentNotFoundError, AgentRegistry
+from ic_env_guard.agents.client import AgentHttpClient
 from ic_env_guard.api.agent_http import (
     ERROR_STATUS,
     augment_upstream_error_body,
     failure_category_for_client_error,
     get_agent_http_client,
 )
-from ic_env_guard.api.agents import get_agent_availability, get_agent_registry
+from ic_env_guard.api.agent_proxy import get_agent_http_proxy, proxy_get, validate_single_query
+from ic_env_guard.api.agents import get_agent_availability
 from ic_env_guard.api.audit_health import (
     AuditStorageHealth,
     commit_audit_intent,
@@ -22,13 +23,137 @@ from ic_env_guard.api.audit_health import (
 )
 from ic_env_guard.api.control_plane_audit import get_control_plane_audit_repository
 from ic_env_guard.api.errors import ApiError
+from ic_env_guard.api.runtime import require_v2_auth
+from ic_env_guard.api.v2_errors import V2ApiError
 from ic_env_guard.auth.dependencies import AuthContext, require_auth
 from ic_env_guard.db.control_plane_audit import (
     ControlPlaneAuditEventCreate,
     ControlPlaneAuditRepository,
 )
+from ic_env_guard.proxy.http import AgentHttpProxy, AgentProxyError
 
 router = APIRouter(prefix="/api/agents/{agent_id}/services", tags=["agent-services"])
+v2_router = APIRouter(prefix="/api/v2/agents/{agent_id}/services", tags=["agent-services-v2"])
+_SERVICE_ID = re.compile(r"^[a-zA-Z0-9_.-]{1,127}$")
+
+
+def _service_id(value: str) -> str:
+    if value in {".", ".."} or _SERVICE_ID.fullmatch(value) is None:
+        raise V2ApiError(422, "validation_error", "request validation failed")
+    return value
+
+
+async def _v2_services_get(
+    agent_id, request, actor, proxy, audit_repo, audit_health, *, path, operation, target
+):
+    validate_single_query(request, set())
+    return await proxy_get(
+        proxy=proxy,
+        agent_id=agent_id,
+        capability="services.v1",
+        upstream_path=path,
+        query={},
+        operation=operation,
+        target=target,
+        request=request,
+        actor=actor,
+        audit_repo=audit_repo,
+        audit_health=audit_health,
+    )
+
+
+@v2_router.get("")
+async def v2_list_agent_services(
+    agent_id: str,
+    request: Request,
+    actor: Annotated[AuthContext, Depends(require_v2_auth)],
+    proxy: Annotated[AgentHttpProxy, Depends(get_agent_http_proxy)],
+    audit_repo: Annotated[ControlPlaneAuditRepository, Depends(get_control_plane_audit_repository)],
+    audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
+):
+    return await _v2_services_get(
+        agent_id,
+        request,
+        actor,
+        proxy,
+        audit_repo,
+        audit_health,
+        path="/api/services",
+        operation="services.list",
+        target="services",
+    )
+
+
+@v2_router.get("/{service_id}")
+async def v2_get_agent_service(
+    agent_id: str,
+    service_id: str,
+    request: Request,
+    actor: Annotated[AuthContext, Depends(require_v2_auth)],
+    proxy: Annotated[AgentHttpProxy, Depends(get_agent_http_proxy)],
+    audit_repo: Annotated[ControlPlaneAuditRepository, Depends(get_control_plane_audit_repository)],
+    audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
+):
+    service_id = _service_id(service_id)
+    return await _v2_services_get(
+        agent_id,
+        request,
+        actor,
+        proxy,
+        audit_repo,
+        audit_health,
+        path=f"/api/services/{service_id}",
+        operation="services.detail",
+        target=f"service:{service_id}",
+    )
+
+
+@v2_router.get("/{service_id}/events")
+async def v2_list_agent_service_events(
+    agent_id: str,
+    service_id: str,
+    request: Request,
+    actor: Annotated[AuthContext, Depends(require_v2_auth)],
+    proxy: Annotated[AgentHttpProxy, Depends(get_agent_http_proxy)],
+    audit_repo: Annotated[ControlPlaneAuditRepository, Depends(get_control_plane_audit_repository)],
+    audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
+):
+    service_id = _service_id(service_id)
+    return await _v2_services_get(
+        agent_id,
+        request,
+        actor,
+        proxy,
+        audit_repo,
+        audit_health,
+        path=f"/api/services/{service_id}/events",
+        operation="services.events",
+        target=f"service:{service_id}",
+    )
+
+
+@v2_router.get("/{service_id}/logs")
+async def v2_get_agent_service_logs(
+    agent_id: str,
+    service_id: str,
+    request: Request,
+    actor: Annotated[AuthContext, Depends(require_v2_auth)],
+    proxy: Annotated[AgentHttpProxy, Depends(get_agent_http_proxy)],
+    audit_repo: Annotated[ControlPlaneAuditRepository, Depends(get_control_plane_audit_repository)],
+    audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
+):
+    service_id = _service_id(service_id)
+    return await _v2_services_get(
+        agent_id,
+        request,
+        actor,
+        proxy,
+        audit_repo,
+        audit_health,
+        path=f"/api/services/{service_id}/logs",
+        operation="services.logs",
+        target=f"service:{service_id}",
+    )
 
 
 def _correlation_id(request: Request) -> str:
@@ -79,56 +204,14 @@ async def _dispatch(
     operation: str,
     target: str,
     actor: AuthContext,
-    registry: AgentRegistry,
     availability: AgentAvailabilityService,
     client: AgentHttpClient,
+    proxy: AgentHttpProxy,
     audit_repo: ControlPlaneAuditRepository,
     audit_health: AuditStorageHealth,
     correlation_id: str,
     source_addr: str | None,
 ) -> Response:
-    try:
-        agent = registry.get(agent_id)
-    except AgentNotFoundError as exc:
-        _record_pre_dispatch_failure(
-            audit_repo=audit_repo,
-            audit_health=audit_health,
-            actor=actor,
-            agent_id=agent_id,
-            operation=operation,
-            target=target,
-            correlation_id=correlation_id,
-            source_addr=source_addr,
-            failure_category="agent_not_found",
-        )
-        raise ApiError(404, "agent_not_found", "agent not found") from exc
-    if not agent.enabled:
-        _record_pre_dispatch_failure(
-            audit_repo=audit_repo,
-            audit_health=audit_health,
-            actor=actor,
-            agent_id=agent_id,
-            operation=operation,
-            target=target,
-            correlation_id=correlation_id,
-            source_addr=source_addr,
-            failure_category="agent_disabled",
-        )
-        raise ApiError(409, "agent_disabled", "agent is disabled")
-    if not await availability.ensure_capability(agent_id, "services.v1"):
-        _record_pre_dispatch_failure(
-            audit_repo=audit_repo,
-            audit_health=audit_health,
-            actor=actor,
-            agent_id=agent_id,
-            operation=operation,
-            target=target,
-            correlation_id=correlation_id,
-            source_addr=source_addr,
-            failure_category="missing_capability",
-        )
-        raise ApiError(409, "agent_capability_missing", "agent does not support services")
-
     audit = audit_repo.record_intent(
         ControlPlaneAuditEventCreate(
             actor_id=actor.actor_id,
@@ -141,18 +224,33 @@ async def _dispatch(
     )
     commit_audit_intent(audit_repo, audit_health)
     try:
-        response = await client.request(agent, method, upstream_path, correlation_id=correlation_id)
-    except AgentClientError as exc:
-        failure_category = failure_category_for_client_error(method, exc.category)
+        response = await proxy.with_runtime(client, availability).request_json(
+            agent_id=agent_id,
+            capability="services.v1",
+            method=method,
+            upstream_path=upstream_path,
+            query={},
+            correlation_id=correlation_id,
+        )
+    except AgentProxyError as exc:
+        failure_category = failure_category_for_client_error(method, exc.code)
+        audit_failure_category = (
+            "missing_capability"
+            if failure_category == "agent_capability_missing"
+            else failure_category
+        )
         audit_repo.finalize(
             audit.id,
             result="failed",
             dispatch_state=exc.dispatch_state,
-            failure_category=failure_category,
+            upstream_status=exc.upstream_status,
+            failure_category=audit_failure_category,
         )
         commit_audit_outcome(audit_repo, audit_health)
         raise ApiError(
-            ERROR_STATUS.get(failure_category, 502), failure_category, "agent request failed"
+            ERROR_STATUS.get(failure_category, exc.status_code),
+            failure_category,
+            "agent request failed",
         ) from exc
 
     audit_repo.finalize(
@@ -167,7 +265,7 @@ async def _dispatch(
     return JSONResponse(
         status_code=response.status_code,
         content=augment_upstream_error_body(
-            response.json(),
+            response.body,
             agent_id=agent_id,
             correlation_id=correlation_id,
             status_code=response.status_code,
@@ -180,9 +278,9 @@ async def list_agent_services(
     agent_id: str,
     request: Request,
     actor: Annotated[AuthContext, Depends(require_auth)],
-    registry: Annotated[AgentRegistry, Depends(get_agent_registry)],
     availability: Annotated[AgentAvailabilityService, Depends(get_agent_availability)],
     client: Annotated[AgentHttpClient, Depends(get_agent_http_client)],
+    proxy: Annotated[AgentHttpProxy, Depends(get_agent_http_proxy)],
     audit_repo: Annotated[ControlPlaneAuditRepository, Depends(get_control_plane_audit_repository)],
     audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
 ) -> Response:
@@ -193,9 +291,9 @@ async def list_agent_services(
         operation="services.list",
         target="services",
         actor=actor,
-        registry=registry,
         availability=availability,
         client=client,
+        proxy=proxy,
         audit_repo=audit_repo,
         audit_health=audit_health,
         correlation_id=_correlation_id(request),
@@ -209,9 +307,9 @@ async def get_agent_service(
     service_id: str,
     request: Request,
     actor: Annotated[AuthContext, Depends(require_auth)],
-    registry: Annotated[AgentRegistry, Depends(get_agent_registry)],
     availability: Annotated[AgentAvailabilityService, Depends(get_agent_availability)],
     client: Annotated[AgentHttpClient, Depends(get_agent_http_client)],
+    proxy: Annotated[AgentHttpProxy, Depends(get_agent_http_proxy)],
     audit_repo: Annotated[ControlPlaneAuditRepository, Depends(get_control_plane_audit_repository)],
     audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
 ) -> Response:
@@ -223,9 +321,9 @@ async def get_agent_service(
         operation="services.detail",
         target=f"service:{safe_service_id}",
         actor=actor,
-        registry=registry,
         availability=availability,
         client=client,
+        proxy=proxy,
         audit_repo=audit_repo,
         audit_health=audit_health,
         correlation_id=_correlation_id(request),
@@ -239,9 +337,9 @@ async def list_agent_service_events(
     service_id: str,
     request: Request,
     actor: Annotated[AuthContext, Depends(require_auth)],
-    registry: Annotated[AgentRegistry, Depends(get_agent_registry)],
     availability: Annotated[AgentAvailabilityService, Depends(get_agent_availability)],
     client: Annotated[AgentHttpClient, Depends(get_agent_http_client)],
+    proxy: Annotated[AgentHttpProxy, Depends(get_agent_http_proxy)],
     audit_repo: Annotated[ControlPlaneAuditRepository, Depends(get_control_plane_audit_repository)],
     audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
 ) -> Response:
@@ -253,9 +351,9 @@ async def list_agent_service_events(
         operation="services.events",
         target=f"service:{safe_service_id}",
         actor=actor,
-        registry=registry,
         availability=availability,
         client=client,
+        proxy=proxy,
         audit_repo=audit_repo,
         audit_health=audit_health,
         correlation_id=_correlation_id(request),
@@ -269,9 +367,9 @@ async def get_agent_service_logs(
     service_id: str,
     request: Request,
     actor: Annotated[AuthContext, Depends(require_auth)],
-    registry: Annotated[AgentRegistry, Depends(get_agent_registry)],
     availability: Annotated[AgentAvailabilityService, Depends(get_agent_availability)],
     client: Annotated[AgentHttpClient, Depends(get_agent_http_client)],
+    proxy: Annotated[AgentHttpProxy, Depends(get_agent_http_proxy)],
     audit_repo: Annotated[ControlPlaneAuditRepository, Depends(get_control_plane_audit_repository)],
     audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
 ) -> Response:
@@ -283,9 +381,9 @@ async def get_agent_service_logs(
         operation="services.logs",
         target=f"service:{safe_service_id}",
         actor=actor,
-        registry=registry,
         availability=availability,
         client=client,
+        proxy=proxy,
         audit_repo=audit_repo,
         audit_health=audit_health,
         correlation_id=_correlation_id(request),
@@ -300,9 +398,9 @@ async def mutate_agent_service(
     action: str,
     request: Request,
     actor: Annotated[AuthContext, Depends(require_auth)],
-    registry: Annotated[AgentRegistry, Depends(get_agent_registry)],
     availability: Annotated[AgentAvailabilityService, Depends(get_agent_availability)],
     client: Annotated[AgentHttpClient, Depends(get_agent_http_client)],
+    proxy: Annotated[AgentHttpProxy, Depends(get_agent_http_proxy)],
     audit_repo: Annotated[ControlPlaneAuditRepository, Depends(get_control_plane_audit_repository)],
     audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
 ) -> Response:
@@ -327,9 +425,9 @@ async def mutate_agent_service(
         operation=f"services.{action}",
         target=f"service:{safe_service_id}",
         actor=actor,
-        registry=registry,
         availability=availability,
         client=client,
+        proxy=proxy,
         audit_repo=audit_repo,
         audit_health=audit_health,
         correlation_id=_correlation_id(request),
