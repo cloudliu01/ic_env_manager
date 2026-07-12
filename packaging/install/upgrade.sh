@@ -205,6 +205,20 @@ if [[ -e "${stage_dir}" || -L "${stage_dir}" ]]; then
     rm -f "${config_file}"
     remove_known_state_dir "${state_dir}"
     cleanup_stage
+  elif [[ ! -e "${marker}" && ! -L "${marker}" \
+    && ! -e "${stage_state}" && ! -L "${stage_state}" \
+    && ! -e "${stage_dir}/config.prepared.yaml" \
+    && ! -L "${stage_dir}/config.prepared.yaml" \
+    && ! -e "${stage_dir}/config.final.yaml" \
+    && ! -L "${stage_dir}/config.final.yaml" \
+    && ! -L "${stage_dir}/marker.next" ]]; then
+    # No durable marker means the legacy service was never stopped. Only an
+    # otherwise empty stage (plus a regular partial marker.next) is removable.
+    rm -f "${stage_dir}/marker.next"
+    rmdir "${stage_dir}" || {
+      echo "refusing unrecognized upgrade staging directory: ${stage_dir}" >&2
+      exit 1
+    }
   else
     echo "refusing unrecognized upgrade staging directory: ${stage_dir}" >&2
     exit 1

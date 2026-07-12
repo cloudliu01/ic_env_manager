@@ -490,6 +490,28 @@ def test_upgrade_recovers_marker_publication_interruption(tmp_path):
     assert (root / "etc/ic-env-guard/edaops.yaml").is_file()
 
 
+@pytest.mark.parametrize("marker_content", [None, "format=partial\n"])
+def test_upgrade_recovers_safe_pre_marker_stage_interruption(tmp_path, marker_content):
+    environment, root = _upgrade_environment(tmp_path)
+    stage = root / "var/lib/ic-env-guard/.ic-env-guard-edaops.upgrade"
+    stage.mkdir(mode=0o700)
+    if marker_content is not None:
+        (stage / "marker.next").write_text(marker_content, encoding="utf-8")
+        (stage / "marker.next").chmod(0o600)
+
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not stage.exists()
+    assert (root / "etc/ic-env-guard/edaops.yaml").is_file()
+
+
 def test_upgrade_cleans_atomically_completed_stage_on_rerun(tmp_path):
     environment, root = _upgrade_environment(tmp_path)
     first = subprocess.run(
