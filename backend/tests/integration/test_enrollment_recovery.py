@@ -315,6 +315,179 @@ async def test_recovery_finishes_activated_local_commit_and_consumes_once(tmp_pa
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize(
+    "method", (EnrollmentMethod.SSH_AUTO, EnrollmentMethod.SSH_CLI)
+)
+async def test_ssh_activated_recovery_commits_registry_and_atomically_clears_ref_and_pin(
+    tmp_path, method
+):
+    calls = []
+
+    class Client:
+        def prepare_pinned(self, endpoint, profile, stored_ip):
+            calls.append((endpoint, profile, stored_ip))
+            return SimpleNamespace(normalized_endpoint=endpoint)
+
+        async def activate(self, *_args, **_kwargs):
+            raise AssertionError("already activated residual must not dispatch")
+
+    orchestrator, jobs, journal, registry, store, engine = setup_services(
+        tmp_path, Client()
+    )
+    try:
+        pending = jobs.create(
+            EnrollmentJobRequest(
+                normalized_endpoint="https://agent.example:8765",
+                transport_profile_id="system-tls",
+                display_name="Lab SSH",
+                ssh_user="edaops",
+                ssh_host="agent.example",
+                ssh_port=22,
+                enrollment_method=method,
+            ),
+            now=NOW,
+        )
+        reference = store.put(b"registry-owned")
+        current = pending
+        for state in (
+            EnrollmentState.RUNNING,
+            EnrollmentState.CREDENTIAL_ISSUED,
+            EnrollmentState.VERIFYING,
+            EnrollmentState.VERIFIED,
+            EnrollmentState.ACTIVATION_REQUESTED,
+            EnrollmentState.ACTIVATED,
+        ):
+            current = journal.replace_if_state(
+                replace(
+                    current,
+                    state=state,
+                    credential_temp_ref=(
+                        reference
+                        if state is not EnrollmentState.RUNNING
+                        else current.credential_temp_ref
+                    ),
+                    validated_http_address=(
+                        "10.20.30.40"
+                        if state is not EnrollmentState.RUNNING
+                        else current.validated_http_address
+                    ),
+                    remote_instance_id=(
+                        "33333333-3333-4333-8333-333333333333"
+                        if state is not EnrollmentState.RUNNING
+                        else current.remote_instance_id
+                    ),
+                    remote_credential_id=(
+                        "remote-credential"
+                        if state is not EnrollmentState.RUNNING
+                        else current.remote_credential_id
+                    ),
+                    save_requested=state
+                    in {
+                        EnrollmentState.ACTIVATION_REQUESTED,
+                        EnrollmentState.ACTIVATED,
+                    },
+                    requested_display_name="Lab SSH",
+                ),
+                expected_state=current.state,
+            )
+
+        await orchestrator.recover_and_cleanup()
+
+        saved = registry.get(pending.enrollment_id)
+        assert saved is not None
+        assert saved.credential_ref == reference
+        assert saved.instance_id == "33333333-3333-4333-8333-333333333333"
+        consumed = journal.get(pending.enrollment_id)
+        assert consumed.state is EnrollmentState.CONSUMED
+        assert consumed.credential_temp_ref is None
+        assert consumed.validated_http_address is None
+        assert store.read(reference) == b"registry-owned"
+        await orchestrator.recover_and_cleanup()
+        assert registry.get(pending.enrollment_id) == saved
+        assert calls == [
+            ("https://agent.example:8765", "system-tls", "10.20.30.40")
+        ]
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_registry_commit_then_consumed_fence_fault_converges_on_restart(
+    tmp_path, monkeypatch
+):
+    class Client:
+        def prepare_pinned(self, endpoint, _profile, _stored_ip):
+            return SimpleNamespace(normalized_endpoint=endpoint)
+
+    orchestrator, jobs, journal, registry, store, engine = setup_services(
+        tmp_path, Client()
+    )
+    try:
+        pending = jobs.create(
+            EnrollmentJobRequest(
+                normalized_endpoint="https://agent.example:8765",
+                transport_profile_id="system-tls",
+                display_name="Lab SSH",
+                ssh_user="edaops",
+                ssh_host="agent.example",
+                ssh_port=22,
+                enrollment_method=EnrollmentMethod.SSH_AUTO,
+            ),
+            now=NOW,
+        )
+        reference = store.put(b"registry-owned")
+        current = pending
+        for state in (
+            EnrollmentState.RUNNING,
+            EnrollmentState.CREDENTIAL_ISSUED,
+            EnrollmentState.VERIFYING,
+            EnrollmentState.VERIFIED,
+            EnrollmentState.ACTIVATION_REQUESTED,
+            EnrollmentState.ACTIVATED,
+        ):
+            current = journal.replace_if_state(
+                replace(
+                    current,
+                    state=state,
+                    credential_temp_ref=(
+                        reference
+                        if state is not EnrollmentState.RUNNING
+                        else current.credential_temp_ref
+                    ),
+                    validated_http_address=(
+                        "10.20.30.40"
+                        if state is not EnrollmentState.RUNNING
+                        else current.validated_http_address
+                    ),
+                    remote_instance_id="33333333-3333-4333-8333-333333333333",
+                    remote_credential_id="remote-credential",
+                    save_requested=state
+                    in {
+                        EnrollmentState.ACTIVATION_REQUESTED,
+                        EnrollmentState.ACTIVATED,
+                    },
+                    requested_display_name="Lab SSH",
+                ),
+                expected_state=current.state,
+            )
+        real_transition = orchestrator._transition_claimed
+        monkeypatch.setattr(orchestrator, "_transition_claimed", lambda *_a, **_k: None)
+        await orchestrator.recover()
+        assert registry.get(pending.enrollment_id) is not None
+        lost = journal.get(pending.enrollment_id)
+        assert lost.state is EnrollmentState.ACTIVATED
+        monkeypatch.setattr(orchestrator, "_transition_claimed", real_transition)
+        orchestrator._now = lambda: lost.recovery_lease_until + timedelta(seconds=1)
+
+        await orchestrator.recover()
+
+        assert journal.get(pending.enrollment_id).state is EnrollmentState.CONSUMED
+        assert store.read(reference) == b"registry-owned"
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.integration
 async def test_pending_validation_rejects_helper_http_identity_mismatch():
     class Response:
         status_code = 200

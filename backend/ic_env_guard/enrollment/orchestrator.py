@@ -731,25 +731,28 @@ class EnrollmentOrchestrator:
             self._fail_claim(job, "credential_store_unavailable")
             return
         current = job
+        target = None
+        if current.enrollment_method is not EnrollmentMethod.LEGACY_ADMIN_TOKEN:
+            if (
+                self.agent_client is None
+                or not current.remote_credential_id
+                or not current.validated_http_address
+            ):
+                self._fail_claim(current, "enrollment_unavailable")
+                return
+            try:
+                target = self.agent_client.prepare_pinned(
+                    current.normalized_endpoint,
+                    current.transport_profile_id,
+                    current.validated_http_address,
+                )
+            except EnrollmentValidationError as exc:
+                self._fail_claim(current, exc.code)
+                return
         if current.state is EnrollmentState.ACTIVATION_REQUESTED:
             if current.enrollment_method is not EnrollmentMethod.LEGACY_ADMIN_TOKEN:
-                if (
-                    self.agent_client is None
-                    or not current.remote_credential_id
-                    or not current.validated_http_address
-                ):
-                    self._fail_claim(current, "enrollment_unavailable")
-                    return
                 try:
-                    target = self.agent_client.prepare_pinned(
-                        current.normalized_endpoint,
-                        current.transport_profile_id,
-                        current.validated_http_address,
-                    )
                     token = self.credential_store.read(current.credential_temp_ref)
-                except EnrollmentValidationError as exc:
-                    self._fail_claim(current, exc.code)
-                    return
                 except CredentialStoreError:
                     self._fail_claim(current, "credential_store_unavailable")
                     return
@@ -806,7 +809,11 @@ class EnrollmentOrchestrator:
                 if existing is None or not _same_committed_agent(existing, record):
                     return
             self._transition_claimed(
-                replace(current, credential_temp_ref=None),
+                replace(
+                    current,
+                    credential_temp_ref=None,
+                    validated_http_address=None,
+                ),
                 EnrollmentState.CONSUMED,
                 clear_claim=True,
             )
