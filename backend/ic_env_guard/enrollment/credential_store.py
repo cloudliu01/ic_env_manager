@@ -22,11 +22,14 @@ class JournalCredentialReferences(Protocol):
 
 
 _REFERENCE = re.compile(r"^[0-9a-f]{48}$")
+_TEMPORARY = re.compile(r"^\.tmp-[0-9a-f]{48}$")
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 
 
 class CredentialLifecycleCoordinator:
+    """Serializes the sole ManagerContainer CredentialStore lifecycle in one process."""
+
     def __init__(self) -> None:
         self._lock = threading.RLock()
 
@@ -58,6 +61,7 @@ class CredentialStore:
         self._validate_directory()
         if created:
             self._fsync_parent_entry()
+        self.startup_findings = self._recover_temporary_files()
 
     def lifecycle_lease(self) -> Iterator[None]:
         return self._coordinator.exclusive_lease()
@@ -174,6 +178,80 @@ class CredentialStore:
         except Exception:
             os.close(fd)
             raise
+
+    def _recover_temporary_files(self) -> tuple[dict[str, str], ...]:
+        findings: list[dict[str, str]] = []
+        with self._coordinator.exclusive_lease():
+            for temporary in sorted(self.directory.iterdir(), key=lambda path: path.name):
+                if not temporary.name.startswith(".tmp-"):
+                    continue
+                if not _TEMPORARY.fullmatch(temporary.name):
+                    findings.append(
+                        {"entry": "temporary", "action": "retained", "reason": "invalid_name"}
+                    )
+                    continue
+                metadata = self._validate_temporary(temporary)
+                if metadata.st_nlink == 2:
+                    matches = self._matching_published_targets(temporary, metadata)
+                    if len(matches) != 1:
+                        raise CredentialStoreError(
+                            "temporary credential has no unique published target"
+                        )
+                elif metadata.st_nlink != 1:
+                    raise CredentialStoreError("temporary credential has unexpected hard links")
+                try:
+                    temporary.unlink()
+                    self._fsync_directory()
+                except OSError as exc:
+                    raise CredentialStoreError(
+                        "temporary credential could not be recovered"
+                    ) from exc
+                findings.append({"entry": "temporary", "action": "deleted"})
+        return tuple(findings)
+
+    def _validate_temporary(self, path: Path) -> os.stat_result:
+        try:
+            before = path.lstat()
+            if not stat.S_ISREG(before.st_mode):
+                raise CredentialStoreError("unsafe temporary credential file")
+            fd = os.open(path, os.O_RDONLY | _NOFOLLOW)
+        except CredentialStoreError:
+            raise
+        except OSError as exc:
+            raise CredentialStoreError("unsafe temporary credential file") from exc
+        try:
+            metadata = os.fstat(fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or (metadata.st_dev, metadata.st_ino) != (before.st_dev, before.st_ino)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise CredentialStoreError("unsafe temporary credential file")
+            return metadata
+        finally:
+            os.close(fd)
+
+    def _matching_published_targets(
+        self, temporary: Path, metadata: os.stat_result
+    ) -> tuple[Path, ...]:
+        matches: list[Path] = []
+        for candidate in self.directory.iterdir():
+            if candidate == temporary or not _REFERENCE.fullmatch(candidate.name):
+                continue
+            try:
+                candidate_metadata = candidate.lstat()
+            except OSError as exc:
+                raise CredentialStoreError("published credential could not be inspected") from exc
+            if (candidate_metadata.st_dev, candidate_metadata.st_ino) != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                continue
+            fd = self._open_validated(candidate)
+            os.close(fd)
+            matches.append(candidate)
+        return tuple(matches)
 
     def _write_temporary(self, secret: bytes) -> Path:
         temporary = self.directory / f".tmp-{secrets.token_hex(24)}"

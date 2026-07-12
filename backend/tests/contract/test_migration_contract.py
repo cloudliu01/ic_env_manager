@@ -6,6 +6,69 @@ from ic_env_guard.db.control_plane_migrations import run_control_plane_migration
 from ic_env_guard.db.migrations import MigrationError, run_migrations
 
 
+def _create_applied_parent_fleet_schema(connection):
+    connection.executescript(
+        """
+        CREATE TABLE schema_versions (
+            version TEXT PRIMARY KEY, applied_at TEXT NOT NULL, description TEXT NOT NULL,
+            direction TEXT NOT NULL, result TEXT NOT NULL, failure_reason TEXT
+        );
+        INSERT INTO schema_versions VALUES
+            ('0001_control_plane_audit', datetime('now'), 'audit', 'upgrade', 'success', NULL),
+            ('0002_fleet_registry', datetime('now'), 'fleet', 'upgrade', 'success', NULL);
+        CREATE TABLE agents (
+            agent_id TEXT PRIMARY KEY, instance_id TEXT NULL UNIQUE, display_name TEXT NOT NULL,
+            normalized_endpoint TEXT NOT NULL UNIQUE, credential_ref TEXT NOT NULL,
+            remote_credential_id TEXT NULL, transport_profile_id TEXT NOT NULL,
+            enrollment_method TEXT NOT NULL, enabled INTEGER NOT NULL, source TEXT NOT NULL,
+            revision INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE agent_status (
+            agent_id TEXT PRIMARY KEY REFERENCES agents(agent_id) ON DELETE CASCADE,
+            target_revision INTEGER NOT NULL, connection_status TEXT NOT NULL,
+            workload_status TEXT NOT NULL, observed_at TEXT NULL, stale_after TEXT NULL,
+            api_version TEXT NULL, agent_version TEXT NULL, capabilities_json TEXT NOT NULL,
+            summary_json TEXT NOT NULL, last_error_code TEXT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE agent_enrollment_jobs (
+            enrollment_id TEXT PRIMARY KEY, manager_id TEXT NOT NULL, state TEXT NOT NULL,
+            normalized_endpoint TEXT NOT NULL, transport_profile_id TEXT NOT NULL,
+            discovery_result_id TEXT NULL,
+            replace_agent_id TEXT NULL REFERENCES agents(agent_id),
+            requested_display_name TEXT NULL, ssh_user TEXT NULL, ssh_host TEXT NULL,
+            ssh_port INTEGER NULL, enrollment_method TEXT NOT NULL,
+            remote_instance_id TEXT NULL, remote_credential_id TEXT NULL,
+            credential_temp_ref TEXT NULL, old_credential_ref TEXT NULL,
+            old_remote_credential_id TEXT NULL, save_requested INTEGER NOT NULL,
+            expires_at TEXT NOT NULL, last_error_code TEXT NULL, created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_agent_status_updated ON agent_status(updated_at);
+        CREATE INDEX idx_enrollment_state_expiry ON agent_enrollment_jobs(state, expires_at);
+        INSERT INTO agents VALUES (
+            'lab-01', '11111111-1111-1111-1111-111111111111', 'Lab 01',
+            'https://lab-01.example:8765', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+            'remote-1', 'system-tls', 'ssh_auto', 1, 'manual', 1,
+            '2026-07-12T10:00:00.000000Z', '2026-07-12T10:00:00.000000Z'
+        );
+        INSERT INTO agent_status VALUES (
+            'lab-01', 1, 'ready', 'healthy', NULL, NULL, 'v2', '0.1.0', '[]', '{}',
+            NULL, '2026-07-12T10:00:00.000000Z'
+        );
+        INSERT INTO agent_enrollment_jobs VALUES (
+            'enroll-01', '22222222-2222-2222-2222-222222222222', 'completed',
+            'https://lab-01.example:8765', 'system-tls', NULL, 'lab-01', 'Lab 01',
+            'agent', 'lab-01.example', 22, 'ssh_auto',
+            '11111111-1111-1111-1111-111111111111', 'remote-1',
+            'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', NULL, NULL, 1,
+            '2026-07-12T10:10:00.000000Z', NULL,
+            '2026-07-12T10:00:00.000000Z', '2026-07-12T10:00:00.000000Z'
+        );
+        """
+    )
+    connection.commit()
+
+
 @pytest.mark.contract
 def test_migration_runner_records_forward_only_metadata(tmp_path):
     db_path = tmp_path / "state.db"
@@ -154,6 +217,56 @@ def test_manager_database_never_stores_plaintext_credentials(tmp_path):
     assert "token" not in columns
     assert "token_hash" not in columns
     assert "private_key" not in columns
+
+
+@pytest.mark.contract
+def test_fleet_hardening_forward_migration_preserves_parent_schema_data(tmp_path):
+    db_path = tmp_path / "control-plane.db"
+    connection = sqlite3.connect(db_path)
+    try:
+        _create_applied_parent_fleet_schema(connection)
+    finally:
+        connection.close()
+
+    run_control_plane_migrations(db_path)
+
+    connection = sqlite3.connect(db_path)
+    connection.execute("PRAGMA foreign_keys=ON")
+    try:
+        assert connection.execute(
+            "SELECT connection_status, workload_status FROM agent_status"
+        ).fetchone() == ("ready", "healthy")
+        assert connection.execute(
+            "SELECT state, credential_temp_ref FROM agent_enrollment_jobs"
+        ).fetchone() == ("consumed", "b" * 48)
+        versions = connection.execute(
+            "SELECT version FROM schema_versions ORDER BY version"
+        ).fetchall()
+        status_fks = connection.execute("PRAGMA foreign_key_list(agent_status)").fetchall()
+        journal_fks = connection.execute(
+            "PRAGMA foreign_key_list(agent_enrollment_jobs)"
+        ).fetchall()
+        indexes = {
+            row[1]
+            for table in ("agent_status", "agent_enrollment_jobs")
+            for row in connection.execute(f"PRAGMA index_list({table})").fetchall()
+        }
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE agent_status SET connection_status='online' WHERE agent_id='lab-01'"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE agent_enrollment_jobs SET state='completed' "
+                "WHERE enrollment_id='enroll-01'"
+            )
+    finally:
+        connection.close()
+
+    assert ("0003_fleet_registry_hardening",) in versions
+    assert any(row[2] == "agents" and row[6] == "CASCADE" for row in status_fks)
+    assert any(row[2] == "agents" and row[3] == "replace_agent_id" for row in journal_fks)
+    assert {"idx_agent_status_updated", "idx_enrollment_state_expiry"} <= indexes
 
 
 @pytest.mark.contract

@@ -46,12 +46,8 @@ def upgrade(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS agent_status (
             agent_id TEXT PRIMARY KEY REFERENCES agents(agent_id) ON DELETE CASCADE,
             target_revision INTEGER NOT NULL CHECK (target_revision >= 1),
-            connection_status TEXT NOT NULL CHECK (
-                connection_status IN ('disabled', 'unknown', 'ready', 'degraded', 'unavailable')
-            ),
-            workload_status TEXT NOT NULL CHECK (
-                workload_status IN ('unknown', 'healthy', 'warning', 'critical', 'stale')
-            ),
+            connection_status TEXT NOT NULL,
+            workload_status TEXT NOT NULL,
             observed_at TEXT NULL,
             stale_after TEXT NULL,
             api_version TEXT NULL,
@@ -70,7 +66,7 @@ def upgrade(connection: sqlite3.Connection) -> None:
             manager_id TEXT NOT NULL,
             state TEXT NOT NULL CHECK (state IN (
                 'pending', 'running', 'awaiting_cli', 'credential_issued', 'verifying',
-                'verified', 'activation_requested', 'activated', 'consumed', 'cancelled',
+                'verified', 'activation_requested', 'activated', 'completed', 'cancelled',
                 'failed', 'expired'
             )),
             normalized_endpoint TEXT NOT NULL,

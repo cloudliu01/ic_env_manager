@@ -286,3 +286,109 @@ def test_cleanup_cannot_interleave_between_publish_and_journal_commit(tmp_path):
 
     assert cleanup_result == []
     assert store.read(result["reference"]) == b"recoverable"
+
+
+@pytest.mark.unit
+def test_startup_removes_valid_unpublished_temporary_file(tmp_path):
+    directory = tmp_path / "credentials"
+    directory.mkdir(mode=0o700)
+    temporary = directory / (".tmp-" + "a" * 48)
+    temporary.write_bytes(b"never-published-secret")
+    temporary.chmod(0o600)
+
+    store = CredentialStore(directory)
+
+    assert not temporary.exists()
+    assert store.startup_findings == ({"entry": "temporary", "action": "deleted"},)
+    assert "never-published-secret" not in repr(store.startup_findings)
+    assert "a" * 48 not in repr(store.startup_findings)
+
+
+@pytest.mark.unit
+def test_startup_removes_linked_temporary_but_preserves_published_target(tmp_path):
+    directory = tmp_path / "credentials"
+    directory.mkdir(mode=0o700)
+    temporary = directory / (".tmp-" + "b" * 48)
+    target = directory / ("c" * 48)
+    temporary.write_bytes(b"published-secret")
+    temporary.chmod(0o600)
+    os.link(temporary, target)
+
+    store = CredentialStore(directory)
+
+    assert not temporary.exists()
+    assert store.read("c" * 48) == b"published-secret"
+    assert store.startup_findings == ({"entry": "temporary", "action": "deleted"},)
+
+
+@pytest.mark.unit
+def test_startup_retains_only_nonmatching_temporary_name(tmp_path):
+    directory = tmp_path / "credentials"
+    directory.mkdir(mode=0o700)
+    invalid = directory / ".tmp-not-a-reference"
+    invalid.write_bytes(b"invalid")
+
+    store = CredentialStore(directory)
+
+    assert invalid.exists()
+    assert store.startup_findings == (
+        {"entry": "temporary", "action": "retained", "reason": "invalid_name"},
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("unsafe_kind", ("symlink", "wrong_mode", "directory"))
+def test_startup_fails_closed_for_unsafe_strict_temporary_entry(tmp_path, unsafe_kind):
+    directory = tmp_path / "credentials"
+    directory.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"outside")
+    temporary = directory / (".tmp-" + "d" * 48)
+    if unsafe_kind == "symlink":
+        temporary.symlink_to(outside)
+    elif unsafe_kind == "wrong_mode":
+        temporary.write_bytes(b"wrong-mode")
+        temporary.chmod(0o640)
+    else:
+        temporary.mkdir(mode=0o700)
+
+    with pytest.raises(CredentialStoreError, match="unsafe temporary"):
+        CredentialStore(directory)
+
+    assert temporary.exists() or temporary.is_symlink()
+    assert outside.read_bytes() == b"outside"
+
+
+@pytest.mark.unit
+def test_startup_retains_wrong_owner_temporary_entry(tmp_path, monkeypatch):
+    directory = tmp_path / "credentials"
+    directory.mkdir(mode=0o700)
+    temporary = directory / (".tmp-" + "f" * 48)
+    temporary.write_bytes(b"wrong-owner")
+    temporary.chmod(0o600)
+    real_uid = os.geteuid()
+    calls = iter((real_uid, real_uid + 1))
+    monkeypatch.setattr(os, "geteuid", lambda: next(calls, real_uid + 1))
+
+    with pytest.raises(CredentialStoreError, match="unsafe temporary"):
+        CredentialStore(directory)
+    assert temporary.exists()
+
+
+@pytest.mark.unit
+def test_startup_rejects_temporary_with_unexpected_extra_hardlink(tmp_path):
+    directory = tmp_path / "credentials"
+    directory.mkdir(mode=0o700)
+    temporary = directory / (".tmp-" + "f" * 48)
+    target = directory / ("1" * 48)
+    unexpected = tmp_path / "unexpected-link"
+    temporary.write_bytes(b"secret")
+    temporary.chmod(0o600)
+    os.link(temporary, target)
+    os.link(temporary, unexpected)
+
+    with pytest.raises(CredentialStoreError, match="hard links"):
+        CredentialStore(directory)
+
+    assert temporary.exists()
+    assert target.read_bytes() == b"secret"

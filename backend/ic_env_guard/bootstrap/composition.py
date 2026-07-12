@@ -223,6 +223,8 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
     registry_repository = SQLiteManagerRegistryRepository(database_engine)
     status_repository = AgentStatusRepository(database_engine)
     enrollment_journal_repository = EnrollmentJournalRepository(database_engine)
+    # One ManagerContainer owns one Store/coordinator; enrollment mutations and startup cleanup
+    # must share its lifecycle lease rather than constructing another Store for this directory.
     credential_store = CredentialStore(config.control_plane.effective_credential_directory)
     agent_registry = AgentRegistry(config.agents)
     agent_client = AgentHttpClient()
