@@ -164,8 +164,100 @@ def test_discovery_migration_downgrade_is_forward_only(tmp_path):
     finally:
         connection.close()
 
-    assert version == 10
+    assert version == 11
     assert {"discovery_jobs", "discovery_results"} <= tables
+
+
+@pytest.mark.contract
+def test_discovery_dispatch_migration_adds_durable_aggregate_state(tmp_path):
+    db_path = tmp_path / "control-plane.db"
+    connection = sqlite3.connect(db_path)
+    try:
+        _run_control_plane_through(connection, "0010_discovery.py")
+        audit_ids = []
+        for suffix in ("zero", "checked"):
+            audit_ids.append(
+                connection.execute(
+                    "INSERT INTO control_plane_audit_events(timestamp,operation,target,"
+                    "result,dispatch_state) VALUES (?,?,?,?,?)",
+                    (
+                        "2026-07-12T12:00:00.000000Z",
+                        "discovery.start",
+                        f"discovery:{suffix}",
+                        "pending",
+                        "not_dispatched",
+                    ),
+                ).lastrowid
+            )
+        for suffix, checked, audit_id in zip(
+            ("zero", "checked"), (0, 1), audit_ids, strict=True
+        ):
+            connection.execute(
+                "INSERT INTO discovery_jobs(job_id,scope_id,state,total_targets,"
+                "checked_targets,found_targets,cancel_requested,safe_error_code,"
+                "start_audit_event_id,deadline_at,created_at,updated_at,completed_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    suffix,
+                    suffix,
+                    "completed",
+                    1,
+                    checked,
+                    0,
+                    0,
+                    None,
+                    audit_id,
+                    "2026-07-12T12:02:00.000000Z",
+                    "2026-07-12T12:00:00.000000Z",
+                    "2026-07-12T12:01:00.000000Z",
+                    "2026-07-12T12:01:00.000000Z",
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    run_control_plane_migrations(db_path)
+    connection = sqlite3.connect(db_path)
+    try:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(discovery_jobs)")
+        }
+        states = connection.execute(
+            "SELECT job_id,aggregate_dispatch_state FROM discovery_jobs ORDER BY job_id"
+        ).fetchall()
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE discovery_jobs SET aggregate_dispatch_state='forged'"
+            )
+        connection.rollback()
+    finally:
+        connection.close()
+
+    assert "aggregate_dispatch_state" in columns
+    assert states == [("checked", "unknown"), ("zero", "not_dispatched")]
+
+
+@pytest.mark.contract
+def test_discovery_dispatch_downgrade_is_forward_only_without_mutation(tmp_path):
+    db_path = tmp_path / "control-plane.db"
+    run_control_plane_migrations(db_path)
+    migration = _load_migration(
+        CONTROL_PLANE_MIGRATIONS / "0011_discovery_dispatch_state.py"
+    )
+    connection = sqlite3.connect(db_path)
+    before = connection.execute(
+        "SELECT * FROM schema_versions ORDER BY version"
+    ).fetchall()
+    try:
+        with pytest.raises(sqlite3.NotSupportedError, match="forward-only"):
+            migration.downgrade(connection)
+        assert connection.execute("PRAGMA user_version").fetchone() == (11,)
+        assert connection.execute(
+            "SELECT * FROM schema_versions ORDER BY version"
+        ).fetchall() == before
+    finally:
+        connection.close()
 
 
 @pytest.mark.contract
@@ -415,7 +507,7 @@ def test_legacy_manual_migration_preserves_rows_indexes_fks_and_checks(tmp_path)
             item[2] == "agents" and item[6] == "CASCADE"
             for item in connection.execute("PRAGMA foreign_key_list(agent_status)")
         )
-        assert connection.execute("PRAGMA user_version").fetchone() == (10,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (11,)
         status_indexes = {
             row[1] for row in connection.execute("PRAGMA index_list(agent_status)")
         }
@@ -750,7 +842,7 @@ def test_validated_address_migration_preserves_legal_pending_ssh_row(tmp_path):
     run_control_plane_migrations(db_path)
     connection = sqlite3.connect(db_path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone() == (10,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (11,)
         assert connection.execute(
             "SELECT validated_http_address FROM agent_enrollment_jobs"
         ).fetchone() == (None,)
@@ -807,7 +899,7 @@ def test_validated_address_downgrade_is_forward_only_without_mutation(tmp_path):
     try:
         with pytest.raises(sqlite3.NotSupportedError):
             migration.downgrade(connection)
-        assert connection.execute("PRAGMA user_version").fetchone() == (10,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (11,)
         assert connection.execute(
             "SELECT * FROM schema_versions ORDER BY version"
         ).fetchall() == before
@@ -833,7 +925,7 @@ def test_cli_resume_migration_adds_peer_bound_durable_claim_fields(tmp_path):
             "cli_pinned_address",
             "cli_accept_receipt",
         } <= columns
-        assert connection.execute("PRAGMA user_version").fetchone() == (10,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (11,)
     finally:
         connection.close()
 

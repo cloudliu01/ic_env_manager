@@ -85,7 +85,7 @@ def get_job(
 
 
 @router.post("/jobs/{job_id}/cancel")
-def cancel_job(
+async def cancel_job(
     job_id: str,
     request: Request,
     actor: Annotated[AuthContext, Depends(require_v2_auth)],
@@ -95,7 +95,7 @@ def cancel_job(
 ):
     audit = _intent(request, actor, audit_repo, audit_health, job_id, "discovery.cancel")
     try:
-        job = service.cancel(job_id)
+        job = await service.cancel(job_id)
     except (RegistryConflict, RegistryError) as exc:
         code = str(exc) if isinstance(exc, RegistryConflict) else "discovery_unavailable"
         _failure(audit, audit_repo, audit_health, code)

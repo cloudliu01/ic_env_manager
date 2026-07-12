@@ -74,7 +74,9 @@ def _audit(database, event_id):
         ).fetchone()
 
 
-def _finished_job(database, repository, *, job_id, state, now, checked=True):
+def _finished_job(
+    database, repository, *, job_id, state, now, checked=True, dispatch_state=None
+):
     job = DiscoveryJob(
         job_id, "lab", DiscoveryState.QUEUED, 1, 0, 0, False, None,
         _audit_id(database), now + timedelta(seconds=120), now, now,
@@ -89,6 +91,10 @@ def _finished_job(database, repository, *, job_id, state, now, checked=True):
             "network_error",
             now=now,
         )
+    if dispatch_state is not None:
+        repository.merge_dispatch(job_id, dispatch_state, now=now)
+    if state is DiscoveryState.CANCELLED:
+        repository.request_cancel(job_id, now=now)
     return repository.finish(
         job_id,
         state,
@@ -134,6 +140,7 @@ async def test_discovery_job_persists_bounded_progress_and_dedupes_results(tmp_p
         assert completed.state is DiscoveryState.COMPLETED
         assert completed.checked_targets == completed.total_targets == 2
         assert completed.found_targets == 1
+        assert completed.aggregate_dispatch_state.value == "dispatched"
         assert len(results) == 2
         assert sum(result.found for result in results) == 1
         assert fingerprinter.peak <= 2
@@ -164,15 +171,71 @@ async def test_discovery_cancel_is_durable_and_stops_workers(tmp_path):
         repository=repository,
         fingerprinter=Fingerprinter(),
         clock=lambda: datetime.now(UTC),
+        outcome_recorder=DiscoveryAuditOutcomeRecorder(
+            create_session_factory(engine)
+        ),
     )
     try:
         job = service.start("lab", start_audit_event_id=_audit_id(database))
         await entered.wait()
-        service.cancel(job.job_id)
+        cancelled = await asyncio.gather(
+            service.cancel(job.job_id), service.cancel(job.job_id)
+        )
         release.set()
         await service.wait(job.job_id)
         assert repository.get_job(job.job_id).state is DiscoveryState.CANCELLED
+        assert repository.get_job(job.job_id).aggregate_dispatch_state.value == "unknown"
+        assert all(item.state is DiscoveryState.CANCELLED for item in cancelled)
+        assert _audit(database, job.start_audit_event_id) == (
+            "failed", "unknown", "discovery_cancelled"
+        )
     finally:
+        await service.shutdown()
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_discovery_cancel_wait_is_bounded_when_adapter_suppresses_cancel(tmp_path):
+    database = tmp_path / "manager.db"
+    run_control_plane_migrations(database)
+    engine = create_sqlite_engine(database)
+    repository = DiscoveryRepository(engine)
+    entered = asyncio.Event()
+    suppressed = asyncio.Event()
+    release = asyncio.Event()
+
+    class Fingerprinter:
+        async def probe(self, target, **_kwargs):
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                suppressed.set()
+                await release.wait()
+            return None
+
+    discovery_config = _config().discovery.model_copy(
+        update={"fingerprint_timeout_seconds": 0.01}
+    )
+    service = DiscoveryService(
+        config=discovery_config,
+        transport_profiles=_config().transport_profiles,
+        repository=repository,
+        fingerprinter=Fingerprinter(),
+    )
+    try:
+        job = service.start("lab", start_audit_event_id=_audit_id(database))
+        await entered.wait()
+        cancelled = await asyncio.wait_for(service.cancel(job.job_id), timeout=0.2)
+        assert suppressed.is_set()
+        assert cancelled.state is DiscoveryState.CANCELLED
+        assert cancelled.aggregate_dispatch_state.value == "unknown"
+        release.set()
+        await service.wait(job.job_id)
+        assert repository.list_results(job.job_id) == ()
+        assert repository.get_job(job.job_id).state is DiscoveryState.CANCELLED
+    finally:
+        release.set()
         await service.shutdown()
         engine.dispose()
 
@@ -194,17 +257,18 @@ async def test_discovery_never_targets_manager_self_address(tmp_path):
         transport_profiles=_config().transport_profiles,
         repository=DiscoveryRepository(engine),
         fingerprinter=Fingerprinter(),
-        self_targets={"10.20.30.1"},
+        self_targets={"10.20.30.1", "10.20.30.2"},
     )
     try:
         job = service.start("lab", start_audit_event_id=_audit_id(database))
         await service.wait(job.job_id)
-        assert seen == ["10.20.30.2"]
+        assert seen == []
         completed = service.get(job.job_id)
         assert completed.total_targets == completed.checked_targets == 2
         blocked = service.repository.list_results(job.job_id)[0]
         assert blocked.ip == "10.20.30.1"
         assert blocked.safe_error_code == "self_target_forbidden"
+        assert completed.aggregate_dispatch_state.value == "not_dispatched"
     finally:
         await service.shutdown()
         engine.dispose()
@@ -223,6 +287,7 @@ async def test_restart_finalizes_terminal_pending_discovery_audit(tmp_path):
         job_id="finished-before-outcome",
         state=DiscoveryState.COMPLETED,
         now=now,
+        dispatch_state="dispatched",
     )
     service = DiscoveryService(
         config=_config().discovery,
@@ -243,6 +308,34 @@ async def test_restart_finalizes_terminal_pending_discovery_audit(tmp_path):
         )
     finally:
         await service.shutdown()
+        engine.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("checked", "durable_dispatch", "expected"),
+    [(True, "unknown", "unknown"), (False, "dispatched", "dispatched")],
+)
+def test_audit_uses_durable_dispatch_instead_of_result_count(
+    tmp_path, checked, durable_dispatch, expected
+):
+    database = tmp_path / "manager.db"
+    run_control_plane_migrations(database)
+    engine = create_sqlite_engine(database)
+    repository = DiscoveryRepository(engine)
+    finished = _finished_job(
+        database,
+        repository,
+        job_id=f"durable-{durable_dispatch}",
+        state=DiscoveryState.COMPLETED,
+        now=datetime.now(UTC),
+        checked=checked,
+        dispatch_state=durable_dispatch,
+    )
+    try:
+        DiscoveryAuditOutcomeRecorder(create_session_factory(engine))(finished)
+        assert _audit(database, finished.start_audit_event_id)[1] == expected
+    finally:
         engine.dispose()
 
 
@@ -293,7 +386,7 @@ async def test_failed_audit_commit_is_retried_before_old_job_cleanup(tmp_path, m
         assert audit_health.healthy
         assert repository.get_job(finished.job_id) is None
         assert _audit(database, finished.start_audit_event_id) == (
-            "failed", "unknown", "job_timeout"
+            "failed", "not_dispatched", "job_timeout"
         )
     finally:
         await service.shutdown()
@@ -410,6 +503,30 @@ async def test_concurrency_semaphore_is_shared_across_jobs(tmp_path):
     finally:
         release.set()
         await service.shutdown()
+        engine.dispose()
+
+
+@pytest.mark.integration
+def test_discovery_dispatch_merge_is_durable_and_monotonic(tmp_path):
+    database = tmp_path / "manager.db"
+    run_control_plane_migrations(database)
+    engine = create_sqlite_engine(database)
+    repository = DiscoveryRepository(engine)
+    now = datetime.now(UTC)
+    job = DiscoveryJob(
+        "dispatch-priority", "lab", DiscoveryState.QUEUED, 1, 0, 0, False, None,
+        _audit_id(database), now + timedelta(seconds=120), now, now,
+    )
+    try:
+        repository.create_job(job)
+        repository.claim(job.job_id, now=now)
+        repository.merge_dispatch(job.job_id, "unknown", now=now)
+        repository.merge_dispatch(job.job_id, "not_dispatched", now=now)
+        assert repository.get_job(job.job_id).aggregate_dispatch_state.value == "unknown"
+        repository.merge_dispatch(job.job_id, "dispatched", now=now)
+        repository.merge_dispatch(job.job_id, "unknown", now=now)
+        assert repository.get_job(job.job_id).aggregate_dispatch_state.value == "dispatched"
+    finally:
         engine.dispose()
 
 

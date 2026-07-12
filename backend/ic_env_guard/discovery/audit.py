@@ -11,12 +11,7 @@ class DiscoveryAuditOutcomeRecorder:
 
     def __call__(self, job: DiscoveryJob) -> None:
         success = job.state is DiscoveryState.COMPLETED
-        if job.checked_targets:
-            dispatch_state = "dispatched"
-        elif job.state is DiscoveryState.CANCELLED:
-            dispatch_state = "not_dispatched"
-        else:
-            dispatch_state = "unknown"
+        dispatch_state = job.aggregate_dispatch_state.value
         failure_category = None
         if job.state is DiscoveryState.CANCELLED:
             failure_category = "discovery_cancelled"

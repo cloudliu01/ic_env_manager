@@ -6,6 +6,7 @@ from uuid import uuid4
 from sqlalchemy.exc import SQLAlchemyError
 
 from ic_env_guard.discovery.models import (
+    DiscoveryDispatchState,
     DiscoveryFingerprint,
     DiscoveryJob,
     DiscoveryResult,
@@ -17,7 +18,7 @@ from ic_env_guard.storage.manager_registry import _format_time, _parse_time, _SQ
 
 _JOB_COLUMNS = (
     "job_id,scope_id,state,total_targets,checked_targets,found_targets,"
-    "cancel_requested,safe_error_code,start_audit_event_id,deadline_at,"
+    "cancel_requested,aggregate_dispatch_state,safe_error_code,start_audit_event_id,deadline_at,"
     "created_at,updated_at,completed_at"
 )
 
@@ -60,9 +61,10 @@ class DiscoveryRepository(_SQLiteRepository):
                     raise RegistryConflict("discovery_capacity")
                 connection.execute(
                     "INSERT INTO discovery_jobs(job_id,scope_id,state,total_targets,"
-                    "checked_targets,found_targets,cancel_requested,safe_error_code,"
+                    "checked_targets,found_targets,cancel_requested,aggregate_dispatch_state,"
+                    "safe_error_code,"
                     "start_audit_event_id,deadline_at,created_at,updated_at,completed_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         job.job_id,
                         job.scope_id,
@@ -71,6 +73,7 @@ class DiscoveryRepository(_SQLiteRepository):
                         job.checked_targets,
                         job.found_targets,
                         int(job.cancel_requested),
+                        job.aggregate_dispatch_state.value,
                         job.safe_error_code,
                         job.start_audit_event_id,
                         _format_time(job.deadline_at),
@@ -83,6 +86,34 @@ class DiscoveryRepository(_SQLiteRepository):
         except RegistryConflict:
             raise
         except (SQLAlchemyError, sqlite3.Error) as exc:
+            raise RegistryError("discovery storage unavailable") from exc
+
+    def merge_dispatch(
+        self,
+        job_id: str,
+        state: DiscoveryDispatchState | str,
+        *,
+        now: datetime,
+    ) -> DiscoveryJob:
+        try:
+            incoming = DiscoveryDispatchState(state)
+            with self._write() as connection:
+                connection.execute(
+                    "UPDATE discovery_jobs SET aggregate_dispatch_state=CASE "
+                    "WHEN aggregate_dispatch_state='dispatched' OR ?='dispatched' "
+                    "THEN 'dispatched' "
+                    "WHEN aggregate_dispatch_state='unknown' OR ?='unknown' THEN 'unknown' "
+                    "ELSE 'not_dispatched' END,updated_at=? "
+                    "WHERE job_id=? AND state='running'",
+                    (incoming.value, incoming.value, _format_time(now), job_id),
+                )
+            job = self.get_job(job_id)
+            if job is None:
+                raise RegistryConflict("discovery_job_not_found")
+            return job
+        except RegistryConflict:
+            raise
+        except (SQLAlchemyError, sqlite3.Error, ValueError) as exc:
             raise RegistryError("discovery storage unavailable") from exc
 
     def get_job(self, job_id: str) -> DiscoveryJob | None:
@@ -233,6 +264,12 @@ class DiscoveryRepository(_SQLiteRepository):
     ) -> None:
         try:
             with self._write() as connection:
+                active = connection.execute(
+                    "SELECT 1 FROM discovery_jobs WHERE job_id=? AND state='running'",
+                    (job_id,),
+                ).fetchone()
+                if active is None:
+                    return
                 connection.execute(
                     "INSERT INTO discovery_results(result_id,job_id,canonical_url,ip,port,"
                     "transport_profile_id,fingerprint_version,found,safe_error_code,"
@@ -276,10 +313,12 @@ class DiscoveryRepository(_SQLiteRepository):
         safe_error_code: str | None = None,
     ) -> DiscoveryJob:
         try:
+            cancel_condition = "1" if state is DiscoveryState.CANCELLED else "0"
             with self._write() as connection:
                 connection.execute(
                     "UPDATE discovery_jobs SET state=?,safe_error_code=?,updated_at=?,"
-                    "completed_at=? WHERE job_id=? AND state IN ('queued','running')",
+                    "completed_at=? WHERE job_id=? AND state IN ('queued','running') "
+                    f"AND cancel_requested={cancel_condition}",
                     (
                         state.value,
                         safe_error_code,
@@ -337,10 +376,12 @@ def _job(row) -> DiscoveryJob:
     return DiscoveryJob(
         job_id=row[0], scope_id=row[1], state=DiscoveryState(row[2]),
         total_targets=row[3], checked_targets=row[4], found_targets=row[5],
-        cancel_requested=bool(row[6]), safe_error_code=row[7],
-        start_audit_event_id=row[8], deadline_at=_parse_time(row[9]),
-        created_at=_parse_time(row[10]), updated_at=_parse_time(row[11]),
-        completed_at=_parse_time(row[12]) if row[12] else None,
+        cancel_requested=bool(row[6]),
+        aggregate_dispatch_state=DiscoveryDispatchState(row[7]),
+        safe_error_code=row[8], start_audit_event_id=row[9],
+        deadline_at=_parse_time(row[10]), created_at=_parse_time(row[11]),
+        updated_at=_parse_time(row[12]),
+        completed_at=_parse_time(row[13]) if row[13] else None,
     )
 
 

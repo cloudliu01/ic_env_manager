@@ -11,6 +11,12 @@ class DiscoveryState(str, Enum):
     FAILED = "failed"
 
 
+class DiscoveryDispatchState(str, Enum):
+    NOT_DISPATCHED = "not_dispatched"
+    UNKNOWN = "unknown"
+    DISPATCHED = "dispatched"
+
+
 @dataclass(frozen=True)
 class DiscoveryTarget:
     ip: str
@@ -44,6 +50,9 @@ class DiscoveryJob:
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None = None
+    aggregate_dispatch_state: DiscoveryDispatchState = (
+        DiscoveryDispatchState.NOT_DISPATCHED
+    )
 
 
 @dataclass(frozen=True)

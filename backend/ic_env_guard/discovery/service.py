@@ -81,15 +81,20 @@ class DiscoveryService:
         )
         return job
 
-    def cancel(self, job_id: str) -> DiscoveryJob:
+    async def cancel(self, job_id: str) -> DiscoveryJob:
         now = self._clock()
         self.repository.request_cancel(job_id, now=now)
-        finished = self.repository.finish(job_id, DiscoveryState.CANCELLED, now=now)
-        if self._outcome_recorder is not None:
-            self._outcome_recorder(finished)
         task = self._tasks.get(job_id)
         if task is not None:
             task.cancel()
+            await asyncio.wait(
+                {task}, timeout=min(2.0, self.config.fingerprint_timeout_seconds)
+            )
+        finished = self.repository.finish(
+            job_id, DiscoveryState.CANCELLED, now=self._clock()
+        )
+        if self._outcome_recorder is not None:
+            self._outcome_recorder(finished)
         return finished
 
     def scopes(self):
@@ -228,8 +233,24 @@ class DiscoveryService:
                         now=self._clock(),
                     )
                     continue
+                profile = self._profiles.get(target.transport_profile_id)
+                expected_scheme = (
+                    "http" if isinstance(profile, TrustedLanHttpProfile) else "https"
+                )
+                if profile is None or target.scheme != expected_scheme:
+                    self.repository.record_result(
+                        job_id,
+                        target,
+                        None,
+                        "transport_profile_mismatch",
+                        now=self._clock(),
+                    )
+                    continue
                 try:
                     async with self._semaphore:
+                        self.repository.merge_dispatch(
+                            job_id, "unknown", now=self._clock()
+                        )
                         fingerprint = await asyncio.wait_for(
                             self.fingerprinter.probe(
                                 target,
@@ -241,11 +262,18 @@ class DiscoveryService:
                                 max(0.001, deadline - monotonic()),
                             ),
                         )
+                        self.repository.merge_dispatch(
+                            job_id, "dispatched", now=self._clock()
+                        )
                     if fingerprint is None:
                         error = "fingerprint_mismatch"
                 except TimeoutError:
                     error = "timeout"
                 except DiscoveryProbeError as exc:
+                    if exc.code in {"network_error", "fingerprint_too_large"}:
+                        self.repository.merge_dispatch(
+                            job_id, "dispatched", now=self._clock()
+                        )
                     error = (
                         exc.code
                         if exc.code in _SAFE_PROBE_ERRORS
@@ -274,5 +302,9 @@ class DiscoveryService:
         finished = self.repository.finish(
             job_id, state, now=self._clock(), safe_error_code=error
         )
-        if self._outcome_recorder is not None:
+        if self._outcome_recorder is not None and finished.state in {
+            DiscoveryState.COMPLETED,
+            DiscoveryState.CANCELLED,
+            DiscoveryState.FAILED,
+        }:
             self._outcome_recorder(finished)
