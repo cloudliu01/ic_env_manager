@@ -5,7 +5,8 @@ import re
 import signal
 import socket
 import time
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from ipaddress import IPv4Address, IPv6Address, ip_address
 from pathlib import Path
 from typing import Any, TextIO
@@ -146,7 +147,7 @@ def run_cli_enrollment(
             "ssh": ssh,
             "pinned_address": str(pinned),
         }
-        client = _connect_manager(manager_socket, header)
+        client = _connect_manager(manager_socket, header, timeout_seconds=3)
         ready = _read_object(client, 4096)
         _validate_ready(ready)
         profile = TrustedLanHttpProfile(
@@ -184,7 +185,8 @@ def run_cli_enrollment(
             )
         )
         helper = parse_response(helper_payload)
-        result_frame = (
+        helper_expires_at = helper.expires_at
+        result_frame = bytearray(
             json.dumps(
                 {
                     "protocol": "manager-cli-enrollment.result.v1",
@@ -203,7 +205,7 @@ def run_cli_enrollment(
             initial_header=header,
             ready=ready,
             result_frame=result_frame,
-            total_timeout_seconds=total_timeout_seconds,
+            helper_expires_at=helper_expires_at,
         )
         client = None
         stdout.write("Enrollment verified.\n")
@@ -322,11 +324,14 @@ def _send_object(client: socket.socket, value: dict[str, object]) -> None:
 
 
 def _connect_manager(
-    manager_socket: Path, header: dict[str, object]
+    manager_socket: Path,
+    header: dict[str, object],
+    *,
+    timeout_seconds: float,
 ) -> socket.socket:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        client.settimeout(3)
+        client.settimeout(timeout_seconds)
         client.connect(str(manager_socket))
         _send_object(client, header)
         return client
@@ -358,56 +363,111 @@ def _submit_result_with_resume(
     manager_socket: Path,
     initial_header: dict[str, object],
     ready: dict[str, object],
-    result_frame: bytes,
-    total_timeout_seconds: float,
+    result_frame: bytes | bytearray,
+    helper_expires_at: datetime,
+    per_attempt_timeout_seconds: float = 3.0,
+    safety_margin_seconds: float = 1.0,
+    utcnow: Callable[[], datetime] | None = None,
+    monotonic: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> None:
+    utcnow = utcnow or (lambda: datetime.now(UTC))
+    monotonic = monotonic or time.monotonic
+    sleep = sleep or time.sleep
+    if (
+        not 0 < per_attempt_timeout_seconds <= 30
+        or not 0 <= safety_margin_seconds <= 5
+    ):
+        client.close()
+        raise CliEnrollmentError("enrollment_rejected")
     try:
-        expires_at = datetime.fromisoformat(str(ready["expires_at"]).replace("Z", "+00:00"))
-        if expires_at.tzinfo is None:
+        manager_expires_at = datetime.fromisoformat(
+            str(ready["expires_at"]).replace("Z", "+00:00")
+        )
+        if (
+            manager_expires_at.tzinfo is None
+            or helper_expires_at.tzinfo is None
+        ):
             raise ValueError
     except (TypeError, ValueError):
         client.close()
         raise CliEnrollmentError("enrollment_rejected") from None
-    deadline = min(
-        time.monotonic() + total_timeout_seconds,
-        time.monotonic() + max(0.0, (expires_at - datetime.now(UTC)).total_seconds()),
+    cutoff = min(manager_expires_at, helper_expires_at) - timedelta(
+        seconds=safety_margin_seconds
     )
+    start = monotonic()
+    deadline = start + max(0.0, (cutoff - utcnow()).total_seconds())
     resume_header = {**initial_header, "resume_nonce": ready["nonce"]}
     current: socket.socket | None = client
-    for attempt in range(5):
-        try:
-            if current is None:
-                current = _connect_manager(manager_socket, resume_header)
+    frame = result_frame if isinstance(result_frame, bytearray) else bytearray(result_frame)
+    backoff = 0.1
+    try:
+        while True:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise CliEnrollmentError("enrollment_rejected")
+            attempt_timeout = min(per_attempt_timeout_seconds, remaining)
+            try:
+                if current is None:
+                    current = _connect_manager(
+                        manager_socket,
+                        resume_header,
+                        timeout_seconds=attempt_timeout,
+                    )
+                    _set_socket_timeout(current, deadline, monotonic, per_attempt_timeout_seconds)
+                    response = _read_object(current, 4096)
+                    if response.get("protocol") == "manager-cli-enrollment.accepted.v1":
+                        if set(response) != {
+                            "protocol",
+                            "status",
+                            "enrollment_id",
+                        } or response.get("status") != "already_accepted":
+                            raise ValueError("permanent enrollment rejection")
+                        current.close()
+                        current = None
+                        return
+                    _validate_ready(response, expected=ready)
+                _set_socket_timeout(current, deadline, monotonic, per_attempt_timeout_seconds)
+                current.sendall(frame)
+                current.shutdown(socket.SHUT_WR)
+                _set_socket_timeout(current, deadline, monotonic, per_attempt_timeout_seconds)
                 response = _read_object(current, 4096)
-                if response.get("protocol") == "manager-cli-enrollment.accepted.v1":
-                    if set(response) != {
-                        "protocol",
-                        "status",
-                        "enrollment_id",
-                    } or response.get("status") != "already_accepted":
-                        raise ValueError("permanent enrollment rejection")
-                    current.close()
-                    return
-                _validate_ready(response, expected=ready)
-            current.sendall(result_frame)
-            current.shutdown(socket.SHUT_WR)
-            response = _read_object(current, 4096)
-            if response.get("status") != "verified":
-                raise ValueError("permanent enrollment rejection")
-            current.close()
-            return
-        except (OSError, CliEnrollmentError):
-            if current is not None:
+                if response.get("status") != "verified":
+                    raise ValueError("permanent enrollment rejection")
                 current.close()
                 current = None
-            if attempt == 4 or time.monotonic() >= deadline:
+                return
+            except (OSError, CliEnrollmentError):
+                if current is not None:
+                    current.close()
+                    current = None
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise CliEnrollmentError("enrollment_rejected") from None
+                delay = min(backoff, 2.0, remaining)
+                if delay <= 0:
+                    raise CliEnrollmentError("enrollment_rejected") from None
+                sleep(delay)
+                backoff = min(backoff * 2, 2.0)
+            except ValueError:
                 raise CliEnrollmentError("enrollment_rejected") from None
-            time.sleep(min(0.1 * (2**attempt), max(0.0, deadline - time.monotonic())))
-        except ValueError:
-            if current is not None:
-                current.close()
-            raise CliEnrollmentError("enrollment_rejected") from None
-    raise CliEnrollmentError("enrollment_rejected")
+    finally:
+        if current is not None:
+            current.close()
+        for index in range(len(frame)):
+            frame[index] = 0
+
+
+def _set_socket_timeout(
+    client: socket.socket,
+    deadline: float,
+    monotonic: Callable[[], float],
+    per_attempt_timeout_seconds: float,
+) -> None:
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise CliEnrollmentError("enrollment_rejected")
+    client.settimeout(min(per_attempt_timeout_seconds, remaining))
 
 
 def _read_object(client: socket.socket, limit: int) -> dict[str, object]:

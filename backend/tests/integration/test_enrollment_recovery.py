@@ -57,6 +57,7 @@ def setup_services(tmp_path, client):
         credential_store=store,
         agent_client=client,
         registry=registry,
+        clock=lambda: NOW,
     )
     return orchestrator, jobs, journal, registry, store, engine
 
@@ -557,7 +558,7 @@ async def test_registry_commit_then_consumed_fence_fault_converges_on_restart(
         lost = journal.get(pending.enrollment_id)
         assert lost.state is EnrollmentState.ACTIVATED
         monkeypatch.setattr(orchestrator, "_transition_claimed", real_transition)
-        orchestrator._now = lambda: lost.recovery_lease_until + timedelta(seconds=1)
+        orchestrator._clock = lambda: lost.recovery_lease_until + timedelta(seconds=1)
 
         await orchestrator.recover()
 
@@ -993,7 +994,7 @@ async def test_recovery_renews_one_second_lease_during_slow_network_call(tmp_pat
         elapsed = asyncio.get_running_loop().time() - monotonic_origin
         return wall_origin + timedelta(seconds=elapsed)
 
-    first._now = clock
+    first._clock = clock
     second = EnrollmentOrchestrator(
         jobs=jobs,
         journal=journal,

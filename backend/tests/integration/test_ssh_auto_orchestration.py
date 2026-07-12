@@ -425,8 +425,10 @@ async def test_cancel_fences_background_before_helper_result_can_write_credentia
         created = orchestrator.create_auto(request(), AUDIT_CONTEXT)
         await started.wait()
 
-        cancelled = await orchestrator.cancel(created.job.enrollment_id)
-        release.set()
+        try:
+            cancelled = await orchestrator.cancel(created.job.enrollment_id)
+        finally:
+            release.set()
         await orchestrator.wait_for_background()
 
         current = journal.get(created.job.enrollment_id)
@@ -435,6 +437,7 @@ async def test_cancel_fences_background_before_helper_result_can_write_credentia
         assert current.credential_temp_ref is None
         assert store.puts == 0
     finally:
+        release.set()
         await orchestrator.shutdown()
         engine.dispose()
 
@@ -583,6 +586,27 @@ def test_auto_audit_uses_independent_durable_intent_and_outcome(tmp_path):
             assert row.failure_category == "ssh_auth_failed"
             assert TOKEN.decode() not in repr(row.to_safe_dict())
     finally:
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_injected_clock_controls_public_create_get_and_cancel(tmp_path):
+    orchestrator, _jobs, _journal, _store, _client, engine = setup_services(
+        tmp_path, Adapter()
+    )
+    try:
+        created = orchestrator.create(request())
+        assert created.job.created_at == NOW
+        assert created.job.expires_at == NOW + timedelta(minutes=10)
+
+        loaded = orchestrator.get(created.job.enrollment_id)
+        assert loaded.job.state is EnrollmentState.PENDING
+
+        cancelled = await orchestrator.cancel(created.job.enrollment_id)
+        assert cancelled.job.state is EnrollmentState.CANCELLED
+        assert cancelled.job.updated_at == NOW
+    finally:
+        await orchestrator.shutdown()
         engine.dispose()
 
 

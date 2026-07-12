@@ -160,7 +160,7 @@ class EnrollmentOrchestrator:
         self.credential_store = credential_store
         self.agent_client = agent_client
         self.registry = registry
-        self._now = clock or (lambda: datetime.now(UTC))
+        self._clock = clock or (lambda: datetime.now(UTC))
         self.ssh_adapter = ssh_adapter
         self.service_key_adapter = service_key_adapter
         self._service_key_configured = service_key_configured
@@ -176,7 +176,7 @@ class EnrollmentOrchestrator:
         self._recovery_lease_seconds = max(3, math.ceil(float(max_operation) * 2))
 
     def create(self, request: EnrollmentJobRequest) -> EnrollmentPublicResult:
-        return EnrollmentPublicResult(self.jobs.create(request))
+        return EnrollmentPublicResult(self.jobs.create(request, now=self._clock()))
 
     def create_auto(
         self,
@@ -189,7 +189,7 @@ class EnrollmentOrchestrator:
             else EnrollmentMethod.SSH_AUTO
         )
         request = replace(request, enrollment_method=method)
-        pending = self.jobs.create(request, now=self._now())
+        pending = self.jobs.create(request, now=self._clock())
         adapter = (
             self.service_key_adapter
             if method is EnrollmentMethod.SSH_SERVICE_KEY
@@ -202,13 +202,13 @@ class EnrollmentOrchestrator:
                     state=EnrollmentState.AWAITING_CLI,
                     enrollment_method=EnrollmentMethod.SSH_CLI,
                     last_error_code="ssh_unavailable",
-                    updated_at=self._now(),
+                    updated_at=self._clock(),
                 ),
                 expected_state=EnrollmentState.PENDING,
             )
             return EnrollmentPublicResult(awaiting)
         running = self.journal.claim_pending_auto(
-            pending.enrollment_id, now=self._now()
+            pending.enrollment_id, now=self._clock()
         )
         if running is None:
             current = self.journal.get(pending.enrollment_id)
@@ -237,7 +237,8 @@ class EnrollmentOrchestrator:
 
     def get(self, enrollment_id: str) -> EnrollmentPublicResult:
         return EnrollmentPublicResult(
-            self.jobs.get(enrollment_id), self._validation_cache.get(enrollment_id)
+            self.jobs.get(enrollment_id, now=self._clock()),
+            self._validation_cache.get(enrollment_id),
         )
 
     async def cancel(self, enrollment_id: str) -> EnrollmentPublicResult:
@@ -246,7 +247,9 @@ class EnrollmentOrchestrator:
             task.cancel()
         with self.credential_store.lifecycle_lease():
             return EnrollmentPublicResult(
-                self._cleanup_terminal(self.jobs.cancel(enrollment_id))
+                self._cleanup_terminal(
+                    self.jobs.cancel(enrollment_id, now=self._clock())
+                )
             )
 
     def begin_cli_submission(
@@ -275,7 +278,7 @@ class EnrollmentOrchestrator:
                 "audit_unavailable", dispatch_state="not_dispatched"
             ) from None
         try:
-            job = self.jobs.get(enrollment_id, now=self._now())
+            job = self.jobs.get(enrollment_id, now=self._clock())
             if (job.ssh_user, job.ssh_host, job.ssh_port) != (
                 ssh_user,
                 ssh_host,
@@ -362,7 +365,7 @@ class EnrollmentOrchestrator:
                     job.state is EnrollmentState.RUNNING
                     and job.recovery_owner == resume_nonce
                     and job.recovery_lease_until is not None
-                    and job.recovery_lease_until > self._now()
+                    and job.recovery_lease_until > self._clock()
                 ):
                     return CliSubmissionClaim(
                         job=job,
@@ -398,7 +401,7 @@ class EnrollmentOrchestrator:
                     cli_peer_uid=peer_uid,
                     cli_input_fingerprint=expected_fingerprint,
                     cli_pinned_address=pinned_address,
-                    updated_at=self._now(),
+                    updated_at=self._clock(),
                 ),
                 expected_state=EnrollmentState.AWAITING_CLI,
             )
@@ -456,7 +459,7 @@ class EnrollmentOrchestrator:
             raise EnrollmentValidationError(
                 "agent_enrollment_input_changed", dispatch_state="dispatched"
             )
-        now = self._now()
+        now = self._clock()
         current = self.journal.recheck_cli_submission(
             claim.job.enrollment_id,
             owner=claim.nonce,
@@ -528,7 +531,7 @@ class EnrollmentOrchestrator:
             transport_profile_id=request.transport_profile_id,
             enrollment_method=EnrollmentMethod.LEGACY_ADMIN_TOKEN,
         )
-        job = self.jobs.create(job_request)
+        job = self.jobs.create(job_request, now=self._clock())
         reference = None
         try:
             with self.credential_store.lifecycle_lease():
@@ -536,7 +539,7 @@ class EnrollmentOrchestrator:
                 issued = replace(
                     job,
                     state=EnrollmentState.RUNNING,
-                    updated_at=datetime.now(UTC),
+                    updated_at=self._clock(),
                 )
                 issued = self.journal.replace_if_state(
                     issued, expected_state=EnrollmentState.PENDING
@@ -546,19 +549,19 @@ class EnrollmentOrchestrator:
                         issued,
                         state=EnrollmentState.CREDENTIAL_ISSUED,
                         credential_temp_ref=reference,
-                        updated_at=datetime.now(UTC),
+                        updated_at=self._clock(),
                     ),
                     expected_state=EnrollmentState.RUNNING,
                 )
             verifying = self.journal.replace_if_state(
-                replace(issued, state=EnrollmentState.VERIFYING, updated_at=datetime.now(UTC)),
+                replace(issued, state=EnrollmentState.VERIFYING, updated_at=self._clock()),
                 expected_state=EnrollmentState.CREDENTIAL_ISSUED,
             )
             validation = await self.agent_client.validate_legacy(
                 target, self.credential_store.read(reference)
             )
             verified = self.journal.replace_if_state(
-                replace(verifying, state=EnrollmentState.VERIFIED, updated_at=datetime.now(UTC)),
+                replace(verifying, state=EnrollmentState.VERIFIED, updated_at=self._clock()),
                 expected_state=EnrollmentState.VERIFYING,
             )
             self._validation_cache[verified.enrollment_id] = validation
@@ -576,7 +579,7 @@ class EnrollmentOrchestrator:
                                 if isinstance(exc, EnrollmentValidationError)
                                 else "credential_store_unavailable"
                             ),
-                            updated_at=datetime.now(UTC),
+                            updated_at=self._clock(),
                         ),
                         expected_state=current.state,
                     )
@@ -590,11 +593,11 @@ class EnrollmentOrchestrator:
             raise
 
     async def recover(self) -> None:
-        for enrollment_id in self.journal.prepare_recovery(now=self._now()):
+        for enrollment_id in self.journal.prepare_recovery(now=self._clock()):
             job = self.journal.claim_recovery(
                 enrollment_id,
                 owner=self._recovery_owner,
-                now=self._now(),
+                now=self._clock(),
                 lease_seconds=self._recovery_lease_seconds,
             )
             if job is None:
@@ -654,7 +657,7 @@ class EnrollmentOrchestrator:
                 self._converge_auto(job.enrollment_id, "audit_unavailable")
                 return
             dispatch_job = self.journal.recheck_auto_dispatch(
-                job.enrollment_id, now=self._now()
+                job.enrollment_id, now=self._clock()
             )
             if dispatch_job is None:
                 self._record_auto_outcome(
@@ -785,7 +788,7 @@ class EnrollmentOrchestrator:
                         validated_http_address=str(
                             helper.validation_target.pinned_address
                         ),
-                        updated_at=self._now(),
+                        updated_at=self._clock(),
                     ),
                     expected_state=EnrollmentState.RUNNING,
                 )
@@ -797,7 +800,7 @@ class EnrollmentOrchestrator:
             replace(
                 issued,
                 state=EnrollmentState.VERIFYING,
-                updated_at=self._now(),
+                updated_at=self._clock(),
             ),
             expected_state=EnrollmentState.CREDENTIAL_ISSUED,
         )
@@ -819,7 +822,7 @@ class EnrollmentOrchestrator:
             replace(
                 verifying,
                 state=EnrollmentState.VERIFIED,
-                updated_at=self._now(),
+                updated_at=self._clock(),
             ),
             expected_state=EnrollmentState.VERIFYING,
         )
@@ -854,19 +857,19 @@ class EnrollmentOrchestrator:
                         recovery_owner=None,
                         recovery_lease_until=None,
                         recovery_revision=current.recovery_revision + 1,
-                        updated_at=self._now(),
+                        updated_at=self._clock(),
                     ),
                     expected_state=EnrollmentState.RUNNING,
                     expected_recovery_owner=current.recovery_owner,
                     expected_recovery_revision=current.recovery_revision,
-                    recovery_now=self._now(),
+                    recovery_now=self._clock(),
                 )
         except Exception:
             if reference is not None:
                 self.credential_store.delete_if_exists(reference)
             raise
         verifying = self.journal.replace_if_state(
-            replace(issued, state=EnrollmentState.VERIFYING, updated_at=self._now()),
+            replace(issued, state=EnrollmentState.VERIFYING, updated_at=self._clock()),
             expected_state=EnrollmentState.CREDENTIAL_ISSUED,
         )
         if self.agent_client is None:
@@ -879,7 +882,7 @@ class EnrollmentOrchestrator:
             helper_instance_id=helper.instance_id,
         )
         verified = self.journal.replace_if_state(
-            replace(verifying, state=EnrollmentState.VERIFIED, updated_at=self._now()),
+            replace(verifying, state=EnrollmentState.VERIFIED, updated_at=self._clock()),
             expected_state=EnrollmentState.VERIFYING,
         )
         self._validation_cache[verified.enrollment_id] = validation
@@ -900,7 +903,7 @@ class EnrollmentOrchestrator:
                     current,
                     state=state,
                     last_error_code=code,
-                    updated_at=self._now(),
+                    updated_at=self._clock(),
                 ),
                 expected_state=EnrollmentState.RUNNING,
             )
@@ -985,7 +988,7 @@ class EnrollmentOrchestrator:
                 current.enrollment_id,
                 owner=self._recovery_owner,
                 expected_revision=current.recovery_revision,
-                now=self._now(),
+                now=self._clock(),
             ):
                 self._validation_cache[current.enrollment_id] = validation
             return
@@ -1034,7 +1037,7 @@ class EnrollmentOrchestrator:
                 job.enrollment_id,
                 owner=self._recovery_owner,
                 expected_revision=job.recovery_revision,
-                now=self._now(),
+                now=self._clock(),
                 lease_seconds=self._recovery_lease_seconds,
             )
         except RegistryError:
@@ -1047,7 +1050,7 @@ class EnrollmentOrchestrator:
         *,
         clear_claim: bool = False,
     ) -> EnrollmentJob | None:
-        now = self._now()
+        now = self._clock()
         clear_cli = state in {
             EnrollmentState.CANCELLED,
             EnrollmentState.EXPIRED,
@@ -1112,7 +1115,7 @@ class EnrollmentOrchestrator:
                 owner=self._recovery_owner,
                 expected_revision=job.recovery_revision,
                 error_code=code,
-                now=self._now(),
+                now=self._clock(),
             )
         except RegistryError:
             return
@@ -1195,8 +1198,8 @@ class EnrollmentOrchestrator:
             enabled=True,
             source="manual",
             revision=1,
-            created_at=self._now(),
-            updated_at=self._now(),
+            created_at=self._clock(),
+            updated_at=self._clock(),
         )
         with self.credential_store.lifecycle_lease():
             try:
@@ -1227,13 +1230,13 @@ class EnrollmentOrchestrator:
                     job.enrollment_id,
                     state=job.state,
                     expected_reference=reference,
-                    now=datetime.now(UTC),
+                    now=self._clock(),
                 )
             return self.journal.finish_terminal_cleanup(
                 job.enrollment_id,
                 state=job.state,
                 expected_reference=reference,
-                now=datetime.now(UTC),
+                now=self._clock(),
             )
 
     async def recover_and_cleanup(self) -> None:
@@ -1266,13 +1269,13 @@ class EnrollmentOrchestrator:
                             state=EnrollmentState.AWAITING_CLI,
                             enrollment_method=EnrollmentMethod.SSH_CLI,
                             last_error_code="ssh_unavailable",
-                            updated_at=self._now(),
+                            updated_at=self._clock(),
                         ),
                         expected_state=EnrollmentState.PENDING,
                     )
                     continue
                 running = self.journal.claim_pending_auto(
-                    job.enrollment_id, now=self._now()
+                    job.enrollment_id, now=self._clock()
                 )
                 if running is None:
                     continue
@@ -1300,7 +1303,7 @@ class EnrollmentOrchestrator:
                         recovery_owner=None,
                         recovery_lease_until=None,
                         recovery_revision=job.recovery_revision + 1,
-                        updated_at=self._now(),
+                        updated_at=self._clock(),
                     ),
                     expected_state=EnrollmentState.RUNNING,
                 )

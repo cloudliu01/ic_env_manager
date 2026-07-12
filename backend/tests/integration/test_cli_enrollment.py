@@ -222,6 +222,9 @@ def _socket_line(connection):
 
 def test_cli_resume_retries_transient_manager_reconnect_failure(monkeypatch, tmp_path):
     class BrokenResultSocket:
+        def settimeout(self, _timeout):
+            return None
+
         def sendall(self, _payload):
             raise OSError("reply path lost")
 
@@ -229,15 +232,20 @@ def test_cli_resume_retries_transient_manager_reconnect_failure(monkeypatch, tmp
             return None
 
     class AcceptedSocket:
+        def settimeout(self, _timeout):
+            return None
+
         def close(self):
             return None
 
     accepted = AcceptedSocket()
+    clock = _ManualClock(datetime(2026, 7, 12, 12, 0, tzinfo=UTC))
     attempts = []
 
-    def reconnect(_path, _header):
+    def reconnect(_path, _header, *, timeout_seconds):
         attempts.append(1)
-        if len(attempts) == 1:
+        assert 0 < timeout_seconds <= 0.5
+        if clock.monotonic() < 1.6:
             raise OSError("manager restarting")
         return accepted
 
@@ -268,11 +276,154 @@ def test_cli_resume_retries_transient_manager_reconnect_failure(monkeypatch, tmp
             "enrollment_id": "enrollment-1",
             "input_fingerprint": "f" * 64,
             "nonce": "22222222-2222-4222-8222-222222222222",
-            "expires_at": (datetime.now(UTC) + timedelta(minutes=1)).isoformat(),
+            "expires_at": (clock.utcnow() + timedelta(minutes=1)).isoformat(),
             "host_key_policy": "ask",
         },
         result_frame=b"secret-result-once\n",
-        total_timeout_seconds=2,
+        helper_expires_at=clock.utcnow() + timedelta(minutes=1),
+        per_attempt_timeout_seconds=0.5,
+        safety_margin_seconds=1,
+        utcnow=clock.utcnow,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
     )
 
-    assert len(attempts) == 2
+    assert len(attempts) >= 5
+    assert clock.monotonic() >= 1.6
+
+
+@pytest.mark.parametrize(
+    ("manager_seconds", "helper_seconds"),
+    [(10, 3), (3, 10)],
+    ids=["helper-deadline", "manager-deadline"],
+)
+def test_cli_resume_uses_earliest_deadline_without_busy_loop(
+    monkeypatch, tmp_path, manager_seconds, helper_seconds
+):
+    class BrokenResultSocket:
+        def settimeout(self, _timeout):
+            return None
+
+        def sendall(self, _payload):
+            raise OSError("manager down")
+
+        def close(self):
+            return None
+
+    clock = _ManualClock(datetime(2026, 7, 12, 12, 0, tzinfo=UTC))
+    attempts = []
+    result = bytearray(b"token-only-in-memory\n")
+
+    def always_down(_path, _header, *, timeout_seconds):
+        attempts.append(timeout_seconds)
+        clock.advance(timeout_seconds)
+        raise TimeoutError("manager down")
+
+    monkeypatch.setattr("ic_env_guard.enrollment.cli._connect_manager", always_down)
+
+    with pytest.raises(CliEnrollmentError, match="enrollment_rejected"):
+        _submit_result_with_resume(
+            client=BrokenResultSocket(),
+            manager_socket=tmp_path / "manager.sock",
+            initial_header={
+                "protocol": "manager-cli-enrollment.header.v1",
+                "enrollment_id": "enrollment-1",
+                "ssh": "edaops@10.20.30.40",
+                "pinned_address": "10.20.30.40",
+            },
+            ready={
+                "protocol": "manager-cli-enrollment.ready.v1",
+                "manager_id": "11111111-1111-4111-8111-111111111111",
+                "enrollment_id": "enrollment-1",
+                "input_fingerprint": "f" * 64,
+                "nonce": "22222222-2222-4222-8222-222222222222",
+                "expires_at": (
+                    clock.utcnow() + timedelta(seconds=manager_seconds)
+                ).isoformat(),
+                "host_key_policy": "ask",
+            },
+            result_frame=result,
+            helper_expires_at=clock.utcnow() + timedelta(seconds=helper_seconds),
+            per_attempt_timeout_seconds=0.5,
+            safety_margin_seconds=1,
+            utcnow=clock.utcnow,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+
+    assert clock.monotonic() == pytest.approx(2.0)
+    assert 1 < len(attempts) < 20
+    assert clock.sleeps
+    assert all(value > 0 for value in clock.sleeps)
+    assert not any(result)
+
+
+def test_cli_resume_ctrl_c_closes_socket_and_clears_mutable_result(monkeypatch, tmp_path):
+    class BrokenResultSocket:
+        closed = False
+
+        def settimeout(self, _timeout):
+            return None
+
+        def sendall(self, _payload):
+            raise OSError("manager down")
+
+        def close(self):
+            self.closed = True
+
+    clock = _ManualClock(datetime(2026, 7, 12, 12, 0, tzinfo=UTC))
+    client = BrokenResultSocket()
+    result = bytearray(b"token-only-in-memory\n")
+
+    def interrupted_sleep(_seconds):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        _submit_result_with_resume(
+            client=client,
+            manager_socket=tmp_path / "manager.sock",
+            initial_header={
+                "protocol": "manager-cli-enrollment.header.v1",
+                "enrollment_id": "enrollment-1",
+                "ssh": "edaops@10.20.30.40",
+                "pinned_address": "10.20.30.40",
+            },
+            ready={
+                "protocol": "manager-cli-enrollment.ready.v1",
+                "manager_id": "11111111-1111-4111-8111-111111111111",
+                "enrollment_id": "enrollment-1",
+                "input_fingerprint": "f" * 64,
+                "nonce": "22222222-2222-4222-8222-222222222222",
+                "expires_at": (clock.utcnow() + timedelta(minutes=1)).isoformat(),
+                "host_key_policy": "ask",
+            },
+            result_frame=result,
+            helper_expires_at=clock.utcnow() + timedelta(minutes=1),
+            utcnow=clock.utcnow,
+            monotonic=clock.monotonic,
+            sleep=interrupted_sleep,
+        )
+
+    assert client.closed is True
+    assert result == bytearray(len(result))
+
+
+class _ManualClock:
+    def __init__(self, now):
+        self.now = now
+        self.elapsed = 0.0
+        self.sleeps = []
+
+    def utcnow(self):
+        return self.now + timedelta(seconds=self.elapsed)
+
+    def monotonic(self):
+        return self.elapsed
+
+    def sleep(self, seconds):
+        assert seconds > 0
+        self.sleeps.append(seconds)
+        self.elapsed += seconds
+
+    def advance(self, seconds):
+        self.elapsed += seconds
