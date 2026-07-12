@@ -110,6 +110,15 @@ development:
   allow_insecure_http: true
 control_plane:
   audit_database: ${DEV_DIR}/control-plane.db
+  credential_directory: ${DEV_DIR}/manager-credentials
+  allowed_agent_cidrs:
+    - 127.0.0.0/8
+  transport_profiles: []
+  discovery:
+    scopes: []
+enrollment:
+  manager_socket_path: ${DEV_DIR}/manager-enrollment.sock
+  manager_socket_mode: "0600"
 agents:
   - id: local-agent
     name: Local development agent

@@ -75,6 +75,11 @@ SKIP_INSTALL=1 ./start.sh all
 
 `SKIP_INSTALL=1` skips automatic backend/frontend dependency installation checks.
 
+Manager Fleet operations, enrollment security, and grouped backup/rollback
+procedures are documented in [Manager Fleet Operations](docs/manager-fleet-operations.md),
+[Manager Enrollment Security](docs/manager-enrollment-security.md), and
+[Manager Backup and Rollback](docs/manager-backup-and-rollback.md).
+
 ## Backend Setup
 
 Use the Conda environment `venv312` for project Python tooling:

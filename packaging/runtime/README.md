@@ -26,3 +26,7 @@ Public and Local Ingest are two listeners in one process. Local Ingest is
 loopback-only and must never be reverse proxied, forwarded, published, or opened
 in a firewall. See [Agent v2 Operations](../../docs/agent-v2-operations.md) for
 account selection, producer examples, backup, migration, and rollback steps.
+Manager Fleet deployment, SSH enrollment restrictions, and grouped Manager
+database/credential recovery are in [Manager Fleet Operations](../../docs/manager-fleet-operations.md),
+[Manager Enrollment Security](../../docs/manager-enrollment-security.md), and
+[Manager Backup and Rollback](../../docs/manager-backup-and-rollback.md).

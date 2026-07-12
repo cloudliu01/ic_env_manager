@@ -110,9 +110,8 @@ async def test_legacy_credential_is_journaled_before_network_validation(tmp_path
         orchestrator._validation_cache.clear()
         await orchestrator.recover()
         recovered = orchestrator.get(result.job.enrollment_id)
-        assert recovered.job.state is EnrollmentState.FAILED
-        assert recovered.job.last_error_code == "enrollment_recovery_unavailable"
-        assert recovered.job.credential_temp_ref is None
+        assert recovered.job.state is EnrollmentState.VERIFIED
+        assert store.read(recovered.job.credential_temp_ref) == b"legacy-never-serialized"
         assert len(observations) == 1
     finally:
         engine.dispose()

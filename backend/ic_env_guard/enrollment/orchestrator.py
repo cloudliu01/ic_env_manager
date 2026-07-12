@@ -1328,6 +1328,17 @@ class EnrollmentOrchestrator:
         if not job.credential_temp_ref:
             self._fail_claim(job, "credential_store_unavailable")
             return
+        if (
+            job.enrollment_method is EnrollmentMethod.LEGACY_ADMIN_TOKEN
+            and job.state is EnrollmentState.VERIFIED
+        ):
+            self.journal.release_recovery_claim(
+                job.enrollment_id,
+                owner=self._recovery_owner,
+                expected_revision=job.recovery_revision,
+                now=self._clock(),
+            )
+            return
         if job.enrollment_method is EnrollmentMethod.LEGACY_ADMIN_TOKEN:
             self._fail_claim(job, "enrollment_recovery_unavailable")
             return
