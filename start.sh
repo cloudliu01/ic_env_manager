@@ -159,7 +159,7 @@ YAML
   fi
 
   python - "${CONFIG_FILE}" "${DEV_CONFIG_MODE}" "${BACKEND_HOST}" \
-    "${BACKEND_PORT}" "${AGENT_INGEST_PORT}" "${AGENT_PORT}" <<'PY'
+    "${BACKEND_PORT}" "${AGENT_INGEST_PORT}" "${AGENT_PORT}" "${DEV_DIR}" <<'PY'
 import sys
 from pathlib import Path
 
@@ -168,6 +168,7 @@ import yaml
 path = Path(sys.argv[1])
 mode, host = sys.argv[2:4]
 public_port, ingest_port, agent_port = map(int, sys.argv[4:7])
+dev_dir = Path(sys.argv[7])
 config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 config["mode"] = mode
 server = config.setdefault("server", {})
@@ -177,6 +178,9 @@ if mode == "agent":
     ingest = config.setdefault("ingest", {})
     ingest["bind"] = "127.0.0.1"
     ingest["port"] = ingest_port
+    enrollment = config.setdefault("enrollment", {})
+    enrollment["socket_path"] = str(dev_dir / "agent-enrollment.sock")
+    enrollment.setdefault("socket_mode", "0600")
 else:
     for agent in config.get("agents", []):
         if agent.get("id") == "local-agent":

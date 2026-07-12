@@ -126,9 +126,17 @@ Run `sudo packaging/install/upgrade.sh <existing-non-root-user>`. For the docume
 layout, the upgrader detects `/etc/ic-env-guard/config.yaml` plus
 `/var/lib/ic-env-guard/{token,state.db,instance-id}`, validates a staged per-user config, and
 only then stops `ic-env-guard.service` for a consistent state copy. It starts
-`ic-env-guard@<user>.service` before disabling the legacy unit. If the new instance cannot
-start, it re-enables and restarts the legacy unit and leaves the original config and recovery
-files unchanged. The project never creates the selected account and rejects root.
+and enables `ic-env-guard@<user>.service` before disabling the legacy unit. If the new instance
+cannot start, it disables and stops that instance, then re-enables and restarts the legacy unit
+while leaving the original config and recovery files unchanged. The project never creates the
+selected account and rejects root.
+
+The upgrader serializes runs with an owner-only lock and records each cutover phase in the
+owner-only `.ic-env-guard-<user>.upgrade` staging directory. State and config publish by atomic
+same-filesystem rename. If the process is killed after the marker is durable, rerun the same
+command: it recognizes its marker, restores the legacy unit, removes only its known staged or
+published copies, and retries from the unchanged legacy originals. Unknown or symlinked lock,
+staging, and final-state paths fail closed and require operator inspection.
 
 Automatic migration accepts only the paths emitted by the old installer. If the legacy config
 uses customized token or state paths, the upgrader exits before stopping the legacy service;

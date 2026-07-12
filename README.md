@@ -56,7 +56,11 @@ The wrapper creates local development files by default under:
 /tmp/ic-env-guard-dev/config.yaml
 /tmp/ic-env-guard-dev/agent.yaml
 /tmp/ic-env-guard-dev/control-plane.yaml
+/tmp/ic-env-guard-dev/agent-enrollment.sock  # ephemeral while an Agent is running
 ```
+
+Generated Agent configs set the enrollment socket inside the owner-only development directory;
+they do not depend on systemd creating `/run/ic-env-guard`.
 
 Useful overrides:
 
