@@ -147,6 +147,14 @@ running instance is stopped. It records the original active/enabled state and at
 restore that exact state after install, reload, enable, or start failure; an originally inactive
 instance is not started merely because its package was upgraded.
 
+All upgrade control files are created under an initial `umask 077`; a kill before an explicit
+`chmod` therefore cannot leave a trusted file readable by another user. Before replacing an
+existing per-user unit, the upgrader atomically publishes an owner-only backup containing the
+old bytes, mode, and active/enabled state. Failure or rerun stops the new instance, restores and
+reloads that exact unit (or removes the new unit if none existed), and then restores service
+state. Secure interrupted unit temporaries are recoverable; symlinked, misowned, or incorrectly
+mode-controlled temporaries and backups fail closed.
+
 Automatic migration accepts only the paths emitted by the old installer. If the legacy config
 uses customized token or state paths, the upgrader exits before stopping the legacy service;
 copy the grouped backup to the per-user layout, update and validate the config manually, then

@@ -56,7 +56,21 @@ def _upgrade_environment(
         "  *) exit 0 ;;\n"
         "esac\n",
     )
-    _write_executable(fake_bin / "chown", "#!/usr/bin/env bash\nexit 0\n")
+    _write_executable(
+        fake_bin / "chown",
+        "#!/usr/bin/env bash\n"
+        "target=${@: -1}\n"
+        "if [[ -n \"${INTERRUPT_BEFORE_CHMOD:-}\" "
+        "&& \"$target\" = \"$INTERRUPT_BEFORE_CHMOD\" ]]; then kill -9 \"$PPID\"; fi\n",
+    )
+    _write_executable(
+        fake_bin / "chmod",
+        "#!/usr/bin/env bash\n"
+        "target=${@: -1}\n"
+        "if [[ -n \"${INTERRUPT_BEFORE_CHMOD:-}\" "
+        "&& \"$target\" = \"$INTERRUPT_BEFORE_CHMOD\" ]]; then kill -9 \"$PPID\"; fi\n"
+        "exec /bin/chmod \"$@\"\n",
+    )
     _write_executable(
         fake_bin / "stat",
         "#!/usr/bin/env bash\n"
@@ -71,12 +85,19 @@ def _upgrade_environment(
         fake_bin / "mv",
         "#!/usr/bin/env bash\n"
         "echo \"mv $*\" >> \"$EVENT_LOG\"\n"
-        "exec /bin/mv \"$@\"\n",
+        "/bin/mv \"$@\"\n"
+        "target=${@: -1}\n"
+        "if [[ -n \"${INTERRUPT_AFTER_MV_DEST:-}\" "
+        "&& \"$target\" = \"$INTERRUPT_AFTER_MV_DEST\" ]]; then kill -9 \"$PPID\"; fi\n",
     )
     _write_executable(
         fake_bin / "install",
         "#!/usr/bin/env bash\n"
         "echo \"install $*\" >> \"$EVENT_LOG\"\n"
+        "if [[ \"${PERSISTENT_NEW_START_FAILURE:-0}\" = 1 "
+        "&& \"$*\" = *packaging/systemd/ic-env-guard@.service* ]]; then\n"
+        "  target=${@: -1}; printf 'NEW\\n' > \"$target\"; /bin/chmod 0600 \"$target\"; exit 0\n"
+        "fi\n"
         "if [[ \"${FAIL_CURRENT_STEP:-}\" = install && \"$*\" = *ic-env-guard@.service* "
         "&& ! -e \"$FAIL_ONCE_DIR/install\" ]]; then\n"
         "  touch \"$FAIL_ONCE_DIR/install\"\n"
@@ -103,6 +124,9 @@ def _upgrade_environment(
         "&& \"$*\" = \"start ic-env-guard@edaops.service\" ]]; then\n"
         "  exit 1\n"
         "fi\n"
+        "if [[ \"${PERSISTENT_NEW_START_FAILURE:-0}\" = 1 && \"$action\" = start "
+        "&& \"$unit\" = ic-env-guard@edaops.service "
+        "&& -f \"$UNIT_FILE\" && \"$(cat \"$UNIT_FILE\")\" = NEW ]]; then exit 1; fi\n"
         "if [[ \"${FAIL_CURRENT_STEP:-}\" = daemon-reload && \"$action\" = daemon-reload "
         "&& ! -e \"$FAIL_ONCE_DIR/daemon-reload\" ]]; then\n"
         "  touch \"$FAIL_ONCE_DIR/daemon-reload\"; exit 1\n"
@@ -127,6 +151,8 @@ def _upgrade_environment(
         "  phase=$(sed -n 's/^phase=//p' \"$UPGRADE_MARKER\")\n"
         "fi\n"
         "echo \"sync $phase $*\" >> \"$EVENT_LOG\"\n"
+        "if [[ -n \"${INTERRUPT_ON_SYNC_PATH:-}\" "
+        "&& \" $* \" = *\" $INTERRUPT_ON_SYNC_PATH\"* ]]; then kill -9 \"$PPID\"; fi\n"
         "if [[ -n \"${INTERRUPT_PHASE:-}\" && \"$phase\" = \"$INTERRUPT_PHASE\" ]]; then\n"
         "  kill -9 \"$PPID\"\n"
         "fi\n",
@@ -147,7 +173,12 @@ def _upgrade_environment(
             "FAIL_ONCE_DIR": str(service_state),
             "FAKE_WRONG_OWNER_PATH": "",
             "REAL_INSTALL": shutil.which("install") or "/usr/bin/install",
+            "PERSISTENT_NEW_START_FAILURE": "0",
+            "UNIT_FILE": str(root / "etc/systemd/system/ic-env-guard@.service"),
             "INTERRUPT_PHASE": "",
+            "INTERRUPT_BEFORE_CHMOD": "",
+            "INTERRUPT_ON_SYNC_PATH": "",
+            "INTERRUPT_AFTER_MV_DEST": "",
         }
     )
     return environment, root
@@ -498,6 +529,144 @@ def test_existing_user_upgrade_publishes_unit_before_stopping_active_service(tmp
     assert publish_index < reload_index < enable_index < stop_index
 
 
+def test_existing_user_upgrade_reuses_secure_owned_unit_temp(tmp_path):
+    environment, root = _upgrade_environment(tmp_path)
+    _prepare_current_user_layout(tmp_path, root, active=False, enabled=False)
+    unit_dir = root / "etc/systemd/system"
+    unit_dir.mkdir(parents=True)
+    unit_temp = unit_dir / ".ic-env-guard@.service.upgrade"
+    unit_temp.write_text("interrupted-new\n", encoding="utf-8")
+    unit_temp.chmod(0o600)
+
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not unit_temp.exists()
+
+
+def test_existing_user_persistent_new_failure_restores_old_unit_bytes_and_mode(tmp_path):
+    environment, root = _upgrade_environment(tmp_path)
+    _prepare_current_user_layout(tmp_path, root, active=True, enabled=True)
+    unit_dir = root / "etc/systemd/system"
+    unit_dir.mkdir(parents=True)
+    unit_file = unit_dir / "ic-env-guard@.service"
+    unit_file.write_text("OLD\n", encoding="utf-8")
+    unit_file.chmod(0o640)
+    environment["PERSISTENT_NEW_START_FAILURE"] = "1"
+
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert unit_file.read_text(encoding="utf-8") == "OLD\n"
+    assert unit_file.stat().st_mode & 0o777 == 0o640
+    service_state = tmp_path / "service-state"
+    assert (service_state / "active-ic-env-guard@edaops.service").is_file()
+    assert (service_state / "enabled-ic-env-guard@edaops.service").is_file()
+    assert not (unit_dir / ".ic-env-guard@.service.backup").exists()
+
+
+def test_existing_user_failure_removes_new_unit_when_original_was_absent(tmp_path):
+    environment, root = _upgrade_environment(tmp_path)
+    _prepare_current_user_layout(tmp_path, root, active=True, enabled=True)
+    unit_dir = root / "etc/systemd/system"
+    unit_dir.mkdir(parents=True)
+    unit_file = unit_dir / "ic-env-guard@.service"
+    environment["PERSISTENT_NEW_START_FAILURE"] = "1"
+
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert not unit_file.exists()
+    assert (tmp_path / "service-state/active-ic-env-guard@edaops.service").is_file()
+
+
+@pytest.mark.parametrize("window", ["backup-build", "backup-published", "new-published"])
+def test_existing_user_upgrade_recovers_unit_backup_hard_windows(tmp_path, window):
+    environment, root = _upgrade_environment(tmp_path)
+    _prepare_current_user_layout(tmp_path, root, active=True, enabled=True)
+    unit_dir = root / "etc/systemd/system"
+    unit_dir.mkdir(parents=True)
+    unit_file = unit_dir / "ic-env-guard@.service"
+    unit_file.write_text("OLD\n", encoding="utf-8")
+    unit_file.chmod(0o644)
+    backup = unit_dir / ".ic-env-guard@.service.backup"
+    if window == "backup-build":
+        backup_build = backup.with_name(backup.name + ".new")
+        environment["INTERRUPT_ON_SYNC_PATH"] = str(backup_build / "present")
+    elif window == "backup-published":
+        environment["INTERRUPT_AFTER_MV_DEST"] = str(backup)
+    else:
+        environment["INTERRUPT_AFTER_MV_DEST"] = str(unit_file)
+
+    interrupted = subprocess.run(
+        [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert interrupted.returncode != 0
+
+    environment["INTERRUPT_ON_SYNC_PATH"] = ""
+    environment["INTERRUPT_AFTER_MV_DEST"] = ""
+    recovered = subprocess.run(
+        [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    assert not backup.exists()
+    assert (tmp_path / "service-state/active-ic-env-guard@edaops.service").is_file()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "wrong-mode"])
+def test_existing_user_upgrade_refuses_unsafe_unit_backup(tmp_path, kind):
+    environment, root = _upgrade_environment(tmp_path)
+    _prepare_current_user_layout(tmp_path, root, active=False, enabled=False)
+    unit_dir = root / "etc/systemd/system"
+    unit_dir.mkdir(parents=True)
+    backup = unit_dir / ".ic-env-guard@.service.backup"
+    if kind == "symlink":
+        victim = tmp_path / "backup-victim"
+        victim.mkdir()
+        backup.symlink_to(victim, target_is_directory=True)
+    else:
+        backup.mkdir(mode=0o755)
+        (backup / "absent").touch(mode=0o600)
+
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "unsafe" in (result.stdout + result.stderr).lower()
+
+
 def test_upgrade_restarts_legacy_unit_when_new_instance_fails(tmp_path):
     environment, _root = _upgrade_environment(tmp_path, fail_new_start=True)
 
@@ -581,6 +750,43 @@ def test_upgrade_recovers_persisted_hard_interruption_on_rerun(tmp_path, phase):
     )
     assert (root / "var/lib/ic-env-guard/state.db").read_bytes() == b"legacy-state"
     assert not (root / "var/lib/ic-env-guard/.ic-env-guard-edaops.upgrade").exists()
+
+
+@pytest.mark.parametrize("target", ["lock-pid", "marker-next", "prepared", "config-temp"])
+def test_upgrade_recovers_pre_chmod_hard_interruption_on_rerun(tmp_path, target):
+    environment, root = _upgrade_environment(tmp_path)
+    paths = {
+        "lock-pid": root
+        / "var/lib/ic-env-guard/.ic-env-guard-edaops.upgrade.lock/pid",
+        "marker-next": root
+        / "var/lib/ic-env-guard/.ic-env-guard-edaops.upgrade/marker.next",
+        "prepared": root
+        / "var/lib/ic-env-guard/.ic-env-guard-edaops.upgrade/config.prepared.yaml",
+        "config-temp": root / "etc/ic-env-guard/.edaops.yaml.upgrade",
+    }
+    environment["INTERRUPT_BEFORE_CHMOD"] = str(paths[target])
+
+    interrupted = subprocess.run(
+        [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert interrupted.returncode != 0
+    assert paths[target].stat().st_mode & 0o777 == 0o600
+
+    environment["INTERRUPT_BEFORE_CHMOD"] = ""
+    recovered = subprocess.run(
+        [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    assert (root / "etc/ic-env-guard/edaops.yaml").is_file()
 
 
 def test_upgrade_rejects_concurrent_live_owner_before_service_changes(tmp_path):

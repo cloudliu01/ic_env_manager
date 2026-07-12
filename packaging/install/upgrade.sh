@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
+set -o noclobber
 
 account="${1:-}"
 if [[ -z "${account}" ]]; then
@@ -27,6 +29,11 @@ legacy_state="${state_parent}/state.db"
 legacy_token="${state_parent}/token"
 legacy_identity="${state_parent}/instance-id"
 unit_dir="${root}/etc/systemd/system"
+unit_file="${unit_dir}/ic-env-guard@.service"
+unit_temp="${unit_dir}/.ic-env-guard@.service.upgrade"
+unit_restore_temp="${unit_dir}/.ic-env-guard@.service.restore"
+unit_backup_dir="${unit_dir}/.ic-env-guard@.service.backup"
+unit_backup_build="${unit_backup_dir}.new"
 new_unit="ic-env-guard@${account}.service"
 legacy_unit="ic-env-guard.service"
 validator="${IC_ENV_GUARD_CONFIG_VALIDATE:-ic-env-guard-config}"
@@ -106,16 +113,14 @@ require_control_parent() {
 }
 
 install_unit() {
-  local unit_file="${unit_dir}/ic-env-guard@.service"
-  local unit_temp="${unit_dir}/.ic-env-guard@.service.upgrade"
   if [[ -e "${unit_dir}" || -L "${unit_dir}" ]]; then
     require_control_parent "${unit_dir}"
   fi
   install -d -m 0755 "${unit_dir}"
   require_control_parent "${unit_dir}"
   if [[ -e "${unit_temp}" || -L "${unit_temp}" ]]; then
-    echo "unsafe existing unit staging file: ${unit_temp}" >&2
-    return 1
+    require_control_file "${unit_temp}"
+    rm -f "${unit_temp}"
   fi
   if ! install -m 0600 packaging/systemd/ic-env-guard@.service "${unit_temp}"; then
     rm -f "${unit_temp}"
@@ -127,6 +132,95 @@ install_unit() {
   mv "${unit_temp}" "${unit_file}"
   chmod 0644 "${unit_file}"
   systemctl daemon-reload
+}
+
+cleanup_backup_dir() {
+  local directory="$1"
+  require_control_dir "${directory}"
+  for name in present absent mode active enabled; do
+    if [[ -e "${directory}/${name}" || -L "${directory}/${name}" ]]; then
+      require_control_file "${directory}/${name}"
+      rm -f "${directory}/${name}"
+    fi
+  done
+  rmdir "${directory}"
+}
+
+validate_backup() {
+  require_control_dir "${unit_backup_dir}"
+  if [[ -f "${unit_backup_dir}/present" ]]; then
+    require_control_file "${unit_backup_dir}/present"
+    require_control_file "${unit_backup_dir}/mode"
+    [[ ! -e "${unit_backup_dir}/absent" && ! -L "${unit_backup_dir}/absent" ]]
+  elif [[ -f "${unit_backup_dir}/absent" ]]; then
+    require_control_file "${unit_backup_dir}/absent"
+    [[ ! -e "${unit_backup_dir}/present" && ! -L "${unit_backup_dir}/present" ]]
+  else
+    return 1
+  fi
+  for name in active enabled; do
+    if [[ -e "${unit_backup_dir}/${name}" || -L "${unit_backup_dir}/${name}" ]]; then
+      require_control_file "${unit_backup_dir}/${name}"
+    fi
+  done
+}
+
+create_unit_backup() {
+  local mode
+  if [[ -e "${unit_backup_dir}" || -L "${unit_backup_dir}" \
+    || -e "${unit_backup_build}" || -L "${unit_backup_build}" ]]; then
+    echo "unsafe existing unit backup staging" >&2
+    return 1
+  fi
+  mkdir -m 0700 "${unit_backup_build}"
+  chown root:root "${unit_backup_build}"
+  if [[ -f "${unit_file}" && ! -L "${unit_file}" ]]; then
+    cp -p "${unit_file}" "${unit_backup_build}/present"
+    chmod 0600 "${unit_backup_build}/present"
+    mode="$(path_metadata "${unit_file}")"
+    printf '%s\n' "${mode##* }" > "${unit_backup_build}/mode"
+    chmod 0600 "${unit_backup_build}/mode"
+    sync "${unit_backup_build}/present" "${unit_backup_build}/mode"
+  elif [[ ! -e "${unit_file}" && ! -L "${unit_file}" ]]; then
+    : > "${unit_backup_build}/absent"
+    chmod 0600 "${unit_backup_build}/absent"
+    sync "${unit_backup_build}/absent"
+  else
+    return 1
+  fi
+  if [[ ${current_was_active} -eq 1 ]]; then
+    : > "${unit_backup_build}/active"
+    chmod 0600 "${unit_backup_build}/active"
+  fi
+  if [[ ${current_was_enabled} -eq 1 ]]; then
+    : > "${unit_backup_build}/enabled"
+    chmod 0600 "${unit_backup_build}/enabled"
+  fi
+  mv "${unit_backup_build}" "${unit_backup_dir}"
+}
+
+restore_unit_backup() {
+  local mode
+  validate_backup
+  systemctl stop "${new_unit}" 2>/dev/null || true
+  if [[ -f "${unit_backup_dir}/present" ]]; then
+    mode="$(cat "${unit_backup_dir}/mode")"
+    install -m 0600 "${unit_backup_dir}/present" "${unit_restore_temp}"
+    chown root:root "${unit_restore_temp}"
+    require_control_file "${unit_restore_temp}"
+    sync "${unit_restore_temp}"
+    mv "${unit_restore_temp}" "${unit_file}"
+    chmod "${mode}" "${unit_file}"
+  else
+    rm -f "${unit_file}"
+  fi
+  systemctl daemon-reload 2>/dev/null || true
+  current_was_active=0
+  current_was_enabled=0
+  [[ -f "${unit_backup_dir}/active" ]] && current_was_active=1
+  [[ -f "${unit_backup_dir}/enabled" ]] && current_was_enabled=1
+  restore_current_state
+  cleanup_backup_dir "${unit_backup_dir}"
 }
 
 remove_known_state_dir() {
@@ -244,7 +338,11 @@ on_exit() {
     cleanup_stage 2>/dev/null || true
   fi
   if [[ ${status} -ne 0 && ${current_upgrade} -eq 1 ]]; then
-    restore_current_state
+    if [[ -e "${unit_backup_dir}" || -L "${unit_backup_dir}" ]]; then
+      restore_unit_backup 2>/dev/null || true
+    else
+      restore_current_state
+    fi
   fi
   release_lock
   exit "${status}"
@@ -291,6 +389,22 @@ printf '%s\n' "$$" > "${lock_pid}"
 chmod 0600 "${lock_pid}"
 require_control_dir "${lock_dir}"
 require_control_file "${lock_pid}"
+
+if [[ -e "${unit_dir}" || -L "${unit_dir}" ]]; then
+  require_control_parent "${unit_dir}"
+  for leftover in "${unit_temp}" "${unit_restore_temp}"; do
+    if [[ -e "${leftover}" || -L "${leftover}" ]]; then
+      require_control_file "${leftover}"
+      rm -f "${leftover}"
+    fi
+  done
+  if [[ -e "${unit_backup_build}" || -L "${unit_backup_build}" ]]; then
+    cleanup_backup_dir "${unit_backup_build}"
+  fi
+  if [[ -e "${unit_backup_dir}" || -L "${unit_backup_dir}" ]]; then
+    restore_unit_backup
+  fi
+fi
 
 # Successful cutover is committed by atomically renaming the marked staging
 # directory. A kill during later cleanup therefore cannot look like an
@@ -357,6 +471,12 @@ if [[ -f "${config_file}" ]]; then
     current_was_enabled=1
   fi
   current_upgrade=1
+  if [[ -e "${unit_dir}" || -L "${unit_dir}" ]]; then
+    require_control_parent "${unit_dir}"
+  fi
+  install -d -m 0755 "${unit_dir}"
+  require_control_parent "${unit_dir}"
+  create_unit_backup
   install_unit
   if [[ ${current_was_enabled} -eq 1 ]]; then
     systemctl enable "${new_unit}"
@@ -365,6 +485,7 @@ if [[ -f "${config_file}" ]]; then
     systemctl stop "${new_unit}"
     systemctl start "${new_unit}"
   fi
+  cleanup_backup_dir "${unit_backup_dir}"
   current_upgrade=0
   echo "Agent upgraded while preserving the user config, identity, token, and state database."
   exit 0
