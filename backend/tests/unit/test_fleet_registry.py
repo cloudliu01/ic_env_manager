@@ -49,6 +49,7 @@ class _Repository:
         self.update_calls = 0
         self.always_conflict = False
         self.conflict_once_to_desired = False
+        self.third_conflict_update = None
 
     def get(self, agent_id):
         return self.records.get(agent_id)
@@ -69,6 +70,8 @@ class _Repository:
             self.records[record.agent_id] = replace(record, revision=expected_revision + 1)
             raise RevisionConflict("race")
         if self.always_conflict:
+            if self.update_calls == 3 and self.third_conflict_update is not None:
+                self.records[record.agent_id] = self.third_conflict_update(record)
             raise RevisionConflict("race")
         updated = replace(record, revision=expected_revision + 1)
         self.records[record.agent_id] = updated
@@ -164,6 +167,54 @@ def test_set_enabled_retries_revision_conflict_idempotently_and_is_bounded(tmp_p
     with pytest.raises(FleetRegistryConflict):
         registry.set_enabled("lab-01", True)
     assert repository.update_calls == 4
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("invalid_after_conflict", ["credential", "profile"])
+def test_concurrent_desired_enable_rechecks_security_gate_after_final_conflict(
+    tmp_path, invalid_after_conflict
+):
+    store = CredentialStore(tmp_path / "credentials")
+    reference = store.put(b"secret")
+    repository = _Repository([_record("lab-01", reference, enabled=False)])
+    repository.always_conflict = True
+
+    def concurrent_enable(record):
+        if invalid_after_conflict == "credential":
+            store.delete(reference)
+            return replace(record, enabled=True, revision=record.revision + 1)
+        return replace(
+            record,
+            enabled=True,
+            revision=record.revision + 1,
+            transport_profile_id="missing",
+        )
+
+    repository.third_conflict_update = concurrent_enable
+    registry = FleetRegistry(
+        repository, store, (VerifiedTlsProfile(id="system-tls"),)
+    )
+
+    with pytest.raises(FleetRegistryConfigurationError):
+        registry.set_enabled("lab-01", True)
+    assert repository.records["lab-01"].enabled is True
+
+
+@pytest.mark.unit
+def test_concurrent_desired_enable_returns_when_final_security_gate_is_valid(tmp_path):
+    store = CredentialStore(tmp_path / "credentials")
+    reference = store.put(b"secret")
+    repository = _Repository([_record("lab-01", reference, enabled=False)])
+    repository.always_conflict = True
+    repository.third_conflict_update = lambda record: replace(
+        record, enabled=True, revision=record.revision + 1
+    )
+    registry = FleetRegistry(
+        repository, store, (VerifiedTlsProfile(id="system-tls"),)
+    )
+
+    assert registry.set_enabled("lab-01", True).enabled is True
+    assert repository.update_calls == 3
 
 
 @pytest.mark.unit

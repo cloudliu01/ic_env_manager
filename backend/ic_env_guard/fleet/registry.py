@@ -57,12 +57,8 @@ class FleetRegistry:
             record = self._repository.get(agent_id)
             if record is None:
                 return None
-            if enabled and not self._configuration_valid(record):
-                raise FleetRegistryConfigurationError(
-                    "Agent transport profile is invalid"
-                )
             if enabled:
-                self._read_credential(record)
+                self._validate_enable(record)
             if record.enabled == enabled:
                 return self._project(record)
             try:
@@ -74,6 +70,8 @@ class FleetRegistry:
             return self._project(updated)
         latest = self._repository.get(agent_id)
         if latest is not None and latest.enabled == enabled:
+            if enabled:
+                self._validate_enable(latest)
             return self._project(latest)
         raise FleetRegistryConflict("Agent Registry revision changed repeatedly")
 
@@ -94,6 +92,11 @@ class FleetRegistry:
         if not token:
             raise FleetRegistryConfigurationError("Agent credential is unavailable")
         return token
+
+    def _validate_enable(self, record: AgentRecord) -> None:
+        if not self._configuration_valid(record):
+            raise FleetRegistryConfigurationError("Agent transport profile is invalid")
+        self._read_credential(record)
 
     def _project(self, record: AgentRecord) -> AgentConfig:
         profile = self._profiles.get(record.transport_profile_id)
