@@ -1,9 +1,14 @@
 import os
+import ssl
 import stat
 from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, IPvAnyNetwork, field_validator, model_validator
+
+
+def create_ca_context(ca_bundle: Path) -> ssl.SSLContext:
+    return ssl.create_default_context(cafile=str(ca_bundle))
 
 
 class VerifiedTlsProfile(BaseModel):
@@ -32,7 +37,12 @@ class VerifiedTlsProfile(BaseModel):
             raise ValueError("CA bundle must be owned by root or the Manager user")
         if stat.S_IMODE(metadata.st_mode) & 0o022:
             raise ValueError("CA bundle must not be group or world writable")
-        return value.resolve()
+        resolved = value.resolve()
+        try:
+            create_ca_context(resolved)
+        except (OSError, ssl.SSLError) as exc:
+            raise ValueError("CA bundle must contain valid certificates") from exc
+        return resolved
 
 
 class TrustedLanHttpProfile(BaseModel):

@@ -48,14 +48,18 @@ class AgentTargetPolicy:
         self,
         *,
         allowed_agent_cidrs: Sequence[str | IPNetwork],
+        self_targets: Sequence[tuple[str | IPAddress, int]],
         resolver: Resolver | None = None,
-        self_addresses: Sequence[str | IPAddress] = (),
-        self_ports: Sequence[int] = (),
     ) -> None:
         self._allowed = tuple(_as_network(value) for value in allowed_agent_cidrs)
         self._resolver = resolver or _resolve_addresses
-        self._self_addresses = frozenset(ip_address(value) for value in self_addresses)
-        self._self_ports = frozenset(self_ports)
+        if not self_targets or any(port < 1 or port > 65535 for _, port in self_targets):
+            raise TargetPolicyError(
+                "target_policy_invalid", "at least one valid Manager self target is required"
+            )
+        self._self_targets = frozenset(
+            (ip_address(address), port) for address, port in self_targets
+        )
 
     def resolve(self, endpoint: str, profile: TransportProfile) -> ValidatedTarget:
         scheme, hostname, port = _parse_endpoint(endpoint)
@@ -75,7 +79,7 @@ class AgentTargetPolicy:
                 raise TargetPolicyError(
                     "target_address_not_allowed", "the Agent address is outside the allowlist"
                 )
-            if address in self._self_addresses and port in self._self_ports:
+            if (address, port) in self._self_targets:
                 raise TargetPolicyError("target_is_manager", "the Agent target is the Manager")
 
         pinned = addresses[0]

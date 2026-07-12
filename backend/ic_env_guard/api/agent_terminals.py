@@ -1,5 +1,5 @@
 import json as json_module
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import uuid4
@@ -86,6 +86,7 @@ async def _dispatch(
     audit_repo: ControlPlaneAuditRepository,
     audit_health: AuditStorageHealth,
     json: object | None = None,
+    params: Mapping[str, str | int] | None = None,
     correlation_id: str | None = None,
     source_addr: str | None = None,
     validate_response: Callable[[httpx.Response], str | None] | None = None,
@@ -150,6 +151,7 @@ async def _dispatch(
             method,
             upstream_path,
             correlation_id=correlation_id,
+            params=params,
             json=json,
         )
     except AgentClientError as exc:
@@ -314,7 +316,7 @@ async def get_agent_terminal_history(
 ) -> Response:
     return await _dispatch(
         agent_id=agent_id,
-        upstream_path=f"/api/terminals/{terminal_id}/history?cursor={cursor}",
+        upstream_path=f"/api/terminals/{terminal_id}/history",
         method="GET",
         operation="terminals.history",
         target=f"terminal:{terminal_id}",
@@ -324,6 +326,7 @@ async def get_agent_terminal_history(
         client=client,
         audit_repo=audit_repo,
         audit_health=audit_health,
+        params={"cursor": cursor},
         correlation_id=getattr(request.state, "correlation_id", None),
         source_addr=request.client.host if request.client else None,
     )

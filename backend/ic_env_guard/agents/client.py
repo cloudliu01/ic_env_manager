@@ -1,17 +1,23 @@
+import json as json_module
+import re
 import ssl
 from collections.abc import Mapping
 from typing import overload
+from urllib.parse import unquote_to_bytes
 
 import httpx
 
 from ic_env_guard.auth.token import load_bearer_token
 from ic_env_guard.config.models import AgentConfig
 from ic_env_guard.fleet.target_policy import ValidatedTarget
-from ic_env_guard.fleet.transport import VerifiedTlsProfile
+from ic_env_guard.fleet.transport import VerifiedTlsProfile, create_ca_context
 
 FORWARDED_HEADERS = {"accept", "content-type"}
 MAX_AGENT_RESPONSE_BYTES = 1024 * 1024
 MAX_AGENT_TAIL_RESPONSE_BYTES = 1024 * 1024
+STREAM_CHUNK_BYTES = 64 * 1024
+MAX_JSON_NESTING = 64
+PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
 
 
 class AgentClientError(Exception):
@@ -116,6 +122,10 @@ class AgentHttpClient:
         params: Mapping[str, str | int] | None = None,
         max_response_bytes: int = MAX_AGENT_TAIL_RESPONSE_BYTES,
     ) -> httpx.Response:
+        if not 1 <= max_response_bytes <= MAX_AGENT_TAIL_RESPONSE_BYTES:
+            raise AgentClientError(
+                "agent_protocol_error", "agent tail response limit is invalid"
+            )
         return await self._target_request(
             target,
             credential,
@@ -152,17 +162,17 @@ class AgentHttpClient:
         )
         client = self._client
         transient_client: httpx.AsyncClient | None = None
-        if client is None:
-            transient_client = httpx.AsyncClient(
-                follow_redirects=False,
-                verify=_target_verify_setting(target),
-                trust_env=False,
-            )
-            client = transient_client
         timeout = httpx.Timeout(
             self._request_timeout_seconds, connect=self._connect_timeout_seconds
         )
         try:
+            if client is None:
+                transient_client = httpx.AsyncClient(
+                    follow_redirects=False,
+                    verify=_target_verify_setting(target),
+                    trust_env=False,
+                )
+                client = transient_client
             async with client.stream(
                 method,
                 f"{target.pinned_url}{path}",
@@ -172,25 +182,23 @@ class AgentHttpClient:
                 timeout=timeout,
                 extensions=extensions,
             ) as streamed:
-                content = bytearray()
-                async for chunk in streamed.aiter_bytes():
-                    content.extend(chunk)
-                    if len(content) > max_response_bytes:
-                        raise AgentClientError(
-                            "agent_protocol_error", "agent response is too large"
-                        )
-                response = httpx.Response(
-                    streamed.status_code,
-                    headers=streamed.headers,
-                    content=bytes(content),
-                    request=streamed.request,
-                    extensions=streamed.extensions,
-                )
+                if streamed.status_code in {401, 403}:
+                    raise AgentClientError(
+                        "agent_auth_error", "agent authentication failed"
+                    )
+                response = await _read_bounded_response(streamed, max_response_bytes)
         except AgentClientError:
             raise
+        except (ssl.SSLError, OSError) as exc:
+            raise AgentClientError("agent_tls_error", "agent TLS validation failed") from exc
         except httpx.TimeoutException as exc:
             raise AgentClientError("agent_network_error", "agent request timed out") from exc
-        except (httpx.ProtocolError, httpx.DecodingError) as exc:
+        except (
+            httpx.InvalidURL,
+            httpx.ProtocolError,
+            httpx.DecodingError,
+            httpx.StreamError,
+        ) as exc:
             raise AgentClientError(
                 "agent_protocol_error", "agent response protocol is invalid"
             ) from exc
@@ -205,9 +213,7 @@ class AgentHttpClient:
         finally:
             if transient_client is not None:
                 await transient_client.aclose()
-        if response.status_code in {401, 403}:
-            raise AgentClientError("agent_auth_error", "agent authentication failed")
-        return _validate_response(response)
+        return _validate_response(response, max_response_bytes)
 
     async def _legacy_request(
         self,
@@ -223,32 +229,42 @@ class AgentHttpClient:
         headers = self._headers(
             load_bearer_token(agent.token_file), incoming_headers or {}, correlation_id
         )
+        _validate_upstream_path(path)
         client = self._client
         transient_client: httpx.AsyncClient | None = None
-        if client is None:
-            transient_client = httpx.AsyncClient(
-                follow_redirects=False,
-                verify=_legacy_verify_setting(agent),
-                trust_env=False,
-            )
-            client = transient_client
         try:
-            response = await client.request(
+            if client is None:
+                transient_client = httpx.AsyncClient(
+                    follow_redirects=False,
+                    verify=_legacy_verify_setting(agent),
+                    trust_env=False,
+                )
+                client = transient_client
+            async with client.stream(
                 method,
                 f"{agent.base_url}{path}",
                 headers=headers,
                 params=params,
                 json=json,
                 timeout=agent.request_timeout_seconds,
-            )
+            ) as streamed:
+                response = await _read_bounded_response(
+                    streamed, MAX_AGENT_RESPONSE_BYTES
+                )
+        except AgentClientError:
+            raise
         except httpx.TimeoutException as exc:
             raise AgentClientError("agent_timeout", "agent request timed out") from exc
-        except httpx.TransportError as exc:
+        except (OSError, httpx.TransportError) as exc:
             raise AgentClientError("agent_unavailable", "agent is unavailable") from exc
+        except (httpx.InvalidURL, httpx.DecodingError, httpx.StreamError) as exc:
+            raise AgentClientError(
+                "agent_protocol_error", "agent response protocol is invalid"
+            ) from exc
         finally:
             if transient_client is not None:
                 await transient_client.aclose()
-        return _validate_response(response)
+        return _validate_response(response, MAX_AGENT_RESPONSE_BYTES)
 
     @staticmethod
     def _headers(
@@ -256,7 +272,10 @@ class AgentHttpClient:
         incoming_headers: Mapping[str, str],
         correlation_id: str | None,
     ) -> dict[str, str]:
-        headers = {"Authorization": f"Bearer {token}"}
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept-Encoding": "identity",
+        }
         for name, value in incoming_headers.items():
             if name.lower() in FORWARDED_HEADERS:
                 headers[name] = value
@@ -265,18 +284,63 @@ class AgentHttpClient:
         return headers
 
 
-def _validate_response(response: httpx.Response) -> httpx.Response:
+async def _read_bounded_response(
+    streamed: httpx.Response, max_response_bytes: int
+) -> httpx.Response:
+    content_encoding = streamed.headers.get("content-encoding", "").strip().lower()
+    if content_encoding not in {"", "identity"}:
+        raise AgentClientError(
+            "agent_protocol_error", "agent response content encoding is invalid"
+        )
+    content_length = streamed.headers.get("content-length")
+    if content_length is not None:
+        if re.fullmatch(r"[0-9]+", content_length) is None:
+            raise AgentClientError(
+                "agent_protocol_error", "agent response content length is invalid"
+            )
+        declared_length = int(content_length)
+        if declared_length < 0 or declared_length > max_response_bytes:
+            raise AgentClientError("agent_protocol_error", "agent response is too large")
+    content = bytearray()
+    if streamed.is_stream_consumed:
+        content.extend(streamed.content)
+        if len(content) > max_response_bytes:
+            raise AgentClientError("agent_protocol_error", "agent response is too large")
+    else:
+        chunk_size = min(STREAM_CHUNK_BYTES, max_response_bytes + 1)
+        async for chunk in streamed.aiter_raw(chunk_size=chunk_size):
+            content.extend(chunk)
+            if len(content) > max_response_bytes:
+                raise AgentClientError(
+                    "agent_protocol_error", "agent response is too large"
+                )
+    return httpx.Response(
+        streamed.status_code,
+        headers=streamed.headers,
+        content=bytes(content),
+        request=streamed.request,
+        extensions=streamed.extensions,
+    )
+
+
+def _validate_response(
+    response: httpx.Response, max_response_bytes: int
+) -> httpx.Response:
     if 300 <= response.status_code < 400:
         raise AgentClientError("agent_protocol_error", "agent redirects are not allowed")
-    if len(response.content) > MAX_AGENT_RESPONSE_BYTES:
+    if len(response.content) > max_response_bytes:
         raise AgentClientError("agent_protocol_error", "agent response is too large")
-    content_type = response.headers.get("content-type", "")
-    if response.status_code != 204 and not content_type.startswith("application/json"):
+    content_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
+    if response.status_code != 204 and content_type != "application/json":
         raise AgentClientError("agent_protocol_error", "agent response content type is invalid")
     if response.status_code != 204:
         try:
-            response.json()
-        except ValueError as exc:
+            _validate_json_nesting(response.content)
+            json_module.loads(
+                response.content,
+                parse_constant=lambda _value: _reject_json_constant(),
+            )
+        except (UnicodeDecodeError, ValueError, RecursionError) as exc:
             raise AgentClientError(
                 "agent_protocol_error", "agent response JSON is invalid"
             ) from exc
@@ -294,8 +358,64 @@ def _decode_credential(credential: bytes) -> str:
 
 
 def _validate_upstream_path(path: str) -> None:
-    if not path.startswith("/") or path.startswith("//") or "://" in path:
+    if (
+        not path.startswith("/")
+        or path.startswith("//")
+        or "://" in path
+        or "?" in path
+        or "#" in path
+        or "\\" in path
+        or any(ord(character) < 0x20 for character in path)
+    ):
         raise AgentClientError("agent_protocol_error", "agent request path is invalid")
+    for index, character in enumerate(path):
+        if character == "%" and (
+            index + 2 >= len(path) or not PERCENT_ESCAPE.fullmatch(path[index : index + 3])
+        ):
+            raise AgentClientError("agent_protocol_error", "agent request path is invalid")
+    try:
+        decoded = unquote_to_bytes(path).decode("utf-8")
+    except UnicodeDecodeError:
+        raise AgentClientError(
+            "agent_protocol_error", "agent request path is invalid"
+        ) from None
+    if (
+        decoded.count("/") != path.count("/")
+        or "\\" in decoded
+        or "?" in decoded
+        or "#" in decoded
+        or any(ord(character) < 0x20 for character in decoded)
+        or any(segment in {"", ".", ".."} for segment in decoded.split("/")[1:])
+        or PERCENT_ESCAPE.search(decoded)
+    ):
+        raise AgentClientError("agent_protocol_error", "agent request path is invalid")
+
+
+def _reject_json_constant() -> None:
+    raise ValueError("non-standard JSON constant")
+
+
+def _validate_json_nesting(payload: bytes) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for value in payload:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif value == ord("\\"):
+                escaped = True
+            elif value == ord('"'):
+                in_string = False
+            continue
+        if value == ord('"'):
+            in_string = True
+        elif value in {ord("["), ord("{")}:
+            depth += 1
+            if depth > MAX_JSON_NESTING:
+                raise ValueError("JSON nesting is too deep")
+        elif value in {ord("]"), ord("}")}:
+            depth -= 1
 
 
 def _caused_by_tls(error: BaseException) -> bool:
@@ -307,10 +427,12 @@ def _caused_by_tls(error: BaseException) -> bool:
     return False
 
 
-def _target_verify_setting(target: ValidatedTarget) -> bool | str:
+def _target_verify_setting(target: ValidatedTarget) -> bool | ssl.SSLContext:
     if not isinstance(target.profile, VerifiedTlsProfile):
         return True
-    return str(target.profile.ca_bundle) if target.profile.ca_bundle is not None else True
+    if target.profile.ca_bundle is None:
+        return True
+    return create_ca_context(target.profile.ca_bundle)
 
 
 def _legacy_verify_setting(agent: AgentConfig) -> bool | str:

@@ -15,8 +15,7 @@ def _policy(answers=("10.20.30.10",)):
     return AgentTargetPolicy(
         allowed_agent_cidrs=["10.20.30.0/24", "fd20:30::/64"],
         resolver=lambda _host, _port: answers,
-        self_addresses=["10.20.30.1", "fd20:30::1"],
-        self_ports=[8765],
+        self_targets=[("10.20.30.1", 8765), ("fd20:30::1", 8765)],
     )
 
 
@@ -83,6 +82,7 @@ def test_dynamic_targets_reject_forbidden_ranges(address):
     policy = AgentTargetPolicy(
         allowed_agent_cidrs=["0.0.0.0/0", "::/0"],
         resolver=lambda _host, _port: (address,),
+        self_targets=[("10.0.0.1", 8765)],
     )
     endpoint = f"https://[{address}]:8765" if ":" in address else f"https://{address}:8765"
     with pytest.raises(TargetPolicyError, match="target_address_forbidden"):
@@ -107,6 +107,12 @@ def test_self_target_is_rejected_only_at_manager_effective_port():
 
 
 @pytest.mark.unit
+def test_policy_requires_at_least_one_exact_manager_self_target():
+    with pytest.raises(TargetPolicyError, match="target_policy_invalid"):
+        AgentTargetPolicy(allowed_agent_cidrs=["10.0.0.0/8"], self_targets=[])
+
+
+@pytest.mark.unit
 def test_ipv6_target_is_bracketed_and_host_header_preserves_effective_port():
     target = _policy(("fd20:30::10",)).resolve("https://[fd20:30::10]:9443", VERIFIED_TLS)
     assert target.normalized_endpoint == "https://[fd20:30::10]:9443"
@@ -121,7 +127,9 @@ def test_dns_failure_has_stable_safe_error():
 
     with pytest.raises(TargetPolicyError) as error:
         AgentTargetPolicy(
-            allowed_agent_cidrs=["10.0.0.0/8"], resolver=fail
+            allowed_agent_cidrs=["10.0.0.0/8"],
+            resolver=fail,
+            self_targets=[("10.0.0.1", 8765)],
         ).resolve("https://agent.example", VERIFIED_TLS)
     assert error.value.code == "agent_network_error"
     assert "secret" not in error.value.message

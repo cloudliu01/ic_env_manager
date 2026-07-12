@@ -220,6 +220,17 @@ class AgentConfig(BaseModel):
         return self
 
 
+def _is_builtin_system_tls(value: object) -> bool:
+    if isinstance(value, dict):
+        return (
+            set(value) == {"id", "type", "ca_bundle"}
+            and value.get("id") == "system-tls"
+            and value.get("type") == "verified_tls"
+            and value.get("ca_bundle") is None
+        )
+    return value == SYSTEM_TLS_PROFILE
+
+
 class ControlPlaneConfig(BaseModel):
     poll_interval_seconds: int = Field(default=10, ge=1)
     status_stale_after_seconds: int = Field(default=30, ge=1)
@@ -229,19 +240,25 @@ class ControlPlaneConfig(BaseModel):
     max_active_terminal_proxies: int = Field(default=64, ge=1)
     max_outstanding_tickets: int = Field(default=128, ge=1)
     allowed_agent_cidrs: list[IPvAnyNetwork] = Field(default_factory=list)
-    transport_profiles: list[TransportProfile] = Field(default_factory=lambda: [SYSTEM_TLS_PROFILE])
+    transport_profiles: tuple[TransportProfile, ...] = Field(
+        default_factory=lambda: (SYSTEM_TLS_PROFILE,)
+    )
 
     @field_validator("transport_profiles", mode="before")
     @classmethod
     def add_system_tls_profile(cls, value):
         profiles = list(value or [])
-        if any(
-            (item.get("id") if isinstance(item, dict) else getattr(item, "id", None))
-            == "system-tls"
-            for item in profiles
-        ):
-            raise ValueError("system-tls is a reserved transport profile ID")
-        return [SYSTEM_TLS_PROFILE, *profiles]
+        built_in_seen = False
+        custom_profiles = []
+        for item in profiles:
+            profile_id = item.get("id") if isinstance(item, dict) else getattr(item, "id", None)
+            if profile_id != "system-tls":
+                custom_profiles.append(item)
+                continue
+            if built_in_seen or not _is_builtin_system_tls(item):
+                raise ValueError("system-tls is a reserved transport profile ID")
+            built_in_seen = True
+        return (SYSTEM_TLS_PROFILE, *custom_profiles)
 
     @field_validator("audit_database", "credential_directory")
     @classmethod

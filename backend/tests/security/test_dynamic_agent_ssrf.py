@@ -13,6 +13,7 @@ def _target():
     return AgentTargetPolicy(
         allowed_agent_cidrs=["10.20.30.0/24"],
         resolver=lambda _host, _port: ("10.20.30.10",),
+        self_targets=[("10.20.30.1", 8765)],
     ).resolve("https://agent.example:8765", VerifiedTlsProfile(id="system-tls"))
 
 
@@ -82,6 +83,7 @@ async def test_client_disables_redirects_environment_proxy_and_uses_connect_and_
         (httpx.ConnectError("TLS", request=None), "agent_tls_error"),
         (httpx.TimeoutException("slow"), "agent_network_error"),
         (httpx.RemoteProtocolError("invalid framing"), "agent_protocol_error"),
+        (httpx.InvalidURL("invalid URL"), "agent_protocol_error"),
     ],
 )
 async def test_client_maps_transport_failures_to_stable_safe_categories(
