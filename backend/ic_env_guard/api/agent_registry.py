@@ -99,7 +99,9 @@ def set_enabled(
     try:
         registry.set_enabled(agent_id, body.enabled)
     except AgentNotFoundError as exc:
-        _failure(audit, audit_repo, audit_health, "agent_not_found", dispatched=False)
+        _failure(
+            audit, audit_repo, audit_health, "agent_not_found", dispatch_state="not_dispatched"
+        )
         raise V2ApiError(404, "agent_not_found", "agent not found") from exc
     except AgentInvalidConfigurationError as exc:
         _failure(
@@ -107,14 +109,14 @@ def set_enabled(
             audit_repo,
             audit_health,
             "agent_invalid_configuration",
-            dispatched=False,
+            dispatch_state="not_dispatched",
         )
         raise V2ApiError(
             409,
             "agent_invalid_configuration",
             "agent cannot be enabled with its current configuration",
         ) from exc
-    _success(audit, audit_repo, audit_health, dispatched=False)
+    _success(audit, audit_repo, audit_health, dispatch_state="not_dispatched")
     agent = service.get(agent_id)
     assert agent is not None
     return {"agent": agent}
@@ -133,30 +135,38 @@ async def probe(
     audit = _intent(request, actor, audit_repo, audit_health, agent_id, "agents.v2.probe")
     current = status_service.get(agent_id)
     if current is None:
-        _failure(audit, audit_repo, audit_health, "agent_not_found", dispatched=False)
+        _failure(
+            audit, audit_repo, audit_health, "agent_not_found", dispatch_state="not_dispatched"
+        )
         raise V2ApiError(404, "agent_not_found", "agent not found")
     if not current["enabled"]:
-        _failure(audit, audit_repo, audit_health, "agent_disabled", dispatched=False)
+        _failure(
+            audit, audit_repo, audit_health, "agent_disabled", dispatch_state="not_dispatched"
+        )
         raise V2ApiError(409, "agent_disabled", "agent is disabled")
     try:
         result = await probe_service.probe(agent_id)
     except AgentProbeDisabled as exc:
-        _failure(audit, audit_repo, audit_health, exc.code, dispatched=False)
+        _failure(
+            audit, audit_repo, audit_health, exc.code, dispatch_state=exc.dispatch_state
+        )
         raise V2ApiError(409, exc.code, "agent is disabled") from exc
     except AgentProbeError as exc:
-        _failure(audit, audit_repo, audit_health, exc.code, dispatched=True)
+        _failure(
+            audit, audit_repo, audit_health, exc.code, dispatch_state=exc.dispatch_state
+        )
         status_code = 404 if exc.code == "agent_not_found" else 409
         raise V2ApiError(status_code, exc.code, "agent probe failed") from exc
-    if result.connection_status == "unavailable":
+    if result.status.connection_status == "unavailable":
         _failure(
             audit,
             audit_repo,
             audit_health,
-            result.last_error_code or "agent_unavailable",
-            dispatched=True,
+            result.status.last_error_code or "agent_unavailable",
+            dispatch_state=result.dispatch_state,
         )
     else:
-        _success(audit, audit_repo, audit_health, dispatched=True)
+        _success(audit, audit_repo, audit_health, dispatch_state=result.dispatch_state)
     agent = status_service.get(agent_id)
     assert agent is not None
     return {"agent": agent}
@@ -191,20 +201,20 @@ def _intent(
     return event
 
 
-def _failure(event, repository, health, code: str, *, dispatched: bool) -> None:
+def _failure(event, repository, health, code: str, *, dispatch_state: str) -> None:
     repository.finalize(
         event.id,
         result="failed",
-        dispatch_state="dispatched" if dispatched else "not_dispatched",
+        dispatch_state=dispatch_state,
         failure_category=code,
     )
     commit_audit_outcome(repository, health)
 
 
-def _success(event, repository, health, *, dispatched: bool) -> None:
+def _success(event, repository, health, *, dispatch_state: str) -> None:
     repository.finalize(
         event.id,
         result="success",
-        dispatch_state="dispatched" if dispatched else "not_dispatched",
+        dispatch_state=dispatch_state,
     )
     commit_audit_outcome(repository, health)

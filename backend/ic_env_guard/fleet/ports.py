@@ -37,6 +37,10 @@ class AgentStatusRepository(Protocol):
         self, observation: AgentStatus, expected_revision: int
     ) -> bool: ...
 
+    def update_many_if_target_revisions(
+        self, observations: tuple[AgentStatus, ...]
+    ) -> bool: ...
+
 
 class EnrollmentJournalRepository(Protocol):
     def create(self, job: EnrollmentJob) -> EnrollmentJob: ...

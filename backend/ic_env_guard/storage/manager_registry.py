@@ -343,6 +343,36 @@ class AgentStatusRepository(_SQLiteRepository):
     ) -> bool:
         if observation.target_revision != expected_revision or expected_revision < 1:
             raise RegistryInvariantError("status target revision is inconsistent")
+        return self.update_many_if_target_revisions((observation,))
+
+    def update_many_if_target_revisions(
+        self, observations: tuple[AgentStatus, ...]
+    ) -> bool:
+        if not observations:
+            raise RegistryInvariantError("status update batch must not be empty")
+        if len({item.agent_id for item in observations}) != len(observations):
+            raise RegistryInvariantError("status update batch contains duplicate agents")
+        serialized = tuple(self._serialize(item) for item in observations)
+        try:
+            with self._write() as connection:
+                for observation in observations:
+                    current = connection.execute(
+                        "SELECT revision FROM agents WHERE agent_id = ?",
+                        (observation.agent_id,),
+                    ).fetchone()
+                    if current is None or current[0] != observation.target_revision:
+                        return False
+                for values in serialized:
+                    self._upsert(connection, values)
+            return True
+        except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise RegistryError("agent status storage is unavailable") from exc
+
+    @staticmethod
+    def _serialize(observation: AgentStatus) -> tuple[Any, ...]:
+        expected_revision = observation.target_revision
+        if expected_revision < 1:
+            raise RegistryInvariantError("status target revision is inconsistent")
         if observation.connection_status not in _CONNECTION_STATUSES:
             raise RegistryInvariantError("invalid connection status")
         if observation.workload_status not in _WORKLOAD_STATUSES:
@@ -351,43 +381,37 @@ class AgentStatusRepository(_SQLiteRepository):
             raise RegistryInvariantError("invalid Agent capability")
         capabilities = _serialize_json(list(observation.capabilities))
         summary = _serialize_json(observation.summary)
-        try:
-            with self._write() as connection:
-                current = connection.execute(
-                    "SELECT revision FROM agents WHERE agent_id = ?", (observation.agent_id,)
-                ).fetchone()
-                if current is None or current[0] != expected_revision:
-                    return False
-                connection.execute(
-                    f"INSERT INTO agent_status ({_STATUS_COLUMNS}) "
-                    f"VALUES ({','.join('?' * 12)}) "
-                    "ON CONFLICT(agent_id) DO UPDATE SET "
-                    "target_revision=excluded.target_revision, "
-                    "connection_status=excluded.connection_status, "
-                    "workload_status=excluded.workload_status, observed_at=excluded.observed_at, "
-                    "stale_after=excluded.stale_after, api_version=excluded.api_version, "
-                    "agent_version=excluded.agent_version, "
-                    "capabilities_json=excluded.capabilities_json, "
-                    "summary_json=excluded.summary_json, "
-                    "last_error_code=excluded.last_error_code, updated_at=excluded.updated_at",
-                    (
-                        observation.agent_id,
-                        observation.target_revision,
-                        observation.connection_status,
-                        observation.workload_status,
-                        _format_time(observation.observed_at),
-                        _format_time(observation.stale_after),
-                        observation.api_version,
-                        observation.agent_version,
-                        capabilities,
-                        summary,
-                        observation.last_error_code,
-                        _format_time(observation.updated_at),
-                    ),
-                )
-            return True
-        except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
-            raise RegistryError("agent status storage is unavailable") from exc
+        return (
+            observation.agent_id,
+            observation.target_revision,
+            observation.connection_status,
+            observation.workload_status,
+            _format_time(observation.observed_at),
+            _format_time(observation.stale_after),
+            observation.api_version,
+            observation.agent_version,
+            capabilities,
+            summary,
+            observation.last_error_code,
+            _format_time(observation.updated_at),
+        )
+
+    @staticmethod
+    def _upsert(connection: sqlite3.Connection, values: tuple[Any, ...]) -> None:
+        connection.execute(
+            f"INSERT INTO agent_status ({_STATUS_COLUMNS}) "
+            f"VALUES ({','.join('?' * 12)}) "
+            "ON CONFLICT(agent_id) DO UPDATE SET "
+            "target_revision=excluded.target_revision, "
+            "connection_status=excluded.connection_status, "
+            "workload_status=excluded.workload_status, observed_at=excluded.observed_at, "
+            "stale_after=excluded.stale_after, api_version=excluded.api_version, "
+            "agent_version=excluded.agent_version, "
+            "capabilities_json=excluded.capabilities_json, "
+            "summary_json=excluded.summary_json, "
+            "last_error_code=excluded.last_error_code, updated_at=excluded.updated_at",
+            values,
+        )
 
     @staticmethod
     def _record(row: Any) -> AgentStatus:

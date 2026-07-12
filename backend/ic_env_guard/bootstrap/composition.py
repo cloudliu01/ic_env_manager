@@ -35,7 +35,7 @@ from ic_env_guard.enrollment.credential_store import CredentialStore
 from ic_env_guard.enrollment.service import EnrollmentService
 from ic_env_guard.enrollment.socket_server import EnrollmentSocketServer
 from ic_env_guard.fleet.importer import import_yaml_agents_once
-from ic_env_guard.fleet.probes import FleetProbeService
+from ic_env_guard.fleet.probes import AgentProbeError, FleetProbeService
 from ic_env_guard.fleet.registry import FleetRegistry
 from ic_env_guard.fleet.status import FleetStatusService
 from ic_env_guard.fleet.target_policy import AgentTargetPolicy
@@ -293,6 +293,14 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         status_repository,
         config.control_plane.transport_profiles,
     )
+    agent_availability = AgentAvailabilityService(
+        agent_registry,
+        agent_client,
+        stale_after_seconds=config.control_plane.status_stale_after_seconds,
+        max_parallel_probes=config.control_plane.max_parallel_probes,
+        status_repository=status_repository,
+        persist_probe_status=False,
+    )
     try:
         target_policy = AgentTargetPolicy(
             allowed_agent_cidrs=config.control_plane.allowed_agent_cidrs,
@@ -300,6 +308,13 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         )
     except RuntimeError:
         fleet_probe_service = None
+
+        async def unavailable_probe(_agent_id: str) -> None:
+            raise AgentProbeError(
+                "probe_unavailable", dispatch_state="not_dispatched"
+            )
+
+        agent_availability.set_probe_delegate(unavailable_probe)
     else:
         fleet_probe_service = FleetProbeService(
             registry_repository=registry_repository,
@@ -310,7 +325,12 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
             client=agent_client,
             stale_after_seconds=config.control_plane.status_stale_after_seconds,
             max_parallel_probes=config.control_plane.max_parallel_probes,
+            legacy_availability=agent_availability,
+            allow_import_without_dynamic_allowlist=(
+                not config.control_plane.allowed_agent_cidrs
+            ),
         )
+        agent_availability.set_probe_delegate(fleet_probe_service.probe)
     return ManagerContainer(
         config=config,
         agent_registry=agent_registry,
@@ -318,14 +338,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         agent_ws_connector=AgentWebSocketConnector(
             legacy_credential_loader=fleet_registry.load_credential
         ),
-        agent_availability=AgentAvailabilityService(
-            agent_registry,
-            agent_client,
-            stale_after_seconds=config.control_plane.status_stale_after_seconds,
-            max_parallel_probes=config.control_plane.max_parallel_probes,
-            status_repository=status_repository,
-            persist_probe_status=False,
-        ),
+        agent_availability=agent_availability,
         gateway_ticket_store=GatewayTicketStore(
             config.control_plane.max_outstanding_tickets
         ),

@@ -7,6 +7,7 @@ from ic_env_guard.api.agent_registry import get_fleet_probe_service
 from ic_env_guard.api.control_plane_audit import get_control_plane_audit_repository
 from ic_env_guard.config.models import AppConfig, AuthConfig, ControlPlaneConfig
 from ic_env_guard.fleet.models import AgentRecord, AgentStatus, EnrollmentMethod
+from ic_env_guard.fleet.probes import AgentProbeError, ProbeResult
 from ic_env_guard.main import create_app
 
 AUTH = {"Authorization": "Bearer manager-secret"}
@@ -147,7 +148,9 @@ def test_enable_and_probe_are_audited_and_disabled_agents_are_not_dispatched(tmp
 
         async def probe(self, agent_id):
             self.calls.append(agent_id)
-            return container.status_repository.get(agent_id)
+            return ProbeResult(
+                container.status_repository.get(agent_id), "dispatched"
+            )
 
     probe = Probe()
     app.dependency_overrides[get_fleet_probe_service] = lambda: probe
@@ -204,3 +207,31 @@ def test_audit_intent_failure_prevents_enable_mutation_and_probe_dispatch(tmp_pa
     assert enable.json()["error"]["code"] == "audit_unavailable"
     assert container.registry_repository.get("alpha").enabled is False
     assert probe.calls == []
+
+
+@pytest.mark.contract
+@pytest.mark.parametrize("dispatch_state", ["not_dispatched", "unknown", "dispatched"])
+def test_probe_audit_preserves_exact_dispatch_state(tmp_path, dispatch_state):
+    app, container = _manager(tmp_path)
+    _add(
+        container,
+        agent_id="alpha",
+        name="Alpha",
+        endpoint="https://10.0.0.11:8765",
+        enabled=True,
+    )
+
+    class Probe:
+        async def probe(self, _agent_id):
+            raise AgentProbeError(
+                "agent_protocol_error", dispatch_state=dispatch_state
+            )
+
+    app.dependency_overrides[get_fleet_probe_service] = lambda: Probe()
+    client = TestClient(app)
+
+    response = client.post("/api/v2/agents/alpha/probe", headers=AUTH)
+
+    assert response.status_code == 409
+    event = client.get("/api/control-plane/audit?limit=1", headers=AUTH).json()["events"][0]
+    assert event["dispatch_state"] == dispatch_state

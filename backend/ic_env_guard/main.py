@@ -270,20 +270,17 @@ def create_app(
         runtime_metadata = RuntimeMetadata(
             mode="manager",
             capabilities=(
-                (
-                    "fleet.v2",
-                    "agent-registry.v2",
-                    *(
-                        ("trusted-lan-http.v1",)
-                        if any(
-                            isinstance(profile, TrustedLanHttpProfile)
-                            for profile in container.config.control_plane.transport_profiles
-                        )
-                        else ()
-                    ),
-                )
-                if container.fleet_probe_service is not None
-                else ()
+                "fleet.v2",
+                "agent-registry.v2",
+                *(
+                    ("trusted-lan-http.v1",)
+                    if container.fleet_probe_service is not None
+                    and any(
+                        isinstance(profile, TrustedLanHttpProfile)
+                        for profile in container.config.control_plane.transport_profiles
+                    )
+                    else ()
+                ),
             ),
         )
     configured_login_limiter = login_limiter or LoginRateLimiter()

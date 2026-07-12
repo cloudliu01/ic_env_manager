@@ -1,3 +1,4 @@
+import asyncio
 import socket
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -5,13 +6,14 @@ from datetime import UTC, datetime, timedelta
 import psutil
 import pytest
 
-from ic_env_guard.agents.availability import AgentAvailabilityService
+from ic_env_guard.agents.availability import AgentAvailabilityService, AgentObservation
 from ic_env_guard.agents.client import AgentClientError
 from ic_env_guard.agents.registry import AgentRegistry
 from ic_env_guard.bootstrap.composition import _manager_self_targets
 from ic_env_guard.config.models import AgentConfig, AppConfig, AuthConfig, ControlPlaneConfig
 from ic_env_guard.fleet.models import AgentRecord, AgentStatus, EnrollmentMethod
 from ic_env_guard.fleet.probes import AgentProbeError, FleetProbeService
+from ic_env_guard.fleet.target_policy import TargetPolicyError
 from ic_env_guard.main import create_app
 
 NOW = datetime(2026, 7, 12, 10, 0, tzinfo=UTC)
@@ -65,6 +67,58 @@ async def test_legacy_probe_cannot_overwrite_manager_v2_status(tmp_path):
     await service.probe("alpha")
 
 
+@pytest.mark.integration
+async def test_legacy_capability_reads_durable_status_and_ensure_uses_fleet_delegate(tmp_path):
+    container = _manager(tmp_path)
+    _add(container, "alpha", "https://10.0.0.11:8765")
+    calls = []
+
+    async def fleet_probe(agent_id):
+        calls.append(agent_id)
+        status = AgentStatus(
+            agent_id=agent_id,
+            target_revision=1,
+            connection_status="ready",
+            workload_status="healthy",
+            observed_at=datetime.now(UTC),
+            stale_after=datetime.now(UTC) + timedelta(minutes=1),
+            api_version="2",
+            agent_version="0.2.0",
+            capabilities=("services.v1",),
+            summary=_summary(),
+            last_error_code=None,
+            updated_at=datetime.now(UTC),
+        )
+        container.status_repository.update_if_target_revision(status, 1)
+
+    container.agent_availability.set_probe_delegate(fleet_probe)
+
+    assert not container.agent_availability.has_capability("alpha", "services.v1")
+    assert await container.agent_availability.ensure_capability("alpha", "services.v1")
+    assert calls == ["alpha"]
+    assert container.agent_availability.has_capability("alpha", "services.v1")
+
+
+@pytest.mark.integration
+def test_manager_lifecycle_starts_only_the_fleet_probe_scheduler(tmp_path):
+    token_file = tmp_path / "manager.token"
+    token_file.write_text("manager-secret\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    app = create_app(
+        config=AppConfig(
+            mode="control-plane",
+            auth=AuthConfig(token_file=token_file),
+            control_plane=ControlPlaneConfig(audit_database=tmp_path / "manager.db"),
+        )
+    )
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(app):
+        assert app.state.fleet_probe_task
+        assert not hasattr(app.state, "agent_availability_probe_task")
+
+
 def test_manager_self_targets_include_every_interface_on_wildcard_bind(monkeypatch):
     monkeypatch.setattr(
         psutil,
@@ -99,6 +153,8 @@ class TargetPolicy:
 
 
 class Response:
+    status_code = 200
+
     def __init__(self, payload):
         self._payload = payload
 
@@ -119,6 +175,8 @@ class Client:
         payload = self.payloads.pop(0)
         if isinstance(payload, Exception):
             raise payload
+        if isinstance(payload, Response):
+            return payload
         return Response(payload)
 
 
@@ -160,7 +218,14 @@ def _add(container, agent_id, endpoint, *, instance_id=None):
     return record
 
 
-def _service(container, client, policy=None):
+def _service(
+    container,
+    client,
+    policy=None,
+    legacy=None,
+    max_parallel=2,
+    allow_import_without_dynamic_allowlist=True,
+):
     return FleetProbeService(
         registry_repository=container.registry_repository,
         status_repository=container.status_repository,
@@ -169,10 +234,215 @@ def _service(container, client, policy=None):
         transport_profiles=container.config.control_plane.transport_profiles,
         client=client,
         stale_after_seconds=30,
-        max_parallel_probes=2,
+        max_parallel_probes=max_parallel,
         probe_jitter_seconds=0,
         clock=lambda: NOW,
+        legacy_availability=legacy,
+        allow_import_without_dynamic_allowlist=allow_import_without_dynamic_allowlist,
     )
+
+
+class LegacyAdapter:
+    def __init__(self):
+        self.calls = []
+        self.active = 0
+        self.max_active = 0
+        self.release = asyncio.Event()
+        self.release.set()
+
+    async def probe_legacy(self, agent_id):
+        self.calls.append(agent_id)
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        await self.release.wait()
+        self.active -= 1
+        return AgentObservation(
+            status="ready",
+            observed_at=NOW,
+            stale_after=NOW + timedelta(seconds=30),
+            api_version="1",
+            agent_version="0.1.0",
+            capabilities=("services.v1",),
+            dispatch_state="dispatched",
+        )
+
+
+class RejectingPolicy:
+    def resolve(self, _endpoint, _profile):
+        raise TargetPolicyError("target_address_not_allowed", "not allowed")
+
+
+@pytest.mark.integration
+async def test_imported_legacy_agent_falls_back_when_dynamic_allowlist_is_missing(tmp_path):
+    container = _manager(tmp_path)
+    _add(container, "legacy", "https://10.0.0.11:8765")
+    legacy = LegacyAdapter()
+    result = await _service(
+        container,
+        Client([]),
+        policy=RejectingPolicy(),
+        legacy=legacy,
+    ).probe("legacy")
+
+    assert legacy.calls == ["legacy"]
+    assert result.status.connection_status == "degraded"
+    assert result.status.api_version == "1"
+    assert result.status.last_error_code == "legacy_identity_unavailable"
+    assert result.dispatch_state == "dispatched"
+
+
+@pytest.mark.integration
+async def test_imported_legacy_http_marker_and_v2_not_found_use_narrow_fallback(tmp_path):
+    container = _manager(tmp_path)
+    marker = _add(container, "marker", "http://10.0.0.11:8765")
+    container.registry_repository.update_if_revision(
+        replace(marker, transport_profile_id="legacy-config-http", updated_at=NOW),
+        expected_revision=1,
+    )
+    identity = "11111111-1111-4111-8111-111111111111"
+    _add(
+        container,
+        "not-found",
+        "https://10.0.0.12:8765",
+        instance_id=identity,
+    )
+
+    class NotFound(Response):
+        status_code = 404
+
+    legacy = LegacyAdapter()
+    marker_result = await _service(
+        container, Client([]), policy=TargetPolicy(), legacy=legacy
+    ).probe("marker")
+    not_found_result = await _service(
+        container,
+        Client([NotFound({"error": "not found"})]),
+        policy=TargetPolicy(),
+        legacy=legacy,
+    ).probe("not-found")
+
+    assert marker_result.status.connection_status == "degraded"
+    assert not_found_result.status.connection_status == "degraded"
+    assert legacy.calls == ["marker", "not-found"]
+
+
+@pytest.mark.integration
+async def test_import_with_missing_stored_profile_never_falls_back(tmp_path):
+    container = _manager(tmp_path)
+    original = _add(container, "legacy", "https://10.0.0.11:8765")
+    container.registry_repository.update_if_revision(
+        replace(original, transport_profile_id="missing-profile", updated_at=NOW),
+        expected_revision=1,
+    )
+    legacy = LegacyAdapter()
+
+    result = await _service(
+        container, Client([]), policy=TargetPolicy(), legacy=legacy
+    ).probe("legacy")
+
+    assert result.status.last_error_code == "transport_profile_invalid"
+    assert result.dispatch_state == "not_dispatched"
+    assert legacy.calls == []
+
+
+@pytest.mark.integration
+async def test_manual_agent_never_uses_import_legacy_fallback(tmp_path):
+    container = _manager(tmp_path)
+    identity = "11111111-1111-4111-8111-111111111111"
+    original = _add(
+        container,
+        "manual",
+        "https://10.0.0.11:8765",
+        instance_id=identity,
+    )
+    container.registry_repository.update_if_revision(
+        replace(original, source="manual", updated_at=NOW),
+        expected_revision=1,
+    )
+    legacy = LegacyAdapter()
+
+    result = await _service(
+        container,
+        Client([]),
+        policy=RejectingPolicy(),
+        legacy=legacy,
+    ).probe("manual")
+
+    assert legacy.calls == []
+    assert result.status.connection_status == "unavailable"
+    assert result.status.last_error_code == "target_address_not_allowed"
+    assert result.dispatch_state == "not_dispatched"
+
+
+@pytest.mark.integration
+async def test_configured_dynamic_allowlist_rejection_never_falls_back(tmp_path):
+    container = _manager(tmp_path)
+    _add(container, "legacy", "https://10.0.0.11:8765")
+    legacy = LegacyAdapter()
+
+    result = await _service(
+        container,
+        Client([]),
+        policy=RejectingPolicy(),
+        legacy=legacy,
+        allow_import_without_dynamic_allowlist=False,
+    ).probe("legacy")
+
+    assert result.status.last_error_code == "target_address_not_allowed"
+    assert legacy.calls == []
+
+
+@pytest.mark.integration
+async def test_import_fallback_never_bypasses_forbidden_or_manager_self_target(tmp_path):
+    container = _manager(tmp_path)
+    _add(container, "legacy", "https://10.0.0.11:8765")
+    legacy = LegacyAdapter()
+
+    for code in ("target_address_forbidden", "target_is_manager"):
+        class ForbiddenPolicy:
+            def __init__(self, error_code):
+                self.error_code = error_code
+
+            def resolve(self, _endpoint, _profile):
+                raise TargetPolicyError(self.error_code, "forbidden")
+
+        result = await _service(
+            container,
+            Client([]),
+            policy=ForbiddenPolicy(code),
+            legacy=legacy,
+        ).probe("legacy")
+        assert result.status.last_error_code == code
+
+    assert legacy.calls == []
+
+
+@pytest.mark.integration
+async def test_legacy_fallback_respects_global_probe_limit(tmp_path):
+    container = _manager(tmp_path)
+    _add(container, "alpha", "https://10.0.0.11:8765")
+    _add(container, "beta", "https://10.0.0.12:8765")
+    legacy = LegacyAdapter()
+    legacy.release.clear()
+    service = _service(
+        container,
+        Client([]),
+        policy=RejectingPolicy(),
+        legacy=legacy,
+        max_parallel=1,
+    )
+
+    first = asyncio.create_task(service.probe("alpha"))
+    second = asyncio.create_task(service.probe("beta"))
+    while legacy.active == 0:
+        await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert legacy.max_active == 1
+    assert len(legacy.calls) == 1
+    legacy.release.set()
+    await asyncio.gather(first, second)
+    assert legacy.max_active == 1
 
 
 def _capabilities(instance_id):
@@ -202,7 +472,8 @@ async def test_probe_uses_policy_credential_and_v2_capabilities_then_summary(tmp
     policy = TargetPolicy()
     client = Client([_capabilities("11111111-1111-4111-8111-111111111111"), _summary()])
 
-    status = await _service(container, client, policy).probe("alpha")
+    result = await _service(container, client, policy).probe("alpha")
+    status = result.status
 
     assert policy.calls == [("https://10.0.0.11:8765", "system-tls")]
     assert [call[2] for call in client.calls] == [
@@ -212,7 +483,78 @@ async def test_probe_uses_policy_credential_and_v2_capabilities_then_summary(tmp
     assert all(call[0] == b"secret-alpha" for call in client.calls)
     assert status.connection_status == "ready"
     assert status.workload_status == "healthy"
+    assert result.dispatch_state == "dispatched"
     assert container.status_repository.get("alpha") == status
+
+
+@pytest.mark.integration
+async def test_probe_discards_unapproved_remote_summary_and_capability_fields(tmp_path):
+    container = _manager(tmp_path)
+    identity = "11111111-1111-4111-8111-111111111111"
+    _add(container, "alpha", "https://10.0.0.11:8765", instance_id=identity)
+    capabilities = _capabilities(identity)
+    capabilities.update(
+        {"Authorization": "Bearer remote-secret", "ssh_user": "root"}
+    )
+    summary = _summary()
+    summary.update(
+        {"Authorization": "Bearer remote-secret", "details": {"private_key": "secret"}}
+    )
+    summary["observations"]["details"] = {"password": "secret"}
+    summary["services"]["ssh_user"] = "root"
+
+    await _service(container, Client([capabilities, summary])).probe("alpha")
+
+    stored = container.status_repository.get("alpha")
+    assert set(stored.summary) == {
+        "observed_at",
+        "observations",
+        "logs",
+        "services",
+        "terminals",
+    }
+    assert set(stored.summary["observations"]) == {
+        "total",
+        "warning",
+        "critical",
+        "stale",
+    }
+    assert set(stored.summary["services"]) == {"total", "running", "unhealthy"}
+    serialized = str(stored)
+    assert "remote-secret" not in serialized
+    assert "private_key" not in serialized
+    assert "ssh_user" not in serialized
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("capability", "Authorization:Bearer-secret"),
+        ("capability", "logs.v2\nprivate-key"),
+        ("capability", "x" * 129),
+        ("agent_version", "v1\nAuthorization"),
+        ("agent_version", "v" * 65),
+    ],
+)
+async def test_probe_rejects_unbounded_or_control_remote_metadata(
+    tmp_path, field, value
+):
+    container = _manager(tmp_path)
+    identity = "11111111-1111-4111-8111-111111111111"
+    _add(container, "alpha", "https://10.0.0.11:8765", instance_id=identity)
+    capabilities = _capabilities(identity)
+    if field == "capability":
+        capabilities["capabilities"].append(value)
+    else:
+        capabilities["agent_version"] = value
+
+    result = await _service(container, Client([capabilities])).probe("alpha")
+
+    assert result.status.connection_status == "unavailable"
+    assert result.status.last_error_code == "agent_protocol_error"
+    assert result.dispatch_state == "dispatched"
+    assert value not in str(container.status_repository.get("alpha"))
 
 
 @pytest.mark.integration
@@ -238,6 +580,55 @@ async def test_late_probe_cannot_write_status_after_target_revision_changes(tmp_
 
     assert container.status_repository.get("alpha") is None
     assert container.registry_repository.get("alpha").revision > original.revision
+
+
+@pytest.mark.integration
+async def test_same_agent_probes_are_single_flight_and_newer_result_wins(tmp_path):
+    container = _manager(tmp_path)
+    identity = "11111111-1111-4111-8111-111111111111"
+    _add(
+        container,
+        "alpha",
+        "https://10.0.0.11:8765",
+        instance_id=identity,
+    )
+
+    old_capabilities = _capabilities(identity)
+    old_capabilities["agent_version"] = "0.1.0"
+    new_capabilities = _capabilities(identity)
+    new_capabilities["agent_version"] = "0.2.0"
+
+    class BlockingClient(Client):
+        def __init__(self):
+            super().__init__(
+                [old_capabilities, _summary(critical=1), new_capabilities, _summary()]
+            )
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def request(self, *args, **kwargs):
+            if not self.calls:
+                self.calls.append((args[1], args[2], args[3]))
+                self.entered.set()
+                await self.release.wait()
+                return Response(self.payloads.pop(0))
+            return await super().request(*args, **kwargs)
+
+    client = BlockingClient()
+    service = _service(container, client)
+
+    older = asyncio.create_task(service.probe("alpha"))
+    await client.entered.wait()
+    newer = asyncio.create_task(service.probe("alpha"))
+    await asyncio.sleep(0)
+
+    assert len(client.calls) == 1
+    client.release.set()
+    await asyncio.gather(older, newer)
+
+    final = container.status_repository.get("alpha")
+    assert final.agent_version == "0.2.0"
+    assert final.workload_status == "healthy"
 
 
 @pytest.mark.integration
@@ -302,3 +693,130 @@ async def test_duplicate_reported_identity_marks_all_conflicts_and_blocks_routin
         with pytest.raises(AgentClientError) as blocked:
             await container.agent_client.request(agent, "GET", "/api/capabilities")
         assert blocked.value.dispatch_state == "not_dispatched"
+
+    restarted_client = Client([_capabilities(identity), _summary()])
+    restarted = _service(container, restarted_client)
+    with pytest.raises(AgentProbeError, match="agent_identity_conflict") as sticky:
+        await restarted.probe("alpha")
+    assert sticky.value.dispatch_state == "not_dispatched"
+    assert restarted_client.calls == []
+
+
+@pytest.mark.integration
+async def test_changed_reported_identity_is_sticky_and_blocks_credential_loading(tmp_path):
+    container = _manager(tmp_path)
+    original_id = "11111111-1111-4111-8111-111111111111"
+    _add(
+        container,
+        "alpha",
+        "https://10.0.0.11:8765",
+        instance_id=original_id,
+    )
+    changed_id = "22222222-2222-4222-8222-222222222222"
+    service = _service(container, Client([_capabilities(changed_id), _summary()]))
+
+    with pytest.raises(AgentProbeError, match="agent_identity_changed") as changed:
+        await service.probe("alpha")
+
+    assert changed.value.dispatch_state == "dispatched"
+    assert container.status_repository.get("alpha").last_error_code == "agent_identity_changed"
+    agent = container.agent_registry.get("alpha")
+    with pytest.raises(AgentClientError) as blocked:
+        await container.agent_client.request(agent, "GET", "/api/capabilities")
+    assert blocked.value.dispatch_state == "not_dispatched"
+
+
+@pytest.mark.integration
+def test_identity_conflict_bulk_status_write_rolls_back_if_second_upsert_fails(tmp_path):
+    container = _manager(tmp_path)
+    _add(container, "alpha", "https://10.0.0.11:8765")
+    _add(container, "beta", "https://10.0.0.12:8765")
+    statuses = tuple(
+        AgentStatus(
+            agent_id=agent_id,
+            target_revision=1,
+            connection_status="unavailable",
+            workload_status="unknown",
+            observed_at=NOW,
+            stale_after=NOW + timedelta(seconds=30),
+            api_version=None,
+            agent_version=None,
+            capabilities=(),
+            summary={},
+            last_error_code="agent_identity_conflict",
+            updated_at=NOW,
+        )
+        for agent_id in ("alpha", "beta")
+    )
+    with container.database_engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TRIGGER fail_beta_status BEFORE INSERT ON agent_status "
+            "WHEN NEW.agent_id = 'beta' BEGIN SELECT RAISE(ABORT, 'fail beta'); END"
+        )
+
+    with pytest.raises(Exception, match="status storage"):
+        container.status_repository.update_many_if_target_revisions(statuses)
+
+    assert container.status_repository.get("alpha") is None
+    assert container.status_repository.get("beta") is None
+
+
+@pytest.mark.integration
+def test_bulk_status_revision_mismatch_writes_no_members(tmp_path):
+    container = _manager(tmp_path)
+    _add(container, "alpha", "https://10.0.0.11:8765")
+    _add(container, "beta", "https://10.0.0.12:8765")
+    statuses = tuple(
+        AgentStatus(
+            agent_id=agent_id,
+            target_revision=revision,
+            connection_status="unavailable",
+            workload_status="unknown",
+            observed_at=NOW,
+            stale_after=NOW + timedelta(seconds=30),
+            api_version=None,
+            agent_version=None,
+            capabilities=(),
+            summary={},
+            last_error_code="agent_identity_conflict",
+            updated_at=NOW,
+        )
+        for agent_id, revision in (("alpha", 1), ("beta", 2))
+    )
+
+    assert not container.status_repository.update_many_if_target_revisions(statuses)
+    assert container.status_repository.get("alpha") is None
+    assert container.status_repository.get("beta") is None
+
+
+@pytest.mark.integration
+async def test_failure_never_reuses_summary_from_an_old_target_revision(tmp_path):
+    container = _manager(tmp_path)
+    original = _add(container, "alpha", "https://10.0.0.11:8765")
+    container.status_repository.update_if_target_revision(
+        AgentStatus(
+            agent_id="alpha",
+            target_revision=1,
+            connection_status="ready",
+            workload_status="critical",
+            observed_at=NOW,
+            stale_after=NOW + timedelta(seconds=30),
+            api_version="2",
+            agent_version="0.1.0",
+            capabilities=("summary.v2",),
+            summary=_summary(critical=1),
+            last_error_code=None,
+            updated_at=NOW,
+        ),
+        1,
+    )
+    container.registry_repository.update_if_revision(
+        replace(original, transport_profile_id="missing-profile", updated_at=NOW),
+        expected_revision=1,
+    )
+
+    result = await _service(container, Client([])).probe("alpha")
+
+    assert result.status.target_revision == 2
+    assert result.status.summary == {}
+    assert result.status.capabilities == ()

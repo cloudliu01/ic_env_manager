@@ -1,5 +1,6 @@
 import asyncio
 import random
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -19,6 +20,7 @@ class AgentObservation:
     agent_version: str | None = None
     capabilities: tuple[str, ...] = ()
     last_error: str | None = None
+    dispatch_state: str = "unknown"
 
 
 class AgentAvailabilityService:
@@ -40,6 +42,12 @@ class AgentAvailabilityService:
         self._status_repository = status_repository
         self._persist_probe_status = persist_probe_status
         self._observations: dict[str, AgentObservation] = {}
+        self._probe_delegate: Callable[[str], Awaitable[object]] | None = None
+
+    def set_probe_delegate(
+        self, delegate: Callable[[str], Awaitable[object]]
+    ) -> None:
+        self._probe_delegate = delegate
 
     def summary(self, agent_id: str) -> dict[str, object]:
         summary = self._registry.summary(agent_id)
@@ -47,7 +55,7 @@ class AgentAvailabilityService:
         if not agent.enabled:
             return summary
         observation = self._observations.get(agent_id)
-        if self._status_repository is not None and self._persist_probe_status:
+        if self._status_repository is not None:
             stored = self._status_repository.get(agent_id)
             revision = self._registry.revision(agent_id)
             if (
@@ -97,14 +105,29 @@ class AgentAvailabilityService:
         self._observations.pop(agent_id, None)
 
     def has_capability(self, agent_id: str, capability: str) -> bool:
+        capabilities = self._fresh_capabilities(agent_id)
+        return capabilities is not None and capability in capabilities
+
+    def _fresh_capabilities(self, agent_id: str) -> tuple[str, ...] | None:
+        if self._status_repository is not None:
+            stored = self._status_repository.get(agent_id)
+            revision = self._registry.revision(agent_id)
+            if (
+                stored is not None
+                and revision is not None
+                and stored.target_revision == revision
+                and stored.connection_status in {"ready", "degraded"}
+                and stored.stale_after is not None
+                and stored.stale_after > datetime.now(UTC)
+            ):
+                return stored.capabilities
         observation = self._observations.get(agent_id)
         if observation is None or observation.stale_after <= datetime.now(UTC):
-            return False
-        return capability in observation.capabilities
+            return None
+        return observation.capabilities
 
     async def ensure_capability(self, agent_id: str, capability: str) -> bool:
-        observation = self._observations.get(agent_id)
-        if observation is None or observation.stale_after <= datetime.now(UTC):
+        if self._fresh_capabilities(agent_id) is None:
             await self.probe(agent_id)
         return self.has_capability(agent_id, capability)
 
@@ -129,6 +152,16 @@ class AgentAvailabilityService:
         agent = self._registry.get(agent_id)
         if not agent.enabled:
             return self._registry.summary(agent_id)
+        if self._probe_delegate is not None:
+            await self._probe_delegate(agent_id)
+            return self.summary(agent_id)
+        observation = await self.probe_legacy(agent_id)
+        self._observations[agent_id] = observation
+        self._persist_observation(agent_id, observation)
+        return self.summary(agent_id)
+
+    async def probe_legacy(self, agent_id: str) -> AgentObservation:
+        agent = self._registry.get(agent_id)
         now = datetime.now(UTC)
         try:
             response = await self._client.request(agent, "GET", "/api/capabilities")
@@ -149,6 +182,7 @@ class AgentAvailabilityService:
                 agent_version=agent_version,
                 capabilities=capabilities,
                 last_error="missing_capabilities" if missing_capabilities else None,
+                dispatch_state="dispatched",
             )
         except (KeyError, TypeError, ValueError):
             observation = AgentObservation(
@@ -156,6 +190,7 @@ class AgentAvailabilityService:
                 observed_at=now,
                 stale_after=now + timedelta(seconds=self._stale_after_seconds),
                 last_error="agent_protocol_error",
+                dispatch_state="dispatched",
             )
         except AgentClientError as exc:
             observation = AgentObservation(
@@ -163,9 +198,19 @@ class AgentAvailabilityService:
                 observed_at=now,
                 stale_after=now + timedelta(seconds=self._stale_after_seconds),
                 last_error=exc.category,
+                dispatch_state=(
+                    exc.dispatch_state
+                    if exc.dispatch_state
+                    in {"not_dispatched", "unknown", "dispatched"}
+                    else "unknown"
+                ),
             )
-        self._observations[agent_id] = observation
-        if self._status_repository is not None:
+        return observation
+
+    def _persist_observation(
+        self, agent_id: str, observation: AgentObservation
+    ) -> None:
+        if self._status_repository is not None and self._persist_probe_status:
             revision = self._registry.revision(agent_id)
             if revision is not None:
                 self._status_repository.update_if_target_revision(
@@ -185,7 +230,6 @@ class AgentAvailabilityService:
                     ),
                     expected_revision=revision,
                 )
-        return self.summary(agent_id)
 
     def record_ready_for_test(
         self,

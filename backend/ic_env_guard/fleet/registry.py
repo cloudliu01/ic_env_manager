@@ -140,4 +140,7 @@ class FleetRegistry:
         if self._statuses is None:
             return False
         status = self._statuses.get(agent_id)
-        return status is not None and status.last_error_code == "agent_identity_conflict"
+        return status is not None and status.last_error_code in {
+            "agent_identity_conflict",
+            "agent_identity_changed",
+        }

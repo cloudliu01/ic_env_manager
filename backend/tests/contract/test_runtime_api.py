@@ -162,6 +162,16 @@ def test_manager_runtime_does_not_claim_v2_when_self_target_inventory_fails(
         control_plane=ControlPlaneConfig(audit_database=tmp_path / "control-plane.db"),
     )
 
-    response = TestClient(create_app(config=config)).get("/api/v2/runtime")
+    client = TestClient(create_app(config=config))
+    response = client.get("/api/v2/runtime")
+    probe = client.post(
+        "/api/v2/agents/unknown/probe",
+        headers={"Authorization": "Bearer secret-token"},
+    )
 
-    assert response.json() == {"mode": "manager", "capabilities": []}
+    assert response.json() == {
+        "mode": "manager",
+        "capabilities": ["fleet.v2", "agent-registry.v2"],
+    }
+    assert probe.status_code == 503
+    assert probe.json()["error"]["code"] == "probe_unavailable"
