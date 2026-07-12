@@ -58,6 +58,33 @@ def _upgrade_environment(
     )
     _write_executable(fake_bin / "chown", "#!/usr/bin/env bash\nexit 0\n")
     _write_executable(
+        fake_bin / "stat",
+        "#!/usr/bin/env bash\n"
+        "target=${@: -1}\n"
+        "if [[ -n \"${FAKE_WRONG_OWNER_PATH:-}\" "
+        "&& \"$target\" = \"$FAKE_WRONG_OWNER_PATH\" ]]; then\n"
+        "  if [[ \"$1\" = -c || \"$1\" = -f ]]; then echo \"999 700\"; exit 0; fi\n"
+        "fi\n"
+        "exec /usr/bin/stat \"$@\"\n",
+    )
+    _write_executable(
+        fake_bin / "mv",
+        "#!/usr/bin/env bash\n"
+        "echo \"mv $*\" >> \"$EVENT_LOG\"\n"
+        "exec /bin/mv \"$@\"\n",
+    )
+    _write_executable(
+        fake_bin / "install",
+        "#!/usr/bin/env bash\n"
+        "echo \"install $*\" >> \"$EVENT_LOG\"\n"
+        "if [[ \"${FAIL_CURRENT_STEP:-}\" = install && \"$*\" = *ic-env-guard@.service* "
+        "&& ! -e \"$FAIL_ONCE_DIR/install\" ]]; then\n"
+        "  touch \"$FAIL_ONCE_DIR/install\"\n"
+        "  exit 1\n"
+        "fi\n"
+        "exec \"$REAL_INSTALL\" \"$@\"\n",
+    )
+    _write_executable(
         fake_bin / "ic-env-guard-config",
         "#!/usr/bin/env bash\n"
         "echo \"validate $2\" >> \"$EVENT_LOG\"\n"
@@ -76,6 +103,13 @@ def _upgrade_environment(
         "&& \"$*\" = \"start ic-env-guard@edaops.service\" ]]; then\n"
         "  exit 1\n"
         "fi\n"
+        "if [[ \"${FAIL_CURRENT_STEP:-}\" = daemon-reload && \"$action\" = daemon-reload "
+        "&& ! -e \"$FAIL_ONCE_DIR/daemon-reload\" ]]; then\n"
+        "  touch \"$FAIL_ONCE_DIR/daemon-reload\"; exit 1\n"
+        "fi\n"
+        "if [[ \"${FAIL_CURRENT_STEP:-}\" = \"$action\" "
+        "&& \"$unit\" = ic-env-guard@edaops.service "
+        "&& ! -e \"$FAIL_ONCE_DIR/$action\" ]]; then touch \"$FAIL_ONCE_DIR/$action\"; exit 1; fi\n"
         "case \"$action\" in\n"
         "  enable) touch \"$SYSTEMCTL_STATE/enabled-$unit\" ;;\n"
         "  disable) rm -f \"$SYSTEMCTL_STATE/enabled-$unit\" ;;\n"
@@ -92,7 +126,7 @@ def _upgrade_environment(
         "if [[ -f \"$UPGRADE_MARKER\" ]]; then\n"
         "  phase=$(sed -n 's/^phase=//p' \"$UPGRADE_MARKER\")\n"
         "fi\n"
-        "echo \"sync $phase\" >> \"$EVENT_LOG\"\n"
+        "echo \"sync $phase $*\" >> \"$EVENT_LOG\"\n"
         "if [[ -n \"${INTERRUPT_PHASE:-}\" && \"$phase\" = \"$INTERRUPT_PHASE\" ]]; then\n"
         "  kill -9 \"$PPID\"\n"
         "fi\n",
@@ -109,10 +143,37 @@ def _upgrade_environment(
             ),
             "FAIL_NEW_START": "1" if fail_new_start else "0",
             "FAIL_STAGED_VALIDATION": "1" if fail_staged_validation else "0",
+            "FAIL_CURRENT_STEP": "",
+            "FAIL_ONCE_DIR": str(service_state),
+            "FAKE_WRONG_OWNER_PATH": "",
+            "REAL_INSTALL": shutil.which("install") or "/usr/bin/install",
             "INTERRUPT_PHASE": "",
         }
     )
     return environment, root
+
+
+def _prepare_current_user_layout(
+    tmp_path: Path, root: Path, *, active: bool, enabled: bool
+) -> None:
+    config = root / "etc/ic-env-guard/edaops.yaml"
+    state = root / "var/lib/ic-env-guard/edaops"
+    state.mkdir(mode=0o700)
+    (state / "token").write_text("current-token\n", encoding="utf-8")
+    config.write_text(
+        "mode: agent\n"
+        "auth:\n  token_file: /var/lib/ic-env-guard/edaops/token\n"
+        "state_database: /var/lib/ic-env-guard/edaops/state.db\n",
+        encoding="utf-8",
+    )
+    service_state = tmp_path / "service-state"
+    for path in service_state.iterdir():
+        if path.name.startswith(("active-", "enabled-")):
+            path.unlink()
+    if active:
+        (service_state / "active-ic-env-guard@edaops.service").touch()
+    if enabled:
+        (service_state / "enabled-ic-env-guard@edaops.service").touch()
 
 
 def _start_config(tmp_path: Path, mode: str, **overrides: str) -> tuple[str, dict]:
@@ -340,6 +401,103 @@ def test_upgrade_migrates_legacy_layout_before_retiring_legacy_unit(tmp_path):
     assert (tmp_path / "service-state/enabled-ic-env-guard@edaops.service").is_file()
 
 
+def test_upgrade_publishes_config_from_owner_only_same_directory_temp(tmp_path):
+    environment, root = _upgrade_environment(tmp_path)
+
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    config_dir = root / "etc/ic-env-guard"
+    config_file = config_dir / "edaops.yaml"
+    events = (tmp_path / "events.log").read_text(encoding="utf-8").splitlines()
+    publish = next(
+        event
+        for event in events
+        if event.startswith("mv ") and event.endswith(str(config_file))
+    )
+    source = Path(publish.removeprefix("mv ").removesuffix(f" {config_file}"))
+    assert source.parent == config_dir
+    assert source.name == ".edaops.yaml.upgrade"
+    assert any(event.endswith(f" {source}") for event in events if event.startswith("sync "))
+
+
+@pytest.mark.parametrize("failure", ["install", "daemon-reload", "enable", "start"])
+def test_existing_user_upgrade_failure_restores_active_enabled_state(tmp_path, failure):
+    environment, root = _upgrade_environment(tmp_path)
+    _prepare_current_user_layout(tmp_path, root, active=True, enabled=True)
+    environment["FAIL_CURRENT_STEP"] = failure
+
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    service_state = tmp_path / "service-state"
+    assert (service_state / "active-ic-env-guard@edaops.service").is_file()
+    assert (service_state / "enabled-ic-env-guard@edaops.service").is_file()
+    assert not (service_state / "active-ic-env-guard.service").exists()
+    assert not (service_state / "enabled-ic-env-guard.service").exists()
+
+
+def test_existing_user_upgrade_does_not_start_originally_inactive_unit(tmp_path):
+    environment, root = _upgrade_environment(tmp_path)
+    _prepare_current_user_layout(tmp_path, root, active=False, enabled=False)
+
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    events = (tmp_path / "events.log").read_text(encoding="utf-8").splitlines()
+    assert "systemctl stop ic-env-guard@edaops.service" not in events
+    assert "systemctl start ic-env-guard@edaops.service" not in events
+    assert "systemctl enable ic-env-guard@edaops.service" not in events
+
+
+def test_existing_user_upgrade_publishes_unit_before_stopping_active_service(tmp_path):
+    environment, root = _upgrade_environment(tmp_path)
+    _prepare_current_user_layout(tmp_path, root, active=True, enabled=True)
+
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    events = (tmp_path / "events.log").read_text(encoding="utf-8").splitlines()
+    unit_file = root / "etc/systemd/system/ic-env-guard@.service"
+    publish_index = next(
+        index
+        for index, event in enumerate(events)
+        if event.startswith("mv ") and event.endswith(str(unit_file))
+    )
+    publish = events[publish_index]
+    source = Path(publish.removeprefix("mv ").removesuffix(f" {unit_file}"))
+    assert source.parent == unit_file.parent
+    assert any(event.endswith(f" {source}") for event in events if event.startswith("sync "))
+    reload_index = events.index("systemctl daemon-reload")
+    enable_index = events.index("systemctl enable ic-env-guard@edaops.service")
+    stop_index = events.index("systemctl stop ic-env-guard@edaops.service")
+    assert publish_index < reload_index < enable_index < stop_index
+
+
 def test_upgrade_restarts_legacy_unit_when_new_instance_fails(tmp_path):
     environment, _root = _upgrade_environment(tmp_path, fail_new_start=True)
 
@@ -430,6 +588,7 @@ def test_upgrade_rejects_concurrent_live_owner_before_service_changes(tmp_path):
     lock_dir = root / "var/lib/ic-env-guard/.ic-env-guard-edaops.upgrade.lock"
     lock_dir.mkdir(mode=0o700)
     (lock_dir / "pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+    (lock_dir / "pid").chmod(0o600)
 
     result = subprocess.run(
         [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
@@ -441,7 +600,120 @@ def test_upgrade_rejects_concurrent_live_owner_before_service_changes(tmp_path):
 
     assert result.returncode != 0
     assert "already running" in result.stdout + result.stderr
-    assert not (tmp_path / "events.log").exists()
+    events = (tmp_path / "events.log").read_text(encoding="utf-8").splitlines()
+    assert not any(event.startswith("systemctl ") for event in events)
+
+
+@pytest.mark.parametrize(
+    "target", ["lock", "pid", "stage", "marker", "completed", "config-temp"]
+)
+def test_upgrade_rejects_wrong_mode_control_metadata(tmp_path, target):
+    environment, root = _upgrade_environment(tmp_path)
+    state_parent = root / "var/lib/ic-env-guard"
+    lock_dir = state_parent / ".ic-env-guard-edaops.upgrade.lock"
+    stage = state_parent / ".ic-env-guard-edaops.upgrade"
+    completed = state_parent / ".ic-env-guard-edaops.upgrade.complete"
+    if target in {"lock", "pid"}:
+        lock_dir.mkdir(mode=0o700)
+        (lock_dir / "pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+        (lock_dir / "pid").chmod(0o600)
+        (lock_dir if target == "lock" else lock_dir / "pid").chmod(0o755)
+    elif target in {"stage", "marker", "config-temp"}:
+        stage.mkdir(mode=0o700)
+        (stage / "marker").write_text(
+            "format=ic-env-guard-legacy-upgrade-v1\naccount=edaops\nphase=prepared\n",
+            encoding="utf-8",
+        )
+        (stage / "marker").chmod(0o600)
+        if target == "config-temp":
+            config_temp = root / "etc/ic-env-guard/.edaops.yaml.upgrade"
+            config_temp.write_text("staged\n", encoding="utf-8")
+            config_temp.chmod(0o644)
+        else:
+            (stage if target == "stage" else stage / "marker").chmod(0o755)
+    else:
+        completed.mkdir(mode=0o755)
+        (completed / "marker").write_text(
+            "format=ic-env-guard-legacy-upgrade-v1\naccount=edaops\nphase=legacy-disabled\n",
+            encoding="utf-8",
+        )
+        (completed / "marker").chmod(0o600)
+
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "unsafe" in (result.stdout + result.stderr).lower()
+
+
+@pytest.mark.parametrize("kind", ["regular", "symlink"])
+def test_upgrade_refuses_unmarked_config_temp_without_touching_it(tmp_path, kind):
+    environment, root = _upgrade_environment(tmp_path)
+    config_temp = root / "etc/ic-env-guard/.edaops.yaml.upgrade"
+    victim = tmp_path / "victim-config"
+    if kind == "symlink":
+        victim.write_text("untouched\n", encoding="utf-8")
+        config_temp.symlink_to(victim)
+    else:
+        config_temp.write_text("operator-data\n", encoding="utf-8")
+        config_temp.chmod(0o600)
+
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    if kind == "symlink":
+        assert victim.read_text(encoding="utf-8") == "untouched\n"
+        assert config_temp.is_symlink()
+    else:
+        assert config_temp.read_text(encoding="utf-8") == "operator-data\n"
+
+
+def test_upgrade_rejects_wrong_effective_owner_control_metadata(tmp_path):
+    environment, root = _upgrade_environment(tmp_path)
+    lock_dir = root / "var/lib/ic-env-guard/.ic-env-guard-edaops.upgrade.lock"
+    lock_dir.mkdir(mode=0o700)
+    (lock_dir / "pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+    (lock_dir / "pid").chmod(0o600)
+    environment["FAKE_WRONG_OWNER_PATH"] = str(lock_dir)
+
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "owner" in (result.stdout + result.stderr).lower()
+
+
+def test_upgrade_rejects_group_writable_control_parent(tmp_path):
+    environment, root = _upgrade_environment(tmp_path)
+    config_dir = root / "etc/ic-env-guard"
+    config_dir.chmod(0o775)
+
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "parent" in (result.stdout + result.stderr).lower()
 
 
 def test_upgrade_refuses_symlinked_persistent_stage_without_touching_target(tmp_path):
@@ -464,7 +736,8 @@ def test_upgrade_refuses_symlinked_persistent_stage_without_touching_target(tmp_
     assert result.returncode != 0
     assert sentinel.read_text(encoding="utf-8") == "untouched\n"
     assert stage.is_symlink()
-    assert not (tmp_path / "events.log").exists()
+    events = (tmp_path / "events.log").read_text(encoding="utf-8").splitlines()
+    assert not any(event.startswith("systemctl ") for event in events)
 
 
 def test_upgrade_recovers_marker_publication_interruption(tmp_path):
@@ -558,4 +831,5 @@ def test_upgrade_still_rejects_unrecognized_final_state_directory(tmp_path):
 
     assert result.returncode != 0
     assert (unknown / "operator-file").read_text(encoding="utf-8") == "keep\n"
-    assert not (tmp_path / "events.log").exists()
+    events = (tmp_path / "events.log").read_text(encoding="utf-8").splitlines()
+    assert not any(event.startswith("systemctl ") for event in events)

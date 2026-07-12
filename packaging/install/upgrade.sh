@@ -19,6 +19,7 @@ group="$(id -gn "${account}")"
 root="${IC_ENV_GUARD_ROOT:-}"
 config_dir="${root}/etc/ic-env-guard"
 config_file="${config_dir}/${account}.yaml"
+config_temp="${config_dir}/.${account}.yaml.upgrade"
 legacy_config="${config_dir}/config.yaml"
 state_parent="${root}/var/lib/ic-env-guard"
 state_dir="${state_parent}/${account}"
@@ -38,15 +39,93 @@ lock_pid="${lock_dir}/pid"
 lock_owned=0
 migration_active=0
 cutover_started=0
+current_upgrade=0
+current_was_active=0
+current_was_enabled=0
 
 validate_config() {
   "${validator}" validate "$1"
 }
 
+path_metadata() {
+  stat -c '%u %a' "$1" 2>/dev/null || stat -f '%u %Lp' "$1"
+}
+
+require_control_dir() {
+  local path="$1"
+  local metadata owner mode
+  if [[ -L "${path}" || ! -d "${path}" ]]; then
+    echo "unsafe control directory: ${path}" >&2
+    return 1
+  fi
+  metadata="$(path_metadata "${path}")" || return 1
+  read -r owner mode <<< "${metadata}"
+  if [[ "${owner}" != "${EUID}" ]]; then
+    echo "unsafe control directory owner: ${path}" >&2
+    return 1
+  fi
+  if [[ "${mode}" != "700" ]]; then
+    echo "unsafe control directory mode: ${path}" >&2
+    return 1
+  fi
+}
+
+require_control_file() {
+  local path="$1"
+  local metadata owner mode
+  if [[ -L "${path}" || ! -f "${path}" ]]; then
+    echo "unsafe control file: ${path}" >&2
+    return 1
+  fi
+  metadata="$(path_metadata "${path}")" || return 1
+  read -r owner mode <<< "${metadata}"
+  if [[ "${owner}" != "${EUID}" ]]; then
+    echo "unsafe control file owner: ${path}" >&2
+    return 1
+  fi
+  if [[ "${mode}" != "600" ]]; then
+    echo "unsafe control file mode: ${path}" >&2
+    return 1
+  fi
+}
+
+require_control_parent() {
+  local path="$1"
+  local metadata owner mode mode_value
+  if [[ -L "${path}" || ! -d "${path}" ]]; then
+    echo "unsafe control parent: ${path}" >&2
+    return 1
+  fi
+  metadata="$(path_metadata "${path}")" || return 1
+  read -r owner mode <<< "${metadata}"
+  mode_value=$((8#${mode}))
+  if [[ "${owner}" != "${EUID}" ]] || (( (mode_value & 8#022) != 0 )); then
+    echo "unsafe control parent owner or mode: ${path}" >&2
+    return 1
+  fi
+}
+
 install_unit() {
+  local unit_file="${unit_dir}/ic-env-guard@.service"
+  local unit_temp="${unit_dir}/.ic-env-guard@.service.upgrade"
+  if [[ -e "${unit_dir}" || -L "${unit_dir}" ]]; then
+    require_control_parent "${unit_dir}"
+  fi
   install -d -m 0755 "${unit_dir}"
-  install -m 0644 packaging/systemd/ic-env-guard@.service \
-    "${unit_dir}/ic-env-guard@.service"
+  require_control_parent "${unit_dir}"
+  if [[ -e "${unit_temp}" || -L "${unit_temp}" ]]; then
+    echo "unsafe existing unit staging file: ${unit_temp}" >&2
+    return 1
+  fi
+  if ! install -m 0600 packaging/systemd/ic-env-guard@.service "${unit_temp}"; then
+    rm -f "${unit_temp}"
+    return 1
+  fi
+  chown root:root "${unit_temp}"
+  require_control_file "${unit_temp}"
+  sync "${unit_temp}"
+  mv "${unit_temp}" "${unit_file}"
+  chmod 0644 "${unit_file}"
   systemctl daemon-reload
 }
 
@@ -70,11 +149,14 @@ cleanup_stage_dir() {
   if [[ ! -e "${directory}" && ! -L "${directory}" ]]; then
     return
   fi
-  if [[ -L "${directory}" || ! -d "${directory}" ]]; then
-    echo "refusing unsafe upgrade staging path: ${directory}" >&2
-    return 1
-  fi
+  require_control_dir "${directory}"
   remove_known_state_dir "${directory}/state"
+  for control_file in "${directory}/marker.next" "${directory}/marker" \
+    "${directory}/config.prepared.yaml" "${directory}/config.final.yaml"; do
+    if [[ -e "${control_file}" || -L "${control_file}" ]]; then
+      require_control_file "${control_file}"
+    fi
+  done
   rm -f "${directory}/config.prepared.yaml" "${directory}/config.final.yaml" \
     "${directory}/marker.next" "${directory}/marker"
   rmdir "${directory}"
@@ -86,9 +168,7 @@ cleanup_stage() {
 
 marker_file_phase() {
   local marker_file="$1"
-  if [[ -L "${marker_file}" || ! -f "${marker_file}" ]]; then
-    return 1
-  fi
+  require_control_file "${marker_file}" >/dev/null || return 1
   grep -Fxq 'format=ic-env-guard-legacy-upgrade-v1' "${marker_file}" || return 1
   grep -Fxq "account=${account}" "${marker_file}" || return 1
   local phase
@@ -99,6 +179,14 @@ marker_file_phase() {
       ;;
     *) return 1 ;;
   esac
+}
+
+remove_config_temp() {
+  if [[ ! -e "${config_temp}" && ! -L "${config_temp}" ]]; then
+    return
+  fi
+  require_control_file "${config_temp}"
+  rm -f "${config_temp}"
 }
 
 write_marker() {
@@ -122,6 +210,19 @@ rollback_to_legacy() {
   systemctl start "${legacy_unit}" 2>/dev/null || true
 }
 
+restore_current_state() {
+  if [[ ${current_was_enabled} -eq 1 ]]; then
+    systemctl enable "${new_unit}" 2>/dev/null || true
+  else
+    systemctl disable "${new_unit}" 2>/dev/null || true
+  fi
+  if [[ ${current_was_active} -eq 1 ]]; then
+    systemctl start "${new_unit}" 2>/dev/null || true
+  else
+    systemctl stop "${new_unit}" 2>/dev/null || true
+  fi
+}
+
 release_lock() {
   if [[ ${lock_owned} -eq 1 ]]; then
     rm -f "${lock_pid}"
@@ -138,15 +239,27 @@ on_exit() {
       rollback_to_legacy
     fi
     rm -f "${config_file}"
+    remove_config_temp 2>/dev/null || true
     remove_known_state_dir "${state_dir}" 2>/dev/null || true
     cleanup_stage 2>/dev/null || true
+  fi
+  if [[ ${status} -ne 0 && ${current_upgrade} -eq 1 ]]; then
+    restore_current_state
   fi
   release_lock
   exit "${status}"
 }
 trap on_exit EXIT
 
+if [[ -e "${config_dir}" || -L "${config_dir}" ]]; then
+  require_control_parent "${config_dir}"
+fi
+if [[ -e "${state_parent}" || -L "${state_parent}" ]]; then
+  require_control_parent "${state_parent}"
+fi
 install -d -m 0755 "${config_dir}" "${state_parent}"
+require_control_parent "${config_dir}"
+require_control_parent "${state_parent}"
 
 # mkdir is the lock primitive. A SIGKILL leaves the directory behind, so a
 # later run may remove it only when its recorded owner PID is no longer alive.
@@ -155,10 +268,12 @@ if [[ -L "${lock_dir}" ]]; then
   exit 1
 fi
 if ! mkdir -m 0700 "${lock_dir}" 2>/dev/null; then
+  require_control_dir "${lock_dir}"
   if [[ ! -d "${lock_dir}" || -L "${lock_pid}" || ! -f "${lock_pid}" ]]; then
     echo "refusing unrecognized upgrade lock: ${lock_dir}" >&2
     exit 1
   fi
+  require_control_file "${lock_pid}"
   owner_pid="$(cat "${lock_pid}")"
   if [[ "${owner_pid}" =~ ^[1-9][0-9]*$ ]] && kill -0 "${owner_pid}" 2>/dev/null; then
     echo "an Agent upgrade is already running for ${account}" >&2
@@ -174,12 +289,14 @@ fi
 lock_owned=1
 printf '%s\n' "$$" > "${lock_pid}"
 chmod 0600 "${lock_pid}"
+require_control_dir "${lock_dir}"
+require_control_file "${lock_pid}"
 
 # Successful cutover is committed by atomically renaming the marked staging
 # directory. A kill during later cleanup therefore cannot look like an
 # incomplete migration and must not roll the service back.
 if [[ -e "${completed_dir}" || -L "${completed_dir}" ]]; then
-  if [[ -L "${completed_dir}" || ! -d "${completed_dir}" ]] \
+  if ! require_control_dir "${completed_dir}" \
     || [[ "$(marker_file_phase "${completed_dir}/marker" 2>/dev/null || true)" != "legacy-disabled" ]]; then
     echo "refusing unrecognized completed upgrade staging: ${completed_dir}" >&2
     exit 1
@@ -190,10 +307,7 @@ fi
 # A valid marker proves this script owns any published target paths. Recover
 # every incomplete phase to the untouched legacy layout, then retry cleanly.
 if [[ -e "${stage_dir}" || -L "${stage_dir}" ]]; then
-  if [[ -L "${stage_dir}" || ! -d "${stage_dir}" ]]; then
-    echo "refusing unsafe upgrade staging path: ${stage_dir}" >&2
-    exit 1
-  fi
+  require_control_dir "${stage_dir}"
   if [[ ! -e "${marker}" && ! -L "${marker}" ]] \
     && marker_file_phase "${stage_dir}/marker.next" >/dev/null; then
     mv "${stage_dir}/marker.next" "${marker}"
@@ -203,6 +317,7 @@ if [[ -e "${stage_dir}" || -L "${stage_dir}" ]]; then
     echo "Recovering interrupted Agent migration from phase ${phase}."
     rollback_to_legacy
     rm -f "${config_file}"
+    remove_config_temp
     remove_known_state_dir "${state_dir}"
     cleanup_stage
   elif [[ ! -e "${marker}" && ! -L "${marker}" \
@@ -214,7 +329,10 @@ if [[ -e "${stage_dir}" || -L "${stage_dir}" ]]; then
     && ! -L "${stage_dir}/marker.next" ]]; then
     # No durable marker means the legacy service was never stopped. Only an
     # otherwise empty stage (plus a regular partial marker.next) is removable.
-    rm -f "${stage_dir}/marker.next"
+    if [[ -e "${stage_dir}/marker.next" ]]; then
+      require_control_file "${stage_dir}/marker.next"
+      rm -f "${stage_dir}/marker.next"
+    fi
     rmdir "${stage_dir}" || {
       echo "refusing unrecognized upgrade staging directory: ${stage_dir}" >&2
       exit 1
@@ -225,22 +343,29 @@ if [[ -e "${stage_dir}" || -L "${stage_dir}" ]]; then
   fi
 fi
 
+if [[ -e "${config_temp}" || -L "${config_temp}" ]]; then
+  echo "refusing unrecognized config staging file: ${config_temp}" >&2
+  exit 1
+fi
+
 if [[ -f "${config_file}" ]]; then
   validate_config "${config_file}"
-  systemctl stop "${new_unit}" 2>/dev/null || true
-  restart_new=1
-  restore_current_unit() {
-    status=$?
-    if [[ ${status} -ne 0 && ${restart_new} -eq 1 ]]; then
-      systemctl enable "${new_unit}" 2>/dev/null || true
-      systemctl start "${new_unit}" 2>/dev/null || true
-    fi
-    return "${status}"
-  }
+  if systemctl is-active "${new_unit}" >/dev/null 2>&1; then
+    current_was_active=1
+  fi
+  if systemctl is-enabled "${new_unit}" >/dev/null 2>&1; then
+    current_was_enabled=1
+  fi
+  current_upgrade=1
   install_unit
-  systemctl enable "${new_unit}"
-  systemctl start "${new_unit}" || restore_current_unit
-  restart_new=0
+  if [[ ${current_was_enabled} -eq 1 ]]; then
+    systemctl enable "${new_unit}"
+  fi
+  if [[ ${current_was_active} -eq 1 ]]; then
+    systemctl stop "${new_unit}"
+    systemctl start "${new_unit}"
+  fi
+  current_upgrade=0
   echo "Agent upgraded while preserving the user config, identity, token, and state database."
   exit 0
 fi
@@ -300,14 +425,17 @@ fi
 sed \
   -e "s|/var/lib/ic-env-guard/token|/var/lib/ic-env-guard/${account}/token|g" \
   -e "s|/var/lib/ic-env-guard/state\.db|/var/lib/ic-env-guard/${account}/state.db|g" \
-  "${legacy_config}" > "${stage_dir}/config.final.yaml"
-chown "root:${group}" "${stage_dir}/config.final.yaml"
-chmod 0640 "${stage_dir}/config.final.yaml"
+  "${legacy_config}" > "${config_temp}"
+chown root:root "${config_temp}"
+chmod 0600 "${config_temp}"
+sync "${config_temp}"
 
 mv "${stage_state}" "${state_dir}"
 write_marker state-published
-validate_config "${stage_dir}/config.final.yaml"
-mv "${stage_dir}/config.final.yaml" "${config_file}"
+validate_config "${config_temp}"
+mv "${config_temp}" "${config_file}"
+chown "root:${group}" "${config_file}"
+chmod 0640 "${config_file}"
 write_marker config-published
 
 install_unit

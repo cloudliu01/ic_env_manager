@@ -133,10 +133,19 @@ selected account and rejects root.
 
 The upgrader serializes runs with an owner-only lock and records each cutover phase in the
 owner-only `.ic-env-guard-<user>.upgrade` staging directory. State and config publish by atomic
-same-filesystem rename. If the process is killed after the marker is durable, rerun the same
-command: it recognizes its marker, restores the legacy unit, removes only its known staged or
-published copies, and retries from the unchanged legacy originals. Unknown or symlinked lock,
-staging, and final-state paths fail closed and require operator inspection.
+same-filesystem rename; the final config is fsynced in an owner-only temporary file beside its
+destination, never moved from `/var` to `/etc`. Lock, marker, staging, config-temp, and completed
+metadata must have the effective owner and exact private modes, and their parents must not be
+symlinks or group/world writable. If the process is killed after the marker is durable, rerun
+the same command: it recognizes its marker, restores the legacy unit, removes only its known
+staged or published copies, and retries from the unchanged legacy originals. Unknown or
+symlinked control paths fail closed and require operator inspection.
+
+For an already migrated per-user install, the upgrader publishes and fsyncs the unit template
+from a temporary file in the systemd unit directory, reloads systemd, and enables it before any
+running instance is stopped. It records the original active/enabled state and attempts to
+restore that exact state after install, reload, enable, or start failure; an originally inactive
+instance is not started merely because its package was upgraded.
 
 Automatic migration accepts only the paths emitted by the old installer. If the legacy config
 uses customized token or state paths, the upgrader exits before stopping the legacy service;
