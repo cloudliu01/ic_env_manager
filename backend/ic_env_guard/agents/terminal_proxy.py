@@ -2,7 +2,7 @@ import secrets
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 MAX_TERMINAL_FRAME_BYTES = 64 * 1024
 
@@ -11,6 +11,7 @@ MAX_TERMINAL_FRAME_BYTES = 64 * 1024
 class GatewayTicketReservation:
     id: str
     agent_id: str
+    expires_at: datetime
     revision: int | None = None
     credential_ref: str | None = None
     transport_profile_id: str | None = None
@@ -41,10 +42,12 @@ class GatewayTicketStore:
         *,
         clock: Callable[[], datetime] | None = None,
         durable_removal_blocker: Callable[[str], bool] | None = None,
+        reservation_ttl_seconds: int = 30,
     ) -> None:
         self._max_outstanding = max_outstanding
         self._clock = clock or (lambda: datetime.now(UTC))
         self._durable_removal_blocker = durable_removal_blocker
+        self._reservation_ttl = timedelta(seconds=reservation_ttl_seconds)
         self._reservations: dict[str, GatewayTicketReservation] = {}
         self._tickets: dict[str, GatewayTicket] = {}
         self._active: dict[str, GatewayTicket] = {}
@@ -68,8 +71,14 @@ class GatewayTicketStore:
             if len(self._reservations) + len(self._tickets) >= self._max_outstanding:
                 return None
             reservation = GatewayTicketReservation(
-                secrets.token_urlsafe(16), agent_id, revision, credential_ref,
-                transport_profile_id, normalized_endpoint, slot,
+                id=secrets.token_urlsafe(16),
+                agent_id=agent_id,
+                expires_at=self._clock() + self._reservation_ttl,
+                revision=revision,
+                credential_ref=credential_ref,
+                transport_profile_id=transport_profile_id,
+                normalized_endpoint=normalized_endpoint,
+                slot=slot,
             )
             self._reservations[reservation.id] = reservation
             return reservation
@@ -93,6 +102,7 @@ class GatewayTicketStore:
         expires_at: datetime,
     ) -> GatewayTicket:
         with self._lock:
+            self._prune_expired_unlocked()
             stored = self._reservations.get(reservation.id)
             if stored is None:
                 raise ValueError("gateway ticket reservation is not active")
@@ -213,6 +223,15 @@ class GatewayTicketStore:
 
     def _prune_expired_unlocked(self) -> None:
         now = self._clock()
+        expired_reservations = [
+            reservation_id
+            for reservation_id, record in self._reservations.items()
+            if record.expires_at <= now
+        ]
+        for reservation_id in expired_reservations:
+            record = self._reservations.pop(reservation_id, None)
+            if record is not None:
+                _release_slot(record.slot)
         expired = [ticket for ticket, record in self._tickets.items() if record.expires_at <= now]
         for ticket in expired:
             record = self._tickets.pop(ticket, None)

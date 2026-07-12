@@ -33,7 +33,7 @@ from ic_env_guard.db.control_plane_audit import (
     ControlPlaneAuditEventCreate,
     ControlPlaneAuditRepository,
 )
-from ic_env_guard.proxy.http import AgentHttpProxy, AgentProxyError
+from ic_env_guard.proxy.http import AgentHttpProxy, AgentProxyError, AgentRouteCapture
 
 router = APIRouter(prefix="/api/agents/{agent_id}/terminals", tags=["agent-terminals"])
 
@@ -96,6 +96,7 @@ async def _dispatch(
     correlation_id: str | None = None,
     source_addr: str | None = None,
     validate_response: Callable[[httpx.Response], str | None] | None = None,
+    route_capture: AgentRouteCapture | None = None,
 ) -> Response:
     correlation_id = correlation_id or str(uuid4())
     audit = audit_repo.record_intent(
@@ -118,6 +119,7 @@ async def _dispatch(
             query=params or {},
             correlation_id=correlation_id,
             json=json,
+            route_capture=route_capture,
         )
     except AgentProxyError as exc:
         failure_category = failure_category_for_client_error(method, exc.code)
@@ -367,31 +369,43 @@ async def create_agent_terminal_connect_token(
             failure_category="gateway_capacity_exceeded",
         )
         raise ApiError(429, "gateway_capacity_exceeded", "gateway proxy capacity exceeded")
-    record = registry.record(agent_id)
-    reservation = tickets.reserve(
-        agent_id,
-        revision=record.revision if record else None,
-        credential_ref=record.credential_ref if record else None,
-        transport_profile_id=record.transport_profile_id if record else None,
-        normalized_endpoint=record.normalized_endpoint if record else None,
-        slot=slot,
-    )
-    if reservation is None:
-        slot.release()
-        _record_pre_dispatch_failure(
-            audit_repo=audit_repo,
-            audit_health=audit_health,
-            actor=actor,
-            agent_id=agent_id,
-            operation="terminals.connect-token",
-            target=f"terminal:{terminal_id}",
-            correlation_id=getattr(request.state, "correlation_id", None),
-            source_addr=request.client.host if request.client else None,
-            failure_category="gateway_capacity_exceeded",
-        )
-        raise ApiError(429, "gateway_capacity_exceeded", "gateway ticket capacity exceeded")
+    reservation = None
     committed = False
     try:
+        record = registry.record(agent_id)
+        route_capture = (
+            AgentRouteCapture(
+                revision=record.revision,
+                credential_ref=record.credential_ref,
+                transport_profile_id=record.transport_profile_id,
+                normalized_endpoint=record.normalized_endpoint,
+            )
+            if record is not None
+            else None
+        )
+        reservation = tickets.reserve(
+            agent_id,
+            revision=record.revision if record else None,
+            credential_ref=record.credential_ref if record else None,
+            transport_profile_id=record.transport_profile_id if record else None,
+            normalized_endpoint=record.normalized_endpoint if record else None,
+            slot=slot,
+        )
+        if reservation is None:
+            _record_pre_dispatch_failure(
+                audit_repo=audit_repo,
+                audit_health=audit_health,
+                actor=actor,
+                agent_id=agent_id,
+                operation="terminals.connect-token",
+                target=f"terminal:{terminal_id}",
+                correlation_id=getattr(request.state, "correlation_id", None),
+                source_addr=request.client.host if request.client else None,
+                failure_category="gateway_capacity_exceeded",
+            )
+            raise ApiError(
+                429, "gateway_capacity_exceeded", "gateway ticket capacity exceeded"
+            )
         response = await _dispatch(
             agent_id=agent_id,
             upstream_path=f"/api/terminals/{terminal_id}/connect-token",
@@ -407,6 +421,7 @@ async def create_agent_terminal_connect_token(
             correlation_id=getattr(request.state, "correlation_id", None),
             source_addr=request.client.host if request.client else None,
             validate_response=_validate_connect_token_response,
+            route_capture=route_capture,
         )
         if not isinstance(response, JSONResponse):
             return response
@@ -433,7 +448,10 @@ async def create_agent_terminal_connect_token(
         )
     finally:
         if not committed:
-            tickets.release_reservation(reservation)
+            if reservation is None:
+                slot.release()
+            else:
+                tickets.release_reservation(reservation)
 
 
 @router.delete("/{terminal_id}")

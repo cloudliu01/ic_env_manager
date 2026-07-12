@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import httpx
@@ -10,7 +11,7 @@ from ic_env_guard.agents.registry import AgentRegistry
 from ic_env_guard.agents.terminal_proxy import GatewayProxyLimiter
 from ic_env_guard.api.agent_http import get_agent_http_client
 from ic_env_guard.api.agent_terminals import get_gateway_proxy_limiter
-from ic_env_guard.api.agents import get_agent_availability
+from ic_env_guard.api.agents import get_agent_availability, get_agent_registry
 from ic_env_guard.config.models import AgentConfig, AppConfig, AuthConfig, ControlPlaneConfig
 from ic_env_guard.main import create_app
 
@@ -195,6 +196,75 @@ def test_gateway_proxy_slot_is_reserved_before_upstream_ticket_request(tmp_path)
 
     assert response.status_code == 429
     assert dispatched is False
+
+
+@pytest.mark.contract
+def test_gateway_connect_token_releases_slot_when_registry_snapshot_fails(tmp_path):
+    class FailingRegistry:
+        def record(self, _agent_id):
+            raise RuntimeError("registry unavailable")
+
+    config = _config(tmp_path)
+    app = create_app(config=config)
+    limiter = GatewayProxyLimiter(1)
+    app.dependency_overrides[get_gateway_proxy_limiter] = lambda: limiter
+    app.dependency_overrides[get_agent_registry] = lambda: FailingRegistry()
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/agents/lab-01/terminals/term-1/connect-token",
+            headers={"Authorization": "Bearer secret-token"},
+        )
+
+    assert response.status_code == 500
+    assert not app.state.container.gateway_ticket_store.has_usage("lab-01")
+    replacement = limiter.reserve()
+    assert replacement is not None
+    replacement.release()
+
+
+@pytest.mark.contract
+def test_gateway_connect_token_rejects_rotation_between_snapshot_and_dispatch(tmp_path):
+    dispatched = False
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal dispatched
+        dispatched = True
+        return httpx.Response(201, json={"ticket": "upstream", "expires_in_seconds": 60})
+
+    config = _config(tmp_path)
+    app = create_app(config=config)
+    repository = app.state.container.registry_repository
+    limiter = GatewayProxyLimiter(1)
+
+    class RotateAfterSnapshot:
+        def record(self, agent_id):
+            original = repository.get(agent_id)
+            repository.update_if_revision(
+                replace(original, display_name="Rotated"), original.revision
+            )
+            return original
+
+    app.dependency_overrides[get_agent_registry] = lambda: RotateAfterSnapshot()
+    app.dependency_overrides[get_gateway_proxy_limiter] = lambda: limiter
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
+    )
+    app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agents/lab-01/terminals/term-1/connect-token",
+            headers={"Authorization": "Bearer secret-token"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "agent_target_changed"
+    assert dispatched is False
+    assert not app.state.container.gateway_ticket_store.has_usage("lab-01")
+    replacement = limiter.reserve()
+    assert replacement is not None
+    replacement.release()
 
 
 @pytest.mark.contract

@@ -26,6 +26,34 @@ def test_gateway_ticket_store_releases_reservation_on_failure():
 
 
 @pytest.mark.unit
+def test_gateway_ticket_store_expires_uncommitted_reservation_and_releases_usage():
+    now = [datetime.now(UTC)]
+    limiter = GatewayProxyLimiter(1)
+    store = GatewayTicketStore(
+        max_outstanding=1,
+        clock=lambda: now[0],
+        reservation_ttl_seconds=5,
+    )
+    reservation = store.reserve("lab-01", slot=limiter.reserve())
+
+    assert reservation is not None
+    assert reservation.expires_at == now[0] + timedelta(seconds=5)
+    assert store.has_usage("lab-01")
+    assert limiter.reserve() is None
+
+    now[0] += timedelta(seconds=6)
+
+    assert not store.has_usage("lab-01")
+    replacement_reservation = store.reserve("lab-02")
+    assert replacement_reservation is not None
+    store.release_reservation(replacement_reservation)
+    assert store.begin_removal("lab-01")
+    released = limiter.reserve()
+    assert released is not None
+    released.release()
+
+
+@pytest.mark.unit
 def test_gateway_ticket_is_bound_and_one_use():
     store = GatewayTicketStore(max_outstanding=1)
     reservation = store.reserve()

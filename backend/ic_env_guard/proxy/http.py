@@ -38,6 +38,14 @@ class AgentRouteSnapshot:
     credential: bytes
 
 
+@dataclass(frozen=True)
+class AgentRouteCapture:
+    revision: int
+    credential_ref: str
+    transport_profile_id: str
+    normalized_endpoint: str
+
+
 class AgentHttpProxy:
     def __init__(
         self,
@@ -139,12 +147,21 @@ class AgentHttpProxy:
         correlation_id: str | None,
         json: object | None = None,
         tail: bool = False,
+        route_capture: AgentRouteCapture | None = None,
     ) -> AgentProxyResponse:
         captured = self._registry.get(agent_id)
         if captured is None:
             raise AgentProxyError("agent_not_found", 404)
         if not captured.enabled:
             raise AgentProxyError("agent_disabled", 409)
+        if route_capture is not None and not _matches_capture(
+            captured,
+            route_capture.revision,
+            route_capture.credential_ref,
+            route_capture.transport_profile_id,
+            route_capture.normalized_endpoint,
+        ):
+            raise AgentProxyError("agent_target_changed", 409)
         profile = self._profiles.get(captured.transport_profile_id)
         if profile is None or self._target_policy is None:
             raise AgentProxyError("agent_transport_profile_invalid", 409)
