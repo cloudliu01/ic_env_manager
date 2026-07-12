@@ -95,6 +95,13 @@ class AgentTargetPolicy:
                 "the Agent URL does not match its transport profile",
             )
         addresses = self._resolve_once(hostname, port)
+        if allow_loopback_http and any(
+            not address.is_loopback for address in addresses
+        ):
+            raise TargetPolicyError(
+                "target_address_forbidden",
+                "legacy imported HTTP targets must resolve only to loopback addresses",
+            )
         for address in addresses:
             if _is_forbidden(address) and not (
                 allow_loopback_http and address.is_loopback

@@ -340,7 +340,11 @@ async def test_imported_legacy_http_marker_and_v2_not_found_use_narrow_fallback(
 @pytest.mark.parametrize(
     ("endpoint", "expected_code", "self_targets"),
     [
-        ("http://10.0.0.11:8765", "target_is_manager", [("10.0.0.11", 8765)]),
+        (
+            "http://10.0.0.11:8765",
+            "target_address_forbidden",
+            [("10.0.0.11", 8765)],
+        ),
         ("http://169.254.169.254:80", "target_address_forbidden", [("10.0.0.1", 8765)]),
     ],
 )
@@ -437,6 +441,67 @@ async def test_manual_legacy_http_marker_gets_no_loopback_exception(tmp_path):
     ).probe("manual")
 
     assert result.status.last_error_code == "target_address_forbidden"
+    assert result.dispatch_state == "not_dispatched"
+    assert legacy.calls == []
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("endpoint", "answers", "allowed_cidrs", "expected_code"),
+    [
+        (
+            "http://10.20.30.40:9000",
+            None,
+            [],
+            "target_address_forbidden",
+        ),
+        ("http://8.8.8.8:9000", None, [], "target_address_forbidden"),
+        (
+            "http://mixed.example:9000",
+            ("127.0.0.1", "10.20.30.40"),
+            [],
+            "target_address_forbidden",
+        ),
+        ("http://empty.example:9000", (), [], "agent_network_error"),
+        (
+            "http://10.20.30.40:9000",
+            None,
+            ["10.0.0.0/8"],
+            "target_address_forbidden",
+        ),
+    ],
+    ids=["private", "public", "mixed", "empty", "configured-allowlist"],
+)
+async def test_imported_legacy_http_marker_requires_all_loopback_answers(
+    tmp_path, endpoint, answers, allowed_cidrs, expected_code
+):
+    container = _manager(tmp_path)
+    marker = _add(container, "marker", endpoint)
+    container.registry_repository.update_if_revision(
+        replace(marker, transport_profile_id="legacy-config-http", updated_at=NOW),
+        expected_revision=1,
+    )
+    legacy = LegacyAdapter()
+    resolver = (
+        (lambda _host, _port: answers)
+        if answers is not None
+        else None
+    )
+    policy = AgentTargetPolicy(
+        allowed_agent_cidrs=allowed_cidrs,
+        self_targets=[("127.0.0.1", 8765)],
+        resolver=resolver,
+    )
+
+    result = await _service(
+        container,
+        Client([]),
+        policy=policy,
+        legacy=legacy,
+        allow_import_without_dynamic_allowlist=not allowed_cidrs,
+    ).probe("marker")
+
+    assert result.status.last_error_code == expected_code
     assert result.dispatch_state == "not_dispatched"
     assert legacy.calls == []
 
