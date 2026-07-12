@@ -40,7 +40,7 @@ export function AddAgentPage() {
     setValues((current) => ({ ...current, baseUrl: result.candidate_url, profile: result.transport_profile_id, sshHost: result.ip }));
   }, [candidate.data]);
   const cancelCurrent = async () => { if (!enrollmentId) return; try { await cancelEnrollment(enrollmentId); } finally { const next = new URLSearchParams(params); next.delete('enrollment'); setParams(next, { replace: true }); } };
-  const change = (field: keyof ConnectionValues, value: string) => { if (enrollmentId && job.data?.state !== 'verified') void cancelCurrent(); setValues((current) => ({ ...current, [field]: value })); };
+  const change = (field: keyof ConnectionValues, value: string) => { if (enrollmentId && (field !== 'displayName' || Boolean(job.data && job.data.state !== 'verified'))) void cancelCurrent(); setValues((current) => ({ ...current, [field]: value })); };
   const blur = (field: keyof ConnectionValues) => setErrors((current) => ({ ...current, [field]: fieldError(field, values[field]) }));
   const start = async () => {
     const nextErrors = Object.fromEntries((Object.keys(values) as Array<keyof ConnectionValues>).map((field) => [field, fieldError(field, values[field])]).filter(([, error]) => error));
@@ -57,7 +57,7 @@ export function AddAgentPage() {
     {discoveryResultId ? <p className="detail-panel">Discovery candidate selected. The opaque discovery result is fixed; confirm the SSH user before starting enrollment.</p> : null}
     {candidate.isError ? <p role="alert">Discovery candidate could not be restored. Return to Discovery and choose it again.</p> : null}
     {submitError || Object.values(errors).some(Boolean) ? <div role="alert"><p>{submitError || 'Correct the highlighted fields before continuing.'}</p></div> : null}
-    <ConnectionStep values={values} errors={errors} onChange={change} onBlur={blur} locked={submitting} />
+    <ConnectionStep values={values} errors={errors} onChange={change} onBlur={blur} locked={submitting} targetLocked={Boolean(enrollmentId && !job.data && !job.isError)} />
     {legacy ? <label className="form-field">Legacy admin token<input aria-label="Legacy admin token" type="password" value={legacyToken} onChange={(event) => setLegacyToken(event.target.value)} /><span className="secondary-cell">Compatibility-only validation. The token is sent once and is never shown again.</span></label> : <button type="button" className="secondary-button" onClick={() => setLegacy(true)}>Use legacy token instead</button>}
     <button type="button" onClick={() => void start()} disabled={submitting || Boolean(enrollmentId)}>{submitting ? 'Starting enrollment…' : legacy ? 'Validate legacy token' : 'Start enrollment'}</button>
     {job.isError ? <p role="alert">Enrollment status could not be refreshed. Reload this page using the current enrollment ID.</p> : null}

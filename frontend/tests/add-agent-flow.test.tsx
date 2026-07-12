@@ -124,4 +124,42 @@ describe('Add agent flow', () => {
     await waitFor(() => expect(screen.queryByLabelText('Legacy admin token')).toBeNull());
     expect(document.body.textContent).not.toContain('legacy-secret-never-rendered');
   });
+
+  it('keeps only display name editable while a refreshed job is still resolving, then saves a verified job without cancellation', async () => {
+    window.history.replaceState({}, '', '/agents/new?enrollment=job-opaque-1');
+    let resolveJob: (value: typeof job) => void = () => undefined;
+    const delayedJob = new Promise<typeof job>((resolve) => { resolveJob = resolve; });
+    apiRequest.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
+      if (path === '/api/v2/agent-enrollments/job-opaque-1') return delayedJob;
+      if (path === '/api/v2/agents' && init?.method === 'POST') return { agent: { agent_id: 'alpha' } };
+      if (path.endsWith('/cancel')) throw new Error('name edits must not cancel a resolving job');
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    const name = await screen.findByLabelText('Display name');
+    expect((screen.getByLabelText('SSH host') as HTMLInputElement).disabled).toBe(true);
+    await user.type(name, 'Alpha');
+    expect(apiRequest).not.toHaveBeenCalledWith('/api/v2/agent-enrollments/job-opaque-1/cancel', expect.anything());
+    resolveJob({ ...job, state: 'verified' });
+    await user.click(await screen.findByRole('button', { name: 'Save Agent' }));
+    await waitFor(() => expect(apiRequest).toHaveBeenCalledWith('/api/v2/agents', expect.objectContaining({ method: 'POST', body: JSON.stringify({ enrollment_id: 'job-opaque-1', display_name: 'Alpha' }) })));
+  });
+
+  it('cancels and clears a verified job when a target field changes', async () => {
+    window.history.replaceState({}, '', '/agents/new?enrollment=job-opaque-1');
+    apiRequest.mockImplementation(async (path: string) => {
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
+      if (path === '/api/v2/agent-enrollments/job-opaque-1') return { ...job, state: 'verified' };
+      if (path.endsWith('/cancel')) return { ...job, state: 'cancelled' };
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole('button', { name: 'Save Agent' });
+    await user.type(screen.getByLabelText('SSH host'), 'x');
+    await waitFor(() => expect(apiRequest).toHaveBeenCalledWith('/api/v2/agent-enrollments/job-opaque-1/cancel', expect.objectContaining({ method: 'POST' })));
+    expect(window.location.search).not.toContain('enrollment=');
+  });
 });
