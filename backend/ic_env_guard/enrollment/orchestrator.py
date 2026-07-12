@@ -132,6 +132,7 @@ class EnrollmentOrchestrator:
         ssh_adapter: SshEnrollmentAdapter | Any | None = None,
         transport_profiles: tuple[TransportProfile, ...] = (),
         auto_audit: Any | None = None,
+        background_shutdown_timeout_seconds: float = 1.0,
     ) -> None:
         self.jobs = jobs
         self.journal = journal
@@ -145,6 +146,8 @@ class EnrollmentOrchestrator:
         }
         self._auto_audit = auto_audit
         self._background_tasks: dict[str, asyncio.Task[None]] = {}
+        self._closing = False
+        self._background_shutdown_timeout_seconds = background_shutdown_timeout_seconds
         self._validation_cache: dict[str, EnrollmentValidation] = {}
         self._recovery_owner = str(uuid4())
         max_operation = getattr(agent_client, "max_network_operation_seconds", 10.0)
@@ -159,9 +162,9 @@ class EnrollmentOrchestrator:
         audit_context: AutoEnrollmentAuditContext,
     ) -> EnrollmentPublicResult:
         request = replace(request, enrollment_method=EnrollmentMethod.SSH_AUTO)
-        pending = self.jobs.create(request)
+        pending = self.jobs.create(request, now=self._now())
         adapter = self.ssh_adapter
-        if adapter is None or not adapter.healthy:
+        if self._closing or adapter is None or not adapter.healthy:
             awaiting = self.journal.replace_if_state(
                 replace(
                     pending,
@@ -172,14 +175,14 @@ class EnrollmentOrchestrator:
                 expected_state=EnrollmentState.PENDING,
             )
             return EnrollmentPublicResult(awaiting)
-        running = self.journal.replace_if_state(
-            replace(
-                pending,
-                state=EnrollmentState.RUNNING,
-                updated_at=self._now(),
-            ),
-            expected_state=EnrollmentState.PENDING,
+        running = self.journal.claim_pending_auto(
+            pending.enrollment_id, now=self._now()
         )
+        if running is None:
+            current = self.journal.get(pending.enrollment_id)
+            if current is None:
+                raise RegistryError("enrollment journal storage is unavailable")
+            return EnrollmentPublicResult(current)
         self._schedule_auto(running, audit_context)
         return EnrollmentPublicResult(running)
 
@@ -194,10 +197,24 @@ class EnrollmentOrchestrator:
             )
 
     async def shutdown(self) -> None:
+        self._closing = True
         tasks = tuple(self._background_tasks.values())
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        if not tasks:
+            return
+        _done, pending = await asyncio.wait(
+            tasks, timeout=self._background_shutdown_timeout_seconds
+        )
+        for task in pending:
+            task.cancel()
+        if pending:
+            _done, pending = await asyncio.wait(
+                pending, timeout=self._background_shutdown_timeout_seconds
+            )
+        for enrollment_id, task in tuple(self._background_tasks.items()):
+            if task in pending:
+                self._background_tasks.pop(enrollment_id, None)
 
     def get(self, enrollment_id: str) -> EnrollmentPublicResult:
         return EnrollmentPublicResult(
@@ -321,15 +338,23 @@ class EnrollmentOrchestrator:
     def _schedule_auto(
         self, job: EnrollmentJob, context: AutoEnrollmentAuditContext
     ) -> None:
-        if job.enrollment_id in self._background_tasks:
+        if self._closing or job.enrollment_id in self._background_tasks:
             return
         task = asyncio.create_task(self._run_auto(job, context))
         self._background_tasks[job.enrollment_id] = task
         task.add_done_callback(
-            lambda _task, enrollment_id=job.enrollment_id: self._background_tasks.pop(
-                enrollment_id, None
+            lambda completed, enrollment_id=job.enrollment_id: self._background_done(
+                enrollment_id, completed
             )
         )
+
+    def _background_done(
+        self, enrollment_id: str, task: asyncio.Task[None]
+    ) -> None:
+        if self._background_tasks.get(enrollment_id) is task:
+            self._background_tasks.pop(enrollment_id, None)
+        if not task.cancelled():
+            task.exception()
 
     async def _run_auto(
         self, job: EnrollmentJob, context: AutoEnrollmentAuditContext
@@ -345,8 +370,21 @@ class EnrollmentOrchestrator:
             except Exception:
                 self._converge_auto(job.enrollment_id, "audit_unavailable")
                 return
-            await self._issue_and_validate_auto(job)
+            dispatch_job = self.journal.recheck_auto_dispatch(
+                job.enrollment_id, now=self._now()
+            )
+            if dispatch_job is None:
+                self._record_auto_outcome(
+                    event_id,
+                    result="failure",
+                    dispatch_state="not_dispatched",
+                    failure_category="agent_enrollment_cancelled",
+                )
+                return
+            await self._issue_and_validate_auto(dispatch_job)
         except asyncio.CancelledError:
+            if self._closing:
+                raise
             self._record_auto_outcome(
                 event_id,
                 result="failure",
@@ -355,6 +393,8 @@ class EnrollmentOrchestrator:
             )
             raise
         except _AutoStateLost:
+            if self._closing:
+                return
             self._record_auto_outcome(
                 event_id,
                 result="failure",
@@ -431,6 +471,7 @@ class EnrollmentOrchestrator:
             SshEnrollmentRequest(
                 manager_id=job.manager_id,
                 enrollment_id=job.enrollment_id,
+                base_url=job.normalized_endpoint,
                 ssh_user=job.ssh_user,
                 ssh_host=job.ssh_host,
                 ssh_port=job.ssh_port,
@@ -438,6 +479,8 @@ class EnrollmentOrchestrator:
             ),
             profile,
         )
+        if self._closing:
+            raise _AutoStateLost
         reference = None
         try:
             with self.credential_store.lifecycle_lease():
@@ -472,9 +515,11 @@ class EnrollmentOrchestrator:
             raise EnrollmentValidationError(
                 "enrollment_unavailable", dispatch_state="not_dispatched"
             )
-        target = self.agent_client.prepare(
-            verifying.normalized_endpoint, verifying.transport_profile_id
-        )
+        target = helper.validation_target
+        if target is None:
+            raise EnrollmentValidationError(
+                "enrollment_unavailable", dispatch_state="not_dispatched"
+            )
         validation = await self.agent_client.validate_pending(
             target,
             self.credential_store.read(verifying.credential_temp_ref),
@@ -809,14 +854,11 @@ class EnrollmentOrchestrator:
                         expected_state=EnrollmentState.PENDING,
                     )
                     continue
-                running = self.journal.replace_if_state(
-                    replace(
-                        job,
-                        state=EnrollmentState.RUNNING,
-                        updated_at=self._now(),
-                    ),
-                    expected_state=EnrollmentState.PENDING,
+                running = self.journal.claim_pending_auto(
+                    job.enrollment_id, now=self._now()
                 )
+                if running is None:
+                    continue
                 self._schedule_auto(
                     running,
                     AutoEnrollmentAuditContext(

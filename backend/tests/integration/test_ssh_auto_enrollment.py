@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 
 from ic_env_guard.enrollment.ssh import (
     EnrollmentHelperResult,
+    ExecutableIdentity,
     SshEnrollmentAdapter,
     SshEnrollmentError,
     SshEnrollmentRequest,
@@ -22,7 +24,7 @@ MANAGER_ID = "11111111-1111-4111-8111-111111111111"
 ENROLLMENT_ID = "22222222-2222-4222-8222-222222222222"
 INSTANCE_ID = "33333333-3333-4333-8333-333333333333"
 CREDENTIAL_ID = "44444444-4444-4444-8444-444444444444"
-TOKEN = "pending-token-abcdefghijklmnopqrstuvwxyz-0123456789"
+TOKEN = "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg"
 TRUSTED = TrustedLanHttpProfile(id="lab-http", allowed_cidrs=["10.0.0.0/8"])
 VERIFIED = VerifiedTlsProfile(id="lab-tls")
 
@@ -39,7 +41,8 @@ def _script(tmp_path: Path, actual: str, *, preflight_rewrite: str = "") -> Path
         "        opts[key.lower()] = value\n"
         "if '-G' in sys.argv:\n"
         f"    rewrite = {preflight_rewrite!r}\n"
-        "    keys = ('hostname','user','port','hostkeyalias','stricthostkeychecking',"
+        "    keys = ('hostname','user','port','hostkeyalias','userknownhostsfile',"
+        "'stricthostkeychecking',"
         "'batchmode','preferredauthentications','passwordauthentication',"
         "'kbdinteractiveauthentication','proxycommand','proxyjump',"
         "'clearallforwardings','requesttty','permitlocalcommand',"
@@ -80,6 +83,7 @@ def _request() -> SshEnrollmentRequest:
     return SshEnrollmentRequest(
         manager_id=MANAGER_ID,
         enrollment_id=ENROLLMENT_ID,
+        base_url="http://agent.lab.example:8765",
         ssh_user="edaops",
         ssh_host="agent.lab.example",
         ssh_port=2222,
@@ -87,7 +91,22 @@ def _request() -> SshEnrollmentRequest:
     )
 
 
-def _adapter(executable: Path, *, resolver=None, timeout=1.0):
+def _test_executable_identity(path: Path) -> ExecutableIdentity:
+    metadata = path.stat()
+    return ExecutableIdentity(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        mode=metadata.st_mode & 0o7777,
+        uid=metadata.st_uid,
+    )
+
+
+def _adapter(
+    executable: Path, *, resolver=None, timeout=1.0, executable_validator=None
+):
+    ssh_directory = executable.parent / "manager-home" / ".ssh"
+    ssh_directory.mkdir(parents=True, exist_ok=True)
+    ssh_directory.chmod(0o700)
     return SshEnrollmentAdapter(
         target_policy=AgentTargetPolicy(
             allowed_agent_cidrs=["10.0.0.0/8"],
@@ -99,6 +118,8 @@ def _adapter(executable: Path, *, resolver=None, timeout=1.0):
         total_timeout_seconds=timeout,
         clock=lambda: NOW,
         termination_grace_seconds=0.1,
+        user_known_hosts_file=ssh_directory / "known_hosts",
+        executable_validator=executable_validator or _test_executable_identity,
     )
 
 
@@ -122,9 +143,10 @@ async def test_issue_runs_preflight_then_fixed_helper_and_returns_secret_safe_re
         credential_id=CREDENTIAL_ID,
         token=TOKEN.encode(),
         expires_at=NOW + timedelta(minutes=5),
+        validation_target=result.validation_target,
     )
     assert TOKEN not in repr(result)
-    assert resolutions == 1
+    assert resolutions == 2
     stdin = json.loads(Path(f"{executable}.stdin").read_bytes())
     assert stdin == {
         "protocol": "manager-enrollment.v1",
@@ -134,6 +156,119 @@ async def test_issue_runs_preflight_then_fixed_helper_and_returns_secret_safe_re
     argv = json.loads(Path(f"{executable}.argv").read_text())
     assert "Hostname=10.20.30.40" in argv
     assert argv[-1] == "ic-env-guard agent enroll-manager"
+
+
+@pytest.mark.integration
+async def test_real_ssh_g_with_null_config_is_safe_and_has_no_sendenv(tmp_path):
+    executable = Path("/usr/bin/ssh")
+    if not executable.exists():
+        pytest.skip("platform SSH executable is unavailable")
+    ssh_directory = tmp_path / "manager-home" / ".ssh"
+    ssh_directory.mkdir(parents=True)
+    ssh_directory.chmod(0o700)
+    adapter = SshEnrollmentAdapter(
+        target_policy=AgentTargetPolicy(
+            allowed_agent_cidrs=["10.0.0.0/8"],
+            self_targets=[("10.0.0.1", 8765)],
+        ),
+        executable=executable,
+        user_known_hosts_file=ssh_directory / "known_hosts",
+        connect_timeout_seconds=1,
+        total_timeout_seconds=2,
+    )
+
+    assert await adapter.check_available() is True
+
+
+@pytest.mark.integration
+async def test_issue_binds_http_validation_and_ssh_to_deterministic_shared_address(tmp_path):
+    executable = _script(
+        tmp_path,
+        f"sys.stdout.write({_result_json()!r} + '\\n'); sys.stdout.flush()",
+    )
+    calls = []
+
+    def resolver(host, port):
+        calls.append((host, port))
+        if host == "api.agent.example":
+            return ("10.20.30.42", "10.20.30.40", "2001:db8::40")
+        assert host == "ssh.agent.example"
+        return ("2001:db8::40", "10.20.30.40", "10.20.30.41")
+
+    ssh_directory = executable.parent / "manager-home" / ".ssh"
+    ssh_directory.mkdir(parents=True)
+    ssh_directory.chmod(0o700)
+    adapter = SshEnrollmentAdapter(
+        target_policy=AgentTargetPolicy(
+            allowed_agent_cidrs=["10.0.0.0/8", "2001:db8::/32"],
+            self_targets=[("10.0.0.1", 8765)],
+            resolver=resolver,
+        ),
+        executable=executable,
+        connect_timeout_seconds=1,
+        total_timeout_seconds=1,
+        clock=lambda: NOW,
+        user_known_hosts_file=ssh_directory / "known_hosts",
+        executable_validator=_test_executable_identity,
+    )
+    result = await adapter.issue(
+        replace(
+            _request(),
+            base_url="http://api.agent.example:8765",
+            ssh_host="ssh.agent.example",
+        ),
+        TrustedLanHttpProfile(
+            id="dual-stack", allowed_cidrs=["10.0.0.0/8", "2001:db8::/32"]
+        ),
+    )
+
+    assert calls == [
+        ("api.agent.example", 8765),
+        ("ssh.agent.example", 2222),
+    ]
+    assert result.validation_target is not None
+    assert str(result.validation_target.pinned_address) == "10.20.30.40"
+    assert result.validation_target.hostname == "api.agent.example"
+    assert result.validation_target.port == 8765
+    assert result.validation_target.host_header == "api.agent.example:8765"
+    assert "Hostname=10.20.30.40" in json.loads(
+        Path(f"{executable}.argv").read_text()
+    )
+
+
+@pytest.mark.integration
+async def test_issue_rejects_disjoint_http_and_ssh_addresses_before_spawn(tmp_path):
+    executable = _script(tmp_path, "raise AssertionError('must not run')")
+
+    def resolver(host, _port):
+        return ("10.20.30.40",) if host == "api.agent.example" else ("10.20.30.41",)
+
+    request = replace(
+        _request(),
+        base_url="http://api.agent.example:8765",
+        ssh_host="ssh.agent.example",
+    )
+    with pytest.raises(SshEnrollmentError) as caught:
+        await _adapter(executable, resolver=resolver).issue(request, TRUSTED)
+
+    assert caught.value.code == "agent_identity_mismatch"
+    assert caught.value.dispatch_state == "not_dispatched"
+    assert not Path(f"{executable}.stdin").exists()
+
+
+@pytest.mark.integration
+async def test_issue_detects_same_hostname_dns_rebinding_between_http_and_ssh(tmp_path):
+    executable = _script(tmp_path, "raise AssertionError('must not run')")
+    answers = iter((("10.20.30.40",), ("10.20.30.41",)))
+
+    with pytest.raises(SshEnrollmentError) as caught:
+        await _adapter(executable, resolver=lambda _host, _port: next(answers)).issue(
+            _request(), TRUSTED
+        )
+
+    assert caught.value.code == "agent_identity_mismatch"
+    assert caught.value.dispatch_state == "not_dispatched"
+    assert not Path(f"{executable}.stdin").exists()
 
 
 @pytest.mark.integration
@@ -149,6 +284,55 @@ async def test_issue_rejects_effective_config_target_rewrite_before_actual_dispa
 
     assert caught.value.code == "ssh_unavailable"
     assert not Path(f"{executable}.stdin").exists()
+
+
+@pytest.mark.integration
+async def test_issue_fails_closed_if_executable_identity_changes_between_spawns(tmp_path):
+    executable = _script(tmp_path, "raise AssertionError('actual SSH must not run')")
+    original = _test_executable_identity(executable)
+    replaced_identity = replace(original, inode=original.inode + 1)
+    identities = iter((original, original, replaced_identity))
+    adapter = _adapter(
+        executable, executable_validator=lambda _path: next(identities)
+    )
+
+    with pytest.raises(SshEnrollmentError) as caught:
+        await adapter.issue(_request(), TRUSTED)
+
+    assert caught.value.code == "ssh_unavailable"
+    assert caught.value.dispatch_state == "not_dispatched"
+    assert adapter.healthy is False
+    assert not Path(f"{executable}.stdin").exists()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("failing_spawn", (1, 2))
+async def test_spawn_oserror_is_never_reported_as_dispatched(
+    tmp_path, monkeypatch, failing_spawn
+):
+    executable = _script(
+        tmp_path,
+        f"sys.stdout.write({_result_json()!r} + '\\n'); sys.stdout.flush()",
+    )
+    real_spawn = asyncio.create_subprocess_exec
+    calls = 0
+
+    async def fail_selected_spawn(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == failing_spawn:
+            raise OSError("spawn failed")
+        return await real_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "ic_env_guard.enrollment.ssh.asyncio.create_subprocess_exec",
+        fail_selected_spawn,
+    )
+    with pytest.raises(SshEnrollmentError) as caught:
+        await _adapter(executable).issue(_request(), TRUSTED)
+
+    assert caught.value.code == "ssh_unavailable"
+    assert caught.value.dispatch_state == "not_dispatched"
 
 
 @pytest.mark.integration
@@ -170,7 +354,9 @@ async def test_issue_maps_ssh_failure_without_exposing_stderr(tmp_path, stderr, 
     )
 
     with pytest.raises(SshEnrollmentError) as caught:
-        await _adapter(executable).issue(_request(), VERIFIED)
+        await _adapter(executable).issue(
+            replace(_request(), base_url="https://agent.lab.example:8765"), VERIFIED
+        )
 
     assert caught.value.code == code
     assert stderr not in str(caught.value)
@@ -284,6 +470,7 @@ async def test_partial_stream_task_creation_failure_reaps_process_and_tasks(
         "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
     )
     adapter = _adapter(executable)
+    adapter._executable_identity = _test_executable_identity(executable)
     loop = asyncio.get_running_loop()
     real_create_task = loop.create_task
     calls = 0
@@ -332,6 +519,10 @@ async def test_partial_stream_task_creation_failure_reaps_process_and_tasks(
         _result_json(instance_id="not-a-uuid"),
         _result_json(credential_id="NOT-CANONICAL"),
         _result_json(token="short"),
+        _result_json(token=TOKEN[:-1] + "B"),
+        _result_json().replace(
+            f'"token":"{TOKEN}"', f'"token":"{TOKEN}","token":"{TOKEN}"'
+        ),
         _result_json(expires_at="2027-01-01T00:00:00Z"),
         _result_json() + "\\n{}",
     ),

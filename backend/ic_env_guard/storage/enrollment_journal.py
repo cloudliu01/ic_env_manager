@@ -357,6 +357,73 @@ class EnrollmentJournalRepository(_SQLiteRepository):
         except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
             raise RegistryError("enrollment journal storage is unavailable") from exc
 
+    def claim_pending_auto(self, enrollment_id: str, *, now: datetime) -> EnrollmentJob | None:
+        """Atomically expire or claim one pending auto-enrollment for dispatch."""
+        try:
+            with self._write() as connection:
+                connection.execute(
+                    "UPDATE agent_enrollment_jobs SET state=?, updated_at=? "
+                    "WHERE enrollment_id=? AND state=? AND expires_at<=?",
+                    (
+                        EnrollmentState.EXPIRED.value,
+                        _format_time(now),
+                        enrollment_id,
+                        EnrollmentState.PENDING.value,
+                        _format_time(now),
+                    ),
+                )
+                cursor = connection.execute(
+                    "UPDATE agent_enrollment_jobs SET state=?, updated_at=? "
+                    "WHERE enrollment_id=? AND state=? AND expires_at>?",
+                    (
+                        EnrollmentState.RUNNING.value,
+                        _format_time(now),
+                        enrollment_id,
+                        EnrollmentState.PENDING.value,
+                        _format_time(now),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    return None
+                row = connection.execute(
+                    f"SELECT {_COLUMNS} FROM agent_enrollment_jobs WHERE enrollment_id=?",
+                    (enrollment_id,),
+                ).fetchone()
+            return _job(row)
+        except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise RegistryError("enrollment journal storage is unavailable") from exc
+
+    def recheck_auto_dispatch(
+        self, enrollment_id: str, *, now: datetime
+    ) -> EnrollmentJob | None:
+        """Fence dispatch against cancellation and TTL expiry in one transaction."""
+        try:
+            with self._write() as connection:
+                connection.execute(
+                    "UPDATE agent_enrollment_jobs SET state=?, updated_at=? "
+                    "WHERE enrollment_id=? AND state=? AND expires_at<=?",
+                    (
+                        EnrollmentState.EXPIRED.value,
+                        _format_time(now),
+                        enrollment_id,
+                        EnrollmentState.RUNNING.value,
+                        _format_time(now),
+                    ),
+                )
+                row = connection.execute(
+                    f"SELECT {_COLUMNS} FROM agent_enrollment_jobs "
+                    "WHERE enrollment_id=? AND state=? AND credential_temp_ref IS NULL "
+                    "AND expires_at>?",
+                    (
+                        enrollment_id,
+                        EnrollmentState.RUNNING.value,
+                        _format_time(now),
+                    ),
+                ).fetchone()
+            return _job(row) if row is not None else None
+        except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise RegistryError("enrollment journal storage is unavailable") from exc
+
     def prepare_recovery(self, *, now: datetime) -> tuple[str, ...]:
         """Expire TTL phases and list currently claimable jobs without claiming them."""
         expirable = tuple(state.value for state in _EXPIRABLE_STATES)

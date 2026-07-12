@@ -31,8 +31,11 @@ NOW = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
 ENROLLMENT_ID = "22222222-2222-4222-8222-222222222222"
 INSTANCE_ID = "33333333-3333-4333-8333-333333333333"
 CREDENTIAL_ID = "44444444-4444-4444-8444-444444444444"
-TOKEN = b"pending-token-abcdefghijklmnopqrstuvwxyz-0123456789"
+TOKEN = b"eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg"
 PROFILE = TrustedLanHttpProfile(id="lab-http", allowed_cidrs=["10.0.0.0/8"])
+VALIDATION_TARGET = type(
+    "ValidationTarget", (), {"normalized_endpoint": "http://10.20.30.40:8765"}
+)()
 AUDIT_CONTEXT = AutoEnrollmentAuditContext(
     actor_id="local-admin",
     source_addr="127.0.0.1",
@@ -65,7 +68,7 @@ class AgentClient:
         self.calls = 0
 
     def prepare(self, endpoint, _profile_id):
-        return type("Target", (), {"normalized_endpoint": endpoint})()
+        raise AssertionError("auto enrollment must not resolve the Agent target again")
 
     async def validate_pending(self, _target, token, *, helper_instance_id):
         self.calls += 1
@@ -91,6 +94,7 @@ class Adapter:
             credential_id=CREDENTIAL_ID,
             token=TOKEN,
             expires_at=NOW + timedelta(minutes=5),
+            validation_target=VALIDATION_TARGET,
         )
         self.calls = 0
 
@@ -118,7 +122,9 @@ def request():
     )
 
 
-def setup_services(tmp_path, adapter, *, audit=None, store=None):
+def setup_services(
+    tmp_path, adapter, *, audit=None, store=None, shutdown_timeout_seconds=1.0
+):
     database = tmp_path / "manager.db"
     run_control_plane_migrations(database)
     engine = create_sqlite_engine(database)
@@ -142,6 +148,7 @@ def setup_services(tmp_path, adapter, *, audit=None, store=None):
         transport_profiles=(PROFILE,),
         auto_audit=audit or Audit(),
         clock=lambda: NOW,
+        background_shutdown_timeout_seconds=shutdown_timeout_seconds,
     )
     return orchestrator, jobs, journal, credential_store, client, engine
 
@@ -185,11 +192,17 @@ async def test_create_auto_returns_running_then_background_persists_and_verifies
             EnrollmentState.FAILED,
             "ssh_host_key_changed",
         ),
+        (
+            SshEnrollmentError("ssh_unavailable", dispatch_state="not_dispatched"),
+            EnrollmentState.FAILED,
+            "ssh_unavailable",
+        ),
     ),
 )
 async def test_auto_error_converges_to_cli_or_failed_state(tmp_path, error, state, code):
+    audit = Audit()
     orchestrator, _jobs, journal, _store, _client, engine = setup_services(
-        tmp_path, Adapter(error)
+        tmp_path, Adapter(error), audit=audit
     )
     try:
         created = orchestrator.create_auto(request(), AUDIT_CONTEXT)
@@ -197,6 +210,8 @@ async def test_auto_error_converges_to_cli_or_failed_state(tmp_path, error, stat
         current = journal.get(created.job.enrollment_id)
         assert current.state is state
         assert current.last_error_code == code
+        assert audit.events[-1][3] == error.dispatch_state
+        assert audit.events[-1][4] == code
     finally:
         await orchestrator.shutdown()
         engine.dispose()
@@ -267,6 +282,65 @@ async def test_shutdown_cancels_and_awaits_background_auto_task(tmp_path):
 
 
 @pytest.mark.integration
+async def test_shutdown_is_bounded_when_adapter_swallows_cancel_and_late_result_cannot_publish(
+    tmp_path,
+):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def ignores_cancel():
+        started.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+        return EnrollmentHelperResult(
+            instance_id=INSTANCE_ID,
+            credential_id=CREDENTIAL_ID,
+            token=TOKEN,
+            expires_at=NOW + timedelta(minutes=5),
+            validation_target=VALIDATION_TARGET,
+        )
+
+    class CountingStore(CredentialStore):
+        puts = 0
+
+        def put(self, secret):
+            self.puts += 1
+            return super().put(secret)
+
+    audit = Audit()
+    store = CountingStore(tmp_path / "credentials")
+    orchestrator, _jobs, journal, _store, _client, engine = setup_services(
+        tmp_path,
+        Adapter(ignores_cancel),
+        audit=audit,
+        store=store,
+        shutdown_timeout_seconds=0.02,
+    )
+    try:
+        created = orchestrator.create_auto(request(), AUDIT_CONTEXT)
+        await started.wait()
+        background = next(iter(orchestrator._background_tasks.values()))
+
+        await asyncio.wait_for(orchestrator.shutdown(), timeout=0.2)
+
+        assert orchestrator.background_task_count == 0
+        assert [event[0] for event in audit.events] == ["intent"]
+        release.set()
+        await asyncio.gather(background, return_exceptions=True)
+        assert store.puts == 0
+        current = journal.get(created.job.enrollment_id)
+        assert current.state is EnrollmentState.RUNNING
+        assert current.credential_temp_ref is None
+        assert [event[0] for event in audit.events] == ["intent"]
+    finally:
+        release.set()
+        engine.dispose()
+
+
+@pytest.mark.integration
 async def test_cancel_fences_background_before_helper_result_can_write_credential(tmp_path):
     started = asyncio.Event()
     release = asyncio.Event()
@@ -282,6 +356,7 @@ async def test_cancel_fences_background_before_helper_result_can_write_credentia
             credential_id=CREDENTIAL_ID,
             token=TOKEN,
             expires_at=NOW + timedelta(minutes=5),
+            validation_target=VALIDATION_TARGET,
         )
 
     class CountingStore(CredentialStore):
@@ -352,6 +427,55 @@ async def test_startup_schedules_pending_auto_job_exactly_once(tmp_path):
 
         assert adapter.calls == 1
         assert journal.get(pending.enrollment_id).state is EnrollmentState.VERIFIED
+    finally:
+        await orchestrator.shutdown()
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_startup_atomically_expires_pending_auto_before_scheduling(tmp_path):
+    adapter = Adapter()
+    orchestrator, jobs, journal, _store, _client, engine = setup_services(
+        tmp_path, adapter
+    )
+    try:
+        pending = jobs.create(request(), now=NOW - timedelta(minutes=10))
+
+        await orchestrator.recover_and_cleanup()
+
+        assert journal.get(pending.enrollment_id).state is EnrollmentState.EXPIRED
+        assert adapter.calls == 0
+        assert orchestrator.background_task_count == 0
+    finally:
+        await orchestrator.shutdown()
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_cancel_after_audit_intent_is_rechecked_before_ssh_dispatch(tmp_path):
+    adapter = Adapter()
+    audit = Audit()
+    orchestrator, _jobs, journal, _store, _client, engine = setup_services(
+        tmp_path, adapter, audit=audit
+    )
+
+    def cancel_during_intent(enrollment_id, context):
+        event_id = Audit.record_intent(audit, enrollment_id, context)
+        current = journal.get(enrollment_id)
+        journal.replace_if_state(
+            replace(current, state=EnrollmentState.CANCELLED, updated_at=NOW),
+            expected_state=EnrollmentState.RUNNING,
+        )
+        return event_id
+
+    audit.record_intent = cancel_during_intent
+    try:
+        created = orchestrator.create_auto(request(), AUDIT_CONTEXT)
+        await orchestrator.wait_for_background()
+
+        assert journal.get(created.job.enrollment_id).state is EnrollmentState.CANCELLED
+        assert adapter.calls == 0
+        assert audit.events[-1][3] == "not_dispatched"
     finally:
         await orchestrator.shutdown()
         engine.dispose()

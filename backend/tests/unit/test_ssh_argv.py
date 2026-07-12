@@ -8,6 +8,7 @@ from ic_env_guard.enrollment.ssh_config import (
     SshEffectiveTarget,
     build_ssh_argv,
     build_ssh_preflight_argv,
+    host_key_alias,
     validate_ssh_destination,
     verify_effective_config,
 )
@@ -15,6 +16,7 @@ from ic_env_guard.fleet.transport import TrustedLanHttpProfile, VerifiedTlsProfi
 
 TRUSTED = TrustedLanHttpProfile(id="lab-http", allowed_cidrs=["10.0.0.0/8"])
 VERIFIED = VerifiedTlsProfile(id="lab-tls")
+KNOWN_HOSTS = Path("/home/manager/.ssh/known_hosts")
 
 
 def _actual(profile=TRUSTED):
@@ -27,6 +29,7 @@ def _actual(profile=TRUSTED):
         profile=profile,
         connect_timeout_seconds=10,
         batch_mode=True,
+        user_known_hosts_file=KNOWN_HOSTS,
     )
 
 
@@ -38,12 +41,13 @@ def test_auto_argv_is_target_pinned_and_contains_only_fixed_remote_command():
         "agent.lab.example",
         "ic-env-guard agent enroll-manager",
     )
-    assert argv[-4:-2] == ("-o", "SendEnv=-*")
+    assert argv[1:3] == ("-F", "/dev/null")
     for option in (
         "Hostname=10.20.30.40",
         "User=edaops",
         "Port=2222",
         "HostKeyAlias=[agent.lab.example]:2222",
+        f"UserKnownHostsFile={KNOWN_HOSTS}",
         "StrictHostKeyChecking=accept-new",
         "BatchMode=yes",
         "PreferredAuthentications=publickey",
@@ -67,6 +71,41 @@ def test_auto_argv_is_target_pinned_and_contains_only_fixed_remote_command():
 
 def test_verified_tls_auto_never_accepts_an_unknown_host_key():
     assert "StrictHostKeyChecking=yes" in _actual(VERIFIED)
+
+
+@pytest.mark.parametrize(
+    ("host", "canonical", "alias"),
+    (
+        ("BÜCHER.Example...", "xn--bcher-kva.example", "[xn--bcher-kva.example]:2222"),
+        ("2001:0DB8:0:0::1", "2001:db8::1", "[2001:db8::1]:2222"),
+        ("10.20.30.40", "10.20.30.40", "[10.20.30.40]:2222"),
+    ),
+)
+def test_destination_and_host_key_alias_use_one_canonical_collision_safe_form(
+    host, canonical, alias
+):
+    assert validate_ssh_destination(user="edaops", host=host, port=2222) == (
+        "edaops",
+        canonical,
+        2222,
+    )
+    assert host_key_alias(host, 2222) == alias
+
+
+@pytest.mark.parametrize("host", ("010.020.030.040", "fe80::1%en0"))
+def test_destination_rejects_ambiguous_ipv4_and_scoped_ipv6(host):
+    with pytest.raises(SshConfigError, match="ssh_target_invalid"):
+        validate_ssh_destination(user="edaops", host=host, port=22)
+
+
+def test_dns_and_ip_aliases_cannot_collide_across_ports():
+    aliases = {
+        host_key_alias("agent.example", 22),
+        host_key_alias("agent.example", 2222),
+        host_key_alias("10.20.30.40", 22),
+        host_key_alias("2001:db8::1", 22),
+    }
+    assert len(aliases) == 4
 
 
 def test_preflight_uses_the_exact_actual_overrides_and_fixed_command():
@@ -128,6 +167,7 @@ def _effective(**changes):
         "numberofpasswordprompts": "0",
         "connecttimeout": "10",
         "loglevel": "ERROR",
+        "userknownhostsfile": str(KNOWN_HOSTS),
     }
     values.update(changes)
     return "".join(f"{key} {value}\n" for key, value in values.items()).encode()
@@ -142,19 +182,17 @@ def _expected():
         strict_host_key_checking="accept-new",
         batch_mode=True,
         connect_timeout_seconds=10,
+        user_known_hosts_file=str(KNOWN_HOSTS),
     )
 
 
-def test_effective_config_accepts_safe_key_and_agent_contributions():
-    output = _effective() + (
-        b"identityfile ~/.ssh/id_ed25519\nidentityagent SSH_AUTH_SOCK\n"
-        b"sendenv LANG\nsendenv LC_*\n"
-    )
+def test_effective_config_accepts_default_key_and_agent_contributions():
+    output = _effective() + b"identityfile ~/.ssh/id_ed25519\nidentityagent SSH_AUTH_SOCK\n"
 
     verify_effective_config(output, _expected())
 
 
-def test_effective_config_rejects_non_locale_sendenv_pattern():
+def test_effective_config_rejects_any_sendenv_pattern():
     with pytest.raises(SshConfigError, match="ssh_effective_config_unsafe"):
         verify_effective_config(_effective() + b"sendenv TOP_SECRET\n", _expected())
 
@@ -216,4 +254,5 @@ def test_argv_builder_rejects_relative_or_non_ssh_executable():
             profile=TRUSTED,
             connect_timeout_seconds=10,
             batch_mode=True,
+            user_known_hosts_file=KNOWN_HOSTS,
         )

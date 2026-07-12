@@ -1,6 +1,6 @@
 import re
 from dataclasses import dataclass
-from ipaddress import IPv4Address, IPv6Address
+from ipaddress import IPv4Address, IPv6Address, ip_address
 from pathlib import Path
 
 from ic_env_guard.fleet.transport import TransportProfile, TrustedLanHttpProfile
@@ -8,7 +8,7 @@ from ic_env_guard.fleet.transport import TransportProfile, TrustedLanHttpProfile
 MAX_EFFECTIVE_CONFIG_BYTES = 32 * 1024
 REMOTE_ENROLLMENT_COMMAND = "ic-env-guard agent enroll-manager"
 _USER = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
-_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:-]{0,252}$")
+_DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _KEY = re.compile(r"^[a-z][a-z0-9]*$")
 
 
@@ -27,26 +27,22 @@ class SshEffectiveTarget:
     strict_host_key_checking: str
     batch_mode: bool
     connect_timeout_seconds: int
+    user_known_hosts_file: str
 
 
 def validate_ssh_destination(*, user: str, host: str, port: int) -> tuple[str, str, int]:
-    if (
-        not isinstance(user, str)
-        or not _USER.fullmatch(user)
-        or not isinstance(host, str)
-        or not _HOST.fullmatch(host)
-        or host.startswith("-")
-        or ".." in host
-        or not isinstance(port, int)
-        or isinstance(port, bool)
-        or not 1 <= port <= 65535
-    ):
+    if not isinstance(user, str) or not _USER.fullmatch(user):
         raise SshConfigError("ssh_target_invalid")
-    return user, host.lower(), port
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise SshConfigError("ssh_target_invalid")
+    return user, _canonical_host(host), port
 
 
 def host_key_alias(host: str, port: int) -> str:
-    return f"[{host.lower()}]:{port}"
+    _user, canonical, validated_port = validate_ssh_destination(
+        user="host-key-alias", host=host, port=port
+    )
+    return f"[{canonical}]:{validated_port}"
 
 
 def build_ssh_argv(
@@ -59,11 +55,16 @@ def build_ssh_argv(
     profile: TransportProfile,
     connect_timeout_seconds: int,
     batch_mode: bool,
+    user_known_hosts_file: Path,
 ) -> tuple[str, ...]:
     user, host, port = validate_ssh_destination(user=user, host=host, port=port)
     if (
         not isinstance(executable, Path)
         or not executable.is_absolute()
+        or not isinstance(user_known_hosts_file, Path)
+        or not user_known_hosts_file.is_absolute()
+        or any(ord(character) < 0x20 for character in str(user_known_hosts_file))
+        or str(user_known_hosts_file).lower() in {"none", "/dev/null"}
         or not 1 <= connect_timeout_seconds <= 60
     ):
         raise SshConfigError("ssh_unavailable")
@@ -73,6 +74,7 @@ def build_ssh_argv(
         f"User={user}",
         f"Port={port}",
         f"HostKeyAlias={host_key_alias(host, port)}",
+        f"UserKnownHostsFile={user_known_hosts_file}",
         f"StrictHostKeyChecking={strict}",
         f"BatchMode={'yes' if batch_mode else 'no'}",
         "PreferredAuthentications=publickey",
@@ -99,9 +101,8 @@ def build_ssh_argv(
         "ConnectionAttempts=1",
         f"ConnectTimeout={connect_timeout_seconds}",
         "LogLevel=ERROR",
-        "SendEnv=-*",
     )
-    argv: list[str] = [str(executable)]
+    argv: list[str] = [str(executable), "-F", "/dev/null"]
     for option in options:
         argv.extend(("-o", option))
     argv.extend((host, REMOTE_ENROLLMENT_COMMAND))
@@ -127,6 +128,7 @@ def verify_effective_config(output: bytes, expected: SshEffectiveTarget) -> None
         "numberofpasswordprompts": "0",
         "connecttimeout": str(expected.connect_timeout_seconds),
         "loglevel": "ERROR",
+        "userknownhostsfile": expected.user_known_hosts_file,
     }
     absent_or_none = (
         "proxycommand",
@@ -170,7 +172,7 @@ def verify_effective_config(output: bytes, expected: SshEffectiveTarget) -> None
         len(challenge_response) != 1 or _as_bool(challenge_response[0])
     ):
         raise SshConfigError("ssh_effective_config_unsafe")
-    if any(value not in {"LANG", "LC_*"} for value in values.get("sendenv", [])):
+    if values.get("sendenv"):
         raise SshConfigError("ssh_effective_config_unsafe")
     if values.get("setenv"):
         raise SshConfigError("ssh_effective_config_unsafe")
@@ -209,3 +211,31 @@ def _as_bool(value: str) -> bool:
     if value in {"no", "false"}:
         return False
     raise SshConfigError("ssh_effective_config_unsafe")
+
+
+def _canonical_host(host: object) -> str:
+    if not isinstance(host, str) or not host or host.startswith("-"):
+        raise SshConfigError("ssh_target_invalid")
+    if any(ord(character) < 0x21 for character in host) or any(
+        character in "@/\\[]%" for character in host
+    ):
+        raise SshConfigError("ssh_target_invalid")
+    candidate = host.rstrip(".")
+    if not candidate:
+        raise SshConfigError("ssh_target_invalid")
+    try:
+        return ip_address(candidate).compressed.lower()
+    except ValueError:
+        pass
+    try:
+        canonical = candidate.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        raise SshConfigError("ssh_target_invalid") from None
+    labels = canonical.split(".")
+    if (
+        len(canonical) > 253
+        or (len(labels) == 4 and all(label.isdigit() for label in labels))
+        or any(not _DNS_LABEL.fullmatch(label) for label in labels)
+    ):
+        raise SshConfigError("ssh_target_invalid")
+    return canonical

@@ -217,8 +217,11 @@ def test_create_and_background_auto_have_separate_durable_audit_events(
         return EnrollmentHelperResult(
             instance_id="33333333-3333-4333-8333-333333333333",
             credential_id="44444444-4444-4444-8444-444444444444",
-            token=b"pending-token-abcdefghijklmnopqrstuvwxyz-0123456789",
+            token=b"eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg",
             expires_at=min(request.expires_at, datetime.now(UTC) + timedelta(minutes=5)),
+            validation_target=type(
+                "ValidationTarget", (), {"normalized_endpoint": request.base_url}
+            )(),
         )
 
     async def validate_pending(self, target, _token, *, helper_instance_id):
