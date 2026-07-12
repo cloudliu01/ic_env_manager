@@ -27,6 +27,7 @@ from ic_env_guard.db.migrations import run_migrations
 from ic_env_guard.db.services import ServiceRuntime
 from ic_env_guard.db.session import create_session_factory, create_sqlite_engine
 from ic_env_guard.enrollment.audit import AgentEnrollmentAudit
+from ic_env_guard.enrollment.credential_store import CredentialStore
 from ic_env_guard.enrollment.service import EnrollmentService
 from ic_env_guard.enrollment.socket_server import EnrollmentSocketServer
 from ic_env_guard.logs.policy import LogPathPolicy, LogTailReader
@@ -37,8 +38,15 @@ from ic_env_guard.metrics.registry import create_registry
 from ic_env_guard.monitoring.machines import MachineRegistry
 from ic_env_guard.observations.service import ObservationService
 from ic_env_guard.services.manager import ServiceManager
+from ic_env_guard.storage.enrollment_journal import EnrollmentJournalRepository
 from ic_env_guard.storage.log_sources import SQLiteLogSourceRepository
 from ic_env_guard.storage.manager_credentials import SQLiteManagerCredentialRepository
+from ic_env_guard.storage.manager_registry import (
+    AgentStatusRepository,
+)
+from ic_env_guard.storage.manager_registry import (
+    ManagerRegistryRepository as SQLiteManagerRegistryRepository,
+)
 from ic_env_guard.storage.observations import SQLiteObservationRepository
 from ic_env_guard.summary.service import SummaryService
 from ic_env_guard.terminal.manager import TerminalManager
@@ -92,6 +100,11 @@ class ManagerContainer:
     ticket_manager: TerminalTicketManager
     machine_registry: MachineRegistry
     audit_storage_health: AuditStorageHealth
+    manager_id: UUID
+    registry_repository: SQLiteManagerRegistryRepository
+    status_repository: AgentStatusRepository
+    enrollment_journal_repository: EnrollmentJournalRepository
+    credential_store: CredentialStore
 
 
 def _service_runtime(service: ServiceConfig) -> ServiceRuntime:
@@ -207,6 +220,10 @@ def build_agent_container(
 def build_manager_container(config: AppConfig) -> ManagerContainer:
     run_control_plane_migrations(config.control_plane.audit_database)
     database_engine = create_sqlite_engine(config.control_plane.audit_database)
+    registry_repository = SQLiteManagerRegistryRepository(database_engine)
+    status_repository = AgentStatusRepository(database_engine)
+    enrollment_journal_repository = EnrollmentJournalRepository(database_engine)
+    credential_store = CredentialStore(config.control_plane.effective_credential_directory)
     agent_registry = AgentRegistry(config.agents)
     agent_client = AgentHttpClient()
     metrics_registry = create_registry()
@@ -240,4 +257,9 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         ticket_manager=TerminalTicketManager(),
         machine_registry=MachineRegistry(),
         audit_storage_health=AuditStorageHealth(),
+        manager_id=registry_repository.get_or_create_manager_id(),
+        registry_repository=registry_repository,
+        status_repository=status_repository,
+        enrollment_journal_repository=enrollment_journal_repository,
+        credential_store=credential_store,
     )

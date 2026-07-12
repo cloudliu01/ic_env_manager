@@ -220,8 +220,20 @@ class ControlPlaneConfig(BaseModel):
     status_stale_after_seconds: int = Field(default=30, ge=1)
     max_parallel_probes: int = Field(default=8, ge=1)
     audit_database: Path = Path("/var/lib/ic-env-guard/control-plane.db")
+    credential_directory: Path | None = None
     max_active_terminal_proxies: int = Field(default=64, ge=1)
     max_outstanding_tickets: int = Field(default=128, ge=1)
+
+    @field_validator("audit_database", "credential_directory")
+    @classmethod
+    def validate_control_plane_paths(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
+            raise ValueError("control-plane storage paths must be absolute")
+        return value
+
+    @property
+    def effective_credential_directory(self) -> Path:
+        return self.credential_directory or self.audit_database.with_name("agent-credentials")
 
 
 def _is_loopback_url(value: str) -> bool:

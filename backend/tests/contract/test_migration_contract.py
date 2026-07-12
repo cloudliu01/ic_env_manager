@@ -66,7 +66,88 @@ def test_control_plane_migration_runner_records_forward_only_metadata(tmp_path):
         connection.close()
 
     assert rows.count(("0001_control_plane_audit", "upgrade", "success")) == 1
+    assert rows.count(("0002_fleet_registry", "upgrade", "success")) == 1
     assert "control_plane_audit_events" in tables
+
+
+@pytest.mark.contract
+def test_fleet_registry_migration_has_exact_control_plane_tables(tmp_path):
+    db_path = tmp_path / "control-plane.db"
+    run_control_plane_migrations(db_path)
+    connection = sqlite3.connect(db_path)
+    try:
+        expected_columns = {
+            "manager_metadata": ("key", "value"),
+            "agents": (
+                "agent_id", "instance_id", "display_name", "normalized_endpoint",
+                "credential_ref", "remote_credential_id", "transport_profile_id",
+                "enrollment_method", "enabled", "source", "revision", "created_at",
+                "updated_at",
+            ),
+            "agent_status": (
+                "agent_id", "target_revision", "connection_status", "workload_status",
+                "observed_at", "stale_after", "api_version", "agent_version",
+                "capabilities_json", "summary_json", "last_error_code", "updated_at",
+            ),
+            "agent_enrollment_jobs": (
+                "enrollment_id", "manager_id", "state", "normalized_endpoint",
+                "transport_profile_id", "discovery_result_id", "replace_agent_id",
+                "requested_display_name", "ssh_user", "ssh_host", "ssh_port",
+                "enrollment_method", "remote_instance_id", "remote_credential_id",
+                "credential_temp_ref", "old_credential_ref", "old_remote_credential_id",
+                "save_requested", "expires_at", "last_error_code", "created_at", "updated_at",
+            ),
+        }
+        for table, columns in expected_columns.items():
+            actual = tuple(
+                row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+            )
+            assert actual == columns
+
+        agent_indexes = {
+            tuple(
+                column[2]
+                for column in connection.execute(f"PRAGMA index_info({row[1]})").fetchall()
+            )
+            for row in connection.execute("PRAGMA index_list(agents)").fetchall()
+            if row[2]
+        }
+        assert agent_indexes == {
+            ("agent_id",),
+            ("instance_id",),
+            ("normalized_endpoint",),
+        }
+        status_fks = connection.execute("PRAGMA foreign_key_list(agent_status)").fetchall()
+        journal_fks = connection.execute(
+            "PRAGMA foreign_key_list(agent_enrollment_jobs)"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert any(
+        row[2] == "agents" and row[3] == "agent_id" and row[6] == "CASCADE"
+        for row in status_fks
+    )
+    assert any(row[2] == "agents" and row[3] == "replace_agent_id" for row in journal_fks)
+
+
+@pytest.mark.contract
+def test_manager_database_never_stores_plaintext_credentials(tmp_path):
+    db_path = tmp_path / "control-plane.db"
+    run_control_plane_migrations(db_path)
+    connection = sqlite3.connect(db_path)
+    try:
+        columns = {
+            row[1]
+            for table in ("agents", "agent_enrollment_jobs")
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+    finally:
+        connection.close()
+
+    assert "token" not in columns
+    assert "token_hash" not in columns
+    assert "private_key" not in columns
 
 
 @pytest.mark.contract
