@@ -50,7 +50,8 @@ def test_agent_runtime_serializes_configured_capability_without_cidrs(tmp_path):
             config=config,
             state_database=tmp_path / "state.db",
             instance_id_path=tmp_path / "instance-id",
-        )
+        ),
+        client=("192.168.40.20", 50000),
     )
 
     response = client.get("/api/v2/runtime")

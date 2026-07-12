@@ -65,6 +65,7 @@ from ic_env_guard.api.monitoring import get_machine_registry
 from ic_env_guard.api.monitoring import router as monitoring_router
 from ic_env_guard.api.observations import get_observation_service
 from ic_env_guard.api.observations import router as observations_router
+from ic_env_guard.api.public_client_cidr import PublicClientCidrMiddleware
 from ic_env_guard.api.risk import classify_route
 from ic_env_guard.api.runtime import RuntimeMetadata, get_runtime_metadata
 from ic_env_guard.api.runtime import router as runtime_router
@@ -441,6 +442,12 @@ def create_app(
         app.include_router(control_plane_audit_router)
 
     mount_static_ui(app)
+
+    if app_config is not None and app_config.server.trusted_lan_http.enabled:
+        app.add_middleware(
+            PublicClientCidrMiddleware,
+            networks=tuple(app_config.server.trusted_lan_http.client_cidrs),
+        )
 
     return app
 
