@@ -1,9 +1,21 @@
 import sqlite3
+from pathlib import Path
 
 import pytest
 
 from ic_env_guard.db.control_plane_migrations import run_control_plane_migrations
-from ic_env_guard.db.migrations import MigrationError, run_migrations
+from ic_env_guard.db.migrations import MigrationError, _load_migration, run_migrations
+
+CONTROL_PLANE_MIGRATIONS = (
+    Path(__file__).parents[2] / "ic_env_guard" / "control_plane_migrations"
+)
+
+
+def _run_control_plane_through(connection, version):
+    for path in sorted(CONTROL_PLANE_MIGRATIONS.glob("[0-9][0-9][0-9][0-9]_*.py")):
+        if path.name > version:
+            break
+        _load_migration(path).upgrade(connection)
 
 
 def _create_applied_parent_fleet_schema(connection):
@@ -300,3 +312,153 @@ def test_agent_and_control_plane_migrations_keep_databases_isolated(tmp_path):
     assert "control_plane_audit_events" not in agent_tables
     assert "control_plane_audit_events" in control_plane_tables
     assert "audit_events" not in control_plane_tables
+
+
+@pytest.mark.contract
+def test_legacy_manual_migration_preserves_rows_indexes_fks_and_checks(tmp_path):
+    db_path = tmp_path / "control-plane.db"
+    connection = sqlite3.connect(db_path)
+    try:
+        _run_control_plane_through(connection, "0003_fleet_registry_hardening.py")
+        connection.execute(
+            "INSERT INTO agents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "legacy-01", None, "Legacy", "https://legacy.example:8765", "c" * 48,
+                None, "system-tls", "legacy_admin_token", 1, "config_import", 7,
+                "2026-07-12T10:00:00.000000Z", "2026-07-12T11:00:00.000000Z",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO agents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "ssh-01", "instance-01", "SSH", "https://ssh.example:8765", "d" * 48,
+                "remote-01", "system-tls", "ssh_auto", 0, "manual", 3,
+                "2026-07-12T09:00:00.000000Z", "2026-07-12T09:30:00.000000Z",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO agent_status VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "ssh-01", 3, "ready", "healthy", None, None, "2", "0.2.0", "[]",
+                "{}", None, "2026-07-12T09:30:00.000000Z",
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    run_control_plane_migrations(db_path)
+
+    connection = sqlite3.connect(db_path)
+    connection.execute("PRAGMA foreign_keys=ON")
+    try:
+        rows = connection.execute(
+            "SELECT agent_id, instance_id, display_name, normalized_endpoint, credential_ref, "
+            "remote_credential_id, transport_profile_id, enrollment_method, enabled, source, "
+            "revision, created_at, updated_at FROM agents ORDER BY agent_id"
+        ).fetchall()
+        assert rows[0] == (
+            "legacy-01", None, "Legacy", "https://legacy.example:8765", "c" * 48,
+            None, "system-tls", "legacy_admin_token", 1, "config_import", 7,
+            "2026-07-12T10:00:00.000000Z", "2026-07-12T11:00:00.000000Z",
+        )
+        assert rows[1][0:11] == (
+            "ssh-01", "instance-01", "SSH", "https://ssh.example:8765", "d" * 48,
+            "remote-01", "system-tls", "ssh_auto", 0, "manual", 3,
+        )
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        status_indexes = {
+            row[1] for row in connection.execute("PRAGMA index_list(agent_status)")
+        }
+        journal_indexes = {
+            row[1]
+            for row in connection.execute("PRAGMA index_list(agent_enrollment_jobs)")
+        }
+        assert "idx_agent_status_updated" in status_indexes
+        assert "idx_enrollment_state_expiry" in journal_indexes
+        assert any(
+            row[2] == "agents" and row[6] == "CASCADE"
+            for row in connection.execute("PRAGMA foreign_key_list(agent_status)")
+        )
+        connection.execute(
+            "INSERT INTO agents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "manual-legacy", None, "Manual", "https://manual.example:8765", "e" * 48,
+                None, "system-tls", "legacy_admin_token", 1, "manual", 1,
+                "2026-07-12T12:00:00.000000Z", "2026-07-12T12:00:00.000000Z",
+            ),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO agents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "bad-ssh", None, "Bad", "https://bad.example:8765", "f" * 48,
+                    "remote-bad", "system-tls", "ssh_auto", 1, "manual", 1,
+                    "2026-07-12T12:00:00.000000Z", "2026-07-12T12:00:00.000000Z",
+                ),
+            )
+    finally:
+        connection.close()
+
+
+@pytest.mark.contract
+def test_legacy_manual_migration_rolls_back_ddl_failure(tmp_path):
+    db_path = tmp_path / "control-plane.db"
+    connection = sqlite3.connect(db_path)
+    try:
+        _run_control_plane_through(connection, "0003_fleet_registry_hardening.py")
+        before = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name='agents'"
+        ).fetchone()
+        migration = _load_migration(
+            CONTROL_PLANE_MIGRATIONS / "0004_legacy_manual_enrollment.py"
+        )
+        connection.set_authorizer(
+            lambda action, *_args: (
+                sqlite3.SQLITE_DENY
+                if action == sqlite3.SQLITE_ALTER_TABLE
+                else sqlite3.SQLITE_OK
+            )
+        )
+        with pytest.raises(sqlite3.DatabaseError):
+            migration.upgrade(connection)
+        connection.set_authorizer(None)
+        assert connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name='agents'"
+        ).fetchone() == before
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='agents_next'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT 1 FROM schema_versions WHERE version='0004_legacy_manual_enrollment'"
+        ).fetchone() is None
+    finally:
+        connection.close()
+
+
+@pytest.mark.contract
+def test_control_plane_future_user_version_fails_closed_without_writes(tmp_path):
+    db_path = tmp_path / "control-plane.db"
+    run_control_plane_migrations(db_path)
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("PRAGMA user_version=999")
+        connection.commit()
+        before = connection.execute(
+            "SELECT version, result FROM schema_versions ORDER BY version"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    with pytest.raises(MigrationError, match="newer control-plane schema"):
+        run_control_plane_migrations(db_path)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone() == (999,)
+        assert connection.execute(
+            "SELECT version, result FROM schema_versions ORDER BY version"
+        ).fetchall() == before
+    finally:
+        connection.close()

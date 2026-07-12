@@ -13,6 +13,8 @@ from ic_env_guard.agents.registry import AgentRegistry
 from ic_env_guard.agents.terminal_proxy import GatewayProxyLimiter, GatewayTicketStore
 from ic_env_guard.api import terminal_ws
 from ic_env_guard.api.agent_audit import router as agent_audit_router
+from ic_env_guard.api.agent_enrollments import get_enrollment_orchestrator
+from ic_env_guard.api.agent_enrollments import router as agent_enrollments_router
 from ic_env_guard.api.agent_http import get_agent_http_client
 from ic_env_guard.api.agent_monitoring import router as agent_monitoring_router
 from ic_env_guard.api.agent_registry import (
@@ -409,6 +411,11 @@ def create_app(
             raise V2ApiError(503, "probe_unavailable", "fleet probing is unavailable")
         return container.fleet_probe_service
 
+    def configured_enrollment_orchestrator():
+        if not isinstance(container, ManagerContainer):
+            raise RuntimeError("Enrollment orchestrator is not configured in Agent mode")
+        return container.enrollment_orchestrator
+
     def configured_audit_query_repository() -> Iterator[AuditQueryRepository]:
         if audit_session_factory is None:
             raise RuntimeError("agent audit repository is not configured in control-plane mode")
@@ -446,6 +453,9 @@ def create_app(
     app.dependency_overrides[get_agent_ws_connector] = configured_agent_ws_connector
     app.dependency_overrides[get_fleet_status_service] = configured_fleet_status_service
     app.dependency_overrides[get_fleet_probe_service] = configured_fleet_probe_service
+    app.dependency_overrides[get_enrollment_orchestrator] = (
+        configured_enrollment_orchestrator
+    )
     app.dependency_overrides[get_audit_query_repository] = configured_audit_query_repository
     app.dependency_overrides[get_control_plane_audit_repository] = (
         configured_control_plane_audit_repository
@@ -484,6 +494,7 @@ def create_app(
         app.include_router(audit_router)
         app.include_router(terminal_ws.router)
     else:
+        app.include_router(agent_enrollments_router)
         app.include_router(agent_registry_v2_router)
         app.include_router(fleet_v2_router)
         app.include_router(fleet_router)

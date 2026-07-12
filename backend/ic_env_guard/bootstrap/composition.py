@@ -30,8 +30,11 @@ from ic_env_guard.db.control_plane_migrations import run_control_plane_migration
 from ic_env_guard.db.migrations import run_migrations
 from ic_env_guard.db.services import ServiceRuntime
 from ic_env_guard.db.session import create_session_factory, create_sqlite_engine
+from ic_env_guard.enrollment.agent_client import EnrollmentAgentClient
 from ic_env_guard.enrollment.audit import AgentEnrollmentAudit
 from ic_env_guard.enrollment.credential_store import CredentialStore
+from ic_env_guard.enrollment.jobs import EnrollmentJobs
+from ic_env_guard.enrollment.orchestrator import EnrollmentOrchestrator
 from ic_env_guard.enrollment.service import EnrollmentService
 from ic_env_guard.enrollment.socket_server import EnrollmentSocketServer
 from ic_env_guard.fleet.importer import import_yaml_agents_once
@@ -117,6 +120,8 @@ class ManagerContainer:
     credential_store: CredentialStore
     fleet_status_service: FleetStatusService
     fleet_probe_service: FleetProbeService | None
+    enrollment_jobs: EnrollmentJobs
+    enrollment_orchestrator: EnrollmentOrchestrator
 
 
 def _service_runtime(service: ServiceConfig) -> ServiceRuntime:
@@ -265,6 +270,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
     registry_repository = SQLiteManagerRegistryRepository(database_engine)
     status_repository = AgentStatusRepository(database_engine)
     enrollment_journal_repository = EnrollmentJournalRepository(database_engine)
+    manager_id = registry_repository.get_or_create_manager_id()
     # One ManagerContainer owns one Store/coordinator; enrollment mutations and startup cleanup
     # must share its lifecycle lease rather than constructing another Store for this directory.
     credential_store = CredentialStore(config.control_plane.effective_credential_directory)
@@ -301,6 +307,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         status_repository=status_repository,
         persist_probe_status=False,
     )
+    enrollment_agent_client = None
     try:
         target_policy = AgentTargetPolicy(
             allowed_agent_cidrs=config.control_plane.allowed_agent_cidrs,
@@ -316,6 +323,11 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
 
         agent_availability.set_probe_delegate(unavailable_probe)
     else:
+        enrollment_agent_client = EnrollmentAgentClient(
+            target_policy=target_policy,
+            transport_profiles=config.control_plane.transport_profiles,
+            client=agent_client,
+        )
         fleet_probe_service = FleetProbeService(
             registry_repository=registry_repository,
             status_repository=status_repository,
@@ -331,6 +343,19 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
             ),
         )
         agent_availability.set_probe_delegate(fleet_probe_service.probe)
+    enrollment_jobs = EnrollmentJobs(
+        enrollment_journal_repository,
+        manager_id=str(manager_id),
+        pending_ttl_seconds=config.enrollment.pending_ttl_seconds,
+        max_active=config.enrollment.max_pending,
+    )
+    enrollment_orchestrator = EnrollmentOrchestrator(
+        jobs=enrollment_jobs,
+        journal=enrollment_journal_repository,
+        credential_store=credential_store,
+        agent_client=enrollment_agent_client,
+        registry=registry_repository,
+    )
     return ManagerContainer(
         config=config,
         agent_registry=agent_registry,
@@ -355,11 +380,13 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         ticket_manager=TerminalTicketManager(),
         machine_registry=MachineRegistry(),
         audit_storage_health=AuditStorageHealth(),
-        manager_id=registry_repository.get_or_create_manager_id(),
+        manager_id=manager_id,
         registry_repository=registry_repository,
         status_repository=status_repository,
         enrollment_journal_repository=enrollment_journal_repository,
         credential_store=credential_store,
         fleet_status_service=fleet_status_service,
         fleet_probe_service=fleet_probe_service,
+        enrollment_jobs=enrollment_jobs,
+        enrollment_orchestrator=enrollment_orchestrator,
     )

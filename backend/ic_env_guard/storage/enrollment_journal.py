@@ -1,3 +1,4 @@
+import json
 import re
 import sqlite3
 from datetime import datetime
@@ -54,6 +55,7 @@ _ALLOWED_TRANSITIONS = {
     },
     EnrollmentState.VERIFYING: {
         EnrollmentState.VERIFIED,
+        EnrollmentState.CANCELLED,
         EnrollmentState.FAILED,
         EnrollmentState.EXPIRED,
     },
@@ -71,6 +73,14 @@ _ALLOWED_TRANSITIONS = {
         EnrollmentState.FAILED,
     },
 }
+_EXPIRABLE_STATES = (
+    EnrollmentState.PENDING,
+    EnrollmentState.RUNNING,
+    EnrollmentState.AWAITING_CLI,
+    EnrollmentState.CREDENTIAL_ISSUED,
+    EnrollmentState.VERIFYING,
+    EnrollmentState.VERIFIED,
+)
 
 
 def _validate_job(job: EnrollmentJob) -> None:
@@ -153,6 +163,52 @@ class EnrollmentJournalRepository(_SQLiteRepository):
         except (SQLAlchemyError, sqlite3.Error) as exc:
             raise RegistryError("enrollment journal storage is unavailable") from exc
 
+    def create_with_capacity(
+        self,
+        job: EnrollmentJob,
+        *,
+        now: datetime,
+        max_active: int,
+    ) -> EnrollmentJob:
+        _validate_job(job)
+        if max_active < 1:
+            raise RegistryInvariantError("enrollment capacity is invalid")
+        terminal = tuple(state.value for state in EnrollmentState if state.terminal)
+        terminal_placeholders = ",".join("?" for _ in terminal)
+        expirable = tuple(state.value for state in _EXPIRABLE_STATES)
+        expirable_placeholders = ",".join("?" for _ in expirable)
+        try:
+            with self._write() as connection:
+                connection.execute(
+                    f"UPDATE agent_enrollment_jobs SET state=?, updated_at=? "
+                    f"WHERE state IN ({expirable_placeholders}) AND expires_at<=?",
+                    (
+                        EnrollmentState.EXPIRED.value,
+                        _format_time(now),
+                        *expirable,
+                        _format_time(now),
+                    ),
+                )
+                count = connection.execute(
+                    f"SELECT COUNT(*) FROM agent_enrollment_jobs "
+                    f"WHERE state NOT IN ({terminal_placeholders})",
+                    terminal,
+                ).fetchone()[0]
+                if count >= max_active:
+                    raise RegistryConflict("agent_enrollment_capacity")
+                connection.execute(
+                    f"INSERT INTO agent_enrollment_jobs ({_COLUMNS}) "
+                    f"VALUES ({','.join('?' * 22)})",
+                    self._values(job),
+                )
+            return job
+        except RegistryConflict:
+            raise
+        except sqlite3.IntegrityError as exc:
+            raise RegistryConflict("enrollment job conflicts with existing state") from exc
+        except (SQLAlchemyError, sqlite3.Error) as exc:
+            raise RegistryError("enrollment journal storage is unavailable") from exc
+
     def get(self, enrollment_id: str) -> EnrollmentJob | None:
         try:
             with self.engine.connect() as connection:
@@ -190,6 +246,60 @@ class EnrollmentJournalRepository(_SQLiteRepository):
                     raise RevisionConflict("enrollment state changed")
         except RevisionConflict:
             raise
+        except (SQLAlchemyError, sqlite3.Error) as exc:
+            raise RegistryError("enrollment journal storage is unavailable") from exc
+
+    def replace_if_state(
+        self,
+        job: EnrollmentJob,
+        *,
+        expected_state: EnrollmentState,
+    ) -> EnrollmentJob:
+        _validate_job(job)
+        if job.state not in _ALLOWED_TRANSITIONS.get(expected_state, set()):
+            raise RegistryInvariantError("invalid enrollment state transition")
+        assignments = ", ".join(
+            f"{column.strip()}=?"
+            for column in _COLUMNS.split(",")
+            if column.strip() != "enrollment_id"
+        )
+        values = self._values(job)
+        try:
+            with self._write() as connection:
+                cursor = connection.execute(
+                    f"UPDATE agent_enrollment_jobs SET {assignments} "
+                    "WHERE enrollment_id=? AND state=?",
+                    (*values[1:], job.enrollment_id, expected_state.value),
+                )
+                if cursor.rowcount != 1:
+                    raise RevisionConflict("enrollment state changed")
+            return job
+        except RevisionConflict:
+            raise
+        except (SQLAlchemyError, sqlite3.Error) as exc:
+            raise RegistryError("enrollment journal storage is unavailable") from exc
+
+    def list_non_terminal(self) -> tuple[EnrollmentJob, ...]:
+        terminal = tuple(state.value for state in EnrollmentState if state.terminal)
+        placeholders = ",".join("?" for _ in terminal)
+        try:
+            with self.engine.connect() as connection:
+                rows = connection.exec_driver_sql(
+                    f"SELECT {_COLUMNS} FROM agent_enrollment_jobs "
+                    f"WHERE state NOT IN ({placeholders}) ORDER BY created_at, enrollment_id",
+                    terminal,
+                ).fetchall()
+            return tuple(_job(row) for row in rows)
+        except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise RegistryError("enrollment journal storage is unavailable") from exc
+
+    def dump_serialized_rows(self) -> str:
+        try:
+            with self.engine.connect() as connection:
+                rows = connection.exec_driver_sql(
+                    f"SELECT {_COLUMNS} FROM agent_enrollment_jobs ORDER BY enrollment_id"
+                ).mappings().all()
+            return json.dumps([dict(row) for row in rows], sort_keys=True, default=str)
         except (SQLAlchemyError, sqlite3.Error) as exc:
             raise RegistryError("enrollment journal storage is unavailable") from exc
 

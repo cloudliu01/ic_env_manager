@@ -64,6 +64,7 @@ def create_lifespan(container: AgentContainer | ManagerContainer):
                 )
                 app.state.metrics_refresh_task = refresh_task
             if isinstance(container, ManagerContainer):
+                await container.enrollment_orchestrator.recover_and_cleanup()
                 if container.fleet_probe_service is not None:
                     fleet_probe_task = asyncio.create_task(
                         _fleet_probe_loop(

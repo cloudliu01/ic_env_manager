@@ -145,11 +145,8 @@ def _validate_record(record: AgentRecord) -> None:
         raise RegistryInvariantError("agent revision must be positive")
     if record.source not in {"config_import", "manual", "discovery"}:
         raise RegistryInvariantError("invalid agent source")
-    legacy_import = (
-        record.source == "config_import"
-        and record.enrollment_method is EnrollmentMethod.LEGACY_ADMIN_TOKEN
-    )
-    if record.instance_id is None and not legacy_import:
+    legacy_agent = record.enrollment_method is EnrollmentMethod.LEGACY_ADMIN_TOKEN
+    if record.instance_id is None and not legacy_agent:
         raise RegistryInvariantError("registered agents require an instance_id")
     if record.remote_credential_id is None and (
         record.enrollment_method is not EnrollmentMethod.LEGACY_ADMIN_TOKEN
