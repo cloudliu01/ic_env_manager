@@ -19,6 +19,8 @@ Run the template unit as an existing Linux account, for example
 `/run/ic-env-guard` runtime directory for the enrollment socket. Keep the
 stable `instance-id`, legacy admin token, SQLite state, and configuration outside
 the replaceable runtime. The runtime directory and socket are ephemeral.
+The same runtime directory is required when a valid older Agent config omits an
+`enrollment:` block, because that config uses the default socket path.
 
 Public and Local Ingest are two listeners in one process. Local Ingest is
 loopback-only and must never be reverse proxied, forwarded, published, or opened

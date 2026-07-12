@@ -172,7 +172,7 @@ def build_agent_container(
             instance_id,
             enrollment_service,
         )
-        if config is not None and "enrollment" in config.model_fields_set
+        if config is not None
         else None
     )
     return AgentContainer(

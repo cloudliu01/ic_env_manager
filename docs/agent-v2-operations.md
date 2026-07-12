@@ -122,6 +122,20 @@ Stop the service and make a consistent backup before an upgrade:
 4. Do not back up the enrollment socket or anything under `/run`; systemd recreates the runtime
    directory and the Agent recreates its owned socket.
 
+Run `sudo packaging/install/upgrade.sh <existing-non-root-user>`. For the documented legacy
+layout, the upgrader detects `/etc/ic-env-guard/config.yaml` plus
+`/var/lib/ic-env-guard/{token,state.db,instance-id}`, validates a staged per-user config, and
+only then stops `ic-env-guard.service` for a consistent state copy. It starts
+`ic-env-guard@<user>.service` before disabling the legacy unit. If the new instance cannot
+start, it re-enables and restarts the legacy unit and leaves the original config and recovery
+files unchanged. The project never creates the selected account and rejects root.
+
+Automatic migration accepts only the paths emitted by the old installer. If the legacy config
+uses customized token or state paths, the upgrader exits before stopping the legacy service;
+copy the grouped backup to the per-user layout, update and validate the config manually, then
+rerun the upgrade. Do not run both units together: they otherwise use the same default Public
+and Ingest ports.
+
 During the first new/pre-v2 initialization, the Agent may briefly create an owner-only
 `.instance-identity-bootstrap.<database-hash>` beside the state DB. Its versioned content binds
 the canonical DB and identity file paths; it contains no UUID or secret and cannot authorize a
@@ -137,6 +151,11 @@ Agent and restore it from the matching backup. Once the SQLite initialization ma
 existing v2 schema proves initialization occurred, startup without the file fails closed and
 does not generate a replacement UUID. A new install or an explicitly pre-v2 database may
 create the file once. Never copy one Agent's identity to another host.
+
+An older valid Agent config does not need an explicit `enrollment:` block. The documented
+defaults still create `/run/ic-env-guard/agent-enrollment.sock` and advertise
+`manager-enrollment.v1`; the template unit's `RuntimeDirectory=ic-env-guard` and mode `0700`
+provide its parent directory. Add an explicit block only to override the socket path or mode.
 
 Migrations add Observation, Log Source, and `manager_credentials` tables in place and retain
 existing tables. A failed migration prevents startup. An older binary may leave unknown new

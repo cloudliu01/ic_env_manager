@@ -4,11 +4,13 @@ import os
 import tempfile
 from pathlib import Path
 from shutil import rmtree
+from unittest.mock import Mock
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
+from ic_env_guard.config.loader import load_config
 from ic_env_guard.config.models import (
     AppConfig,
     AuthConfig,
@@ -16,6 +18,7 @@ from ic_env_guard.config.models import (
     EnrollmentConfig,
 )
 from ic_env_guard.enrollment.helper import run_helper
+from ic_env_guard.enrollment.socket_server import EnrollmentSocketServer
 from ic_env_guard.main import create_app
 
 REQUEST = (
@@ -79,6 +82,40 @@ def test_helper_uses_local_socket_and_stdout_contains_exactly_one_response(tmp_p
         headers={"Authorization": "Bearer local-admin-token"},
     )
     assert "manager-enrollment.v1" not in stopped.json()["capabilities"]
+
+
+@pytest.mark.integration
+def test_legacy_agent_config_starts_default_enrollment_capability(
+    tmp_path, socket_dir, monkeypatch
+):
+    token_file = tmp_path / "token"
+    token_file.write_text("local-admin-token\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    config_path = tmp_path / "legacy-agent.yaml"
+    config_path.write_text(
+        f"mode: agent\nauth:\n  token_file: {token_file}\n",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    assert "enrollment" not in config.model_fields_set
+    config.enrollment.socket_path = socket_dir / "enroll.sock"
+    start = Mock()
+    stop = Mock()
+    monkeypatch.setattr(EnrollmentSocketServer, "start", start)
+    monkeypatch.setattr(EnrollmentSocketServer, "stop", stop)
+    monkeypatch.setattr(EnrollmentSocketServer, "healthy", property(lambda _self: True))
+
+    app = create_app(config=config, state_database=tmp_path / "state.db")
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/v2/capabilities",
+            headers={"Authorization": "Bearer local-admin-token"},
+        )
+
+        assert response.status_code == 200
+        assert "manager-enrollment.v1" in response.json()["capabilities"]
+    start.assert_called_once_with()
+    stop.assert_called_once_with()
 
 
 @pytest.mark.integration
