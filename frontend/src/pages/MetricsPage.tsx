@@ -99,11 +99,11 @@ export function MetricsPage() {
 
       <div className="monitoring-grid">
         <article className="monitoring-panel">
-          <h3>Disk usage</h3>
+          <h2>Disk usage</h2>
           <DiskTable disks={snapshot?.disks ?? []} />
         </article>
         <article className="monitoring-panel">
-          <h3>Network interfaces</h3>
+          <h2>Network interfaces</h2>
           {snapshot?.network.length ? (
             <div className="monitoring-table-wrap">
               <table className="monitoring-table">
@@ -126,7 +126,7 @@ export function MetricsPage() {
       </div>
 
       <article className="monitoring-panel">
-        <h3>Selected agent</h3>
+        <h2>Selected agent</h2>
         <p className="monitoring-empty">Agent credentials are managed by the control plane configuration.</p>
       </article>
     </section>

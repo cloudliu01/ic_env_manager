@@ -59,7 +59,7 @@ describe('AuditStatusPage', () => {
   });
 
   it('renders gateway and active-agent audit records without secret fields', async () => {
-    render(<AuditStatusPage />);
+    const { container } = render(<AuditStatusPage />);
 
     expect(await screen.findByText('Gateway audit')).toBeTruthy();
     expect(screen.getByText('Agent audit')).toBeTruthy();
@@ -70,6 +70,14 @@ describe('AuditStatusPage', () => {
     expect(screen.queryByText(/token|password|private_key/i)).toBeNull();
     expect(listGatewayAuditEvents).toHaveBeenCalledWith(100, expect.any(AbortSignal));
     expect(listAgentAuditEvents).toHaveBeenCalledWith('agent-a', 100, expect.any(AbortSignal));
+    const tableRegions = Array.from(container.querySelectorAll('.table-region'));
+    expect(tableRegions).toHaveLength(2);
+    for (const region of tableRegions) {
+      expect(region.getAttribute('tabindex')).toBe('0');
+      expect(region.getAttribute('aria-label')).toMatch(/horizontally scrollable/i);
+      expect(region.querySelector('table')).toBeTruthy();
+    }
+    expect(Array.from(container.querySelectorAll('h1,h2,h3')).map((heading) => heading.tagName)).toEqual(['H1', 'H2', 'H2']);
   });
 
   it('does not request agent audit when no active agent is selected', async () => {

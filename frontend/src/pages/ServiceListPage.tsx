@@ -57,7 +57,7 @@ export function ServiceListPage() {
       {activeAgentId && !supportsServices ? <p>Selected agent does not support services.</p> : null}
       {services.map((service) => (
         <article key={service.id}>
-          <h3>{service.name}</h3>
+          <h2>{service.name}</h2>
           <p>Status: {service.status}</p>
           <button type="button" onClick={() => void handleStart(service.id)} disabled={!supportsServices}>Start</button>
           <button type="button" onClick={() => void handleStop(service.id)} disabled={!supportsServices}>Stop</button>

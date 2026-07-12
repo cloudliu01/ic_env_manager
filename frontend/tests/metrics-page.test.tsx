@@ -47,7 +47,7 @@ describe('MetricsPage', () => {
   });
 
   it('shows active-agent monitoring dashboard data without machine credentials', async () => {
-    render(<MetricsPage />);
+    const { container } = render(<MetricsPage />);
 
     expect(await screen.findByText('Machine telemetry')).toBeTruthy();
     expect(await screen.findByText('12.5%')).toBeTruthy();
@@ -56,6 +56,7 @@ describe('MetricsPage', () => {
     expect(screen.queryByPlaceholderText('Bearer token')).toBeNull();
     expect(screen.queryByRole('button', { name: /add machine/i })).toBeNull();
     expect(getAgentMonitoringSnapshot).toHaveBeenCalledWith('agent-a', expect.anything());
+    expect(Array.from(container.querySelectorAll('h1,h2,h3')).map((heading) => heading.tagName)).toEqual(['H1', 'H2', 'H2', 'H2']);
   });
 
   it('reloads snapshots when the active agent changes', async () => {

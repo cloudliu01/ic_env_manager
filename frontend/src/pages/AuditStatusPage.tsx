@@ -4,9 +4,9 @@ import { agentSupports, useActiveAgent } from '../agents/AgentStateContext';
 
 const AUDIT_LIMIT = 100;
 
-function AuditTable({ events }: { events: AuditEvent[] }) {
+function AuditTable({ events, label }: { events: AuditEvent[]; label: string }) {
   return (
-    <table>
+    <div className="table-region" tabIndex={0} aria-label={`${label}, horizontally scrollable`}><table>
       <thead>
         <tr>
           <th>Time</th>
@@ -29,7 +29,7 @@ function AuditTable({ events }: { events: AuditEvent[] }) {
           </tr>
         ))}
       </tbody>
-    </table>
+    </table></div>
   );
 }
 
@@ -73,15 +73,15 @@ export function AuditStatusPage({ mode = 'manager' }: { mode?: 'standalone' | 'm
       {error ? <p role="alert">{error}</p> : null}
 
       {mode === 'manager' ? <article>
-        <h3>Gateway audit</h3>
-        <AuditTable events={gatewayEvents} />
+        <h2>Gateway audit</h2>
+        <AuditTable events={gatewayEvents} label="Gateway audit table" />
       </article> : null}
 
       <article>
-        <h3>Agent audit</h3>
+        <h2>Agent audit</h2>
         <p>{activeAgent?.name ?? activeAgentId ?? 'No active agent selected.'}</p>
         {activeAgentId && !supportsAudit ? <p>Selected agent does not support audit.</p> : null}
-        {activeAgentId && supportsAudit ? <AuditTable events={agentEvents} /> : null}
+        {activeAgentId && supportsAudit ? <AuditTable events={agentEvents} label="Agent audit table" /> : null}
       </article>
     </section>
   );

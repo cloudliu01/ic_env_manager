@@ -15,8 +15,9 @@ vi.mock('../src/api/services', () => ({
 
 describe('ServiceListPage', () => {
   it('renders configured services', async () => {
-    render(<ServiceListPage />);
+    const { container } = render(<ServiceListPage />);
     expect(await screen.findByText('Demo')).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Start' })).toBeTruthy();
+    expect(Array.from(container.querySelectorAll('h1,h2,h3')).map((heading) => heading.tagName)).toEqual(['H1', 'H2']);
   });
 });

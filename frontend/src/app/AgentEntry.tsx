@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useState } from 'react';
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { StandaloneAgentProvider } from '../agents/AgentStateContext';
+import { StandaloneAgentProvider } from '../agents/StandaloneAgentProvider';
 import { apiClient } from '../shared/api/client';
 import { LoginPage } from '../pages/LoginPage';
 import { AppShell } from './shell/AppShell';
