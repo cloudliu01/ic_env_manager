@@ -224,6 +224,15 @@ tbody tr:last-child > * {
   border-bottom: 0;
 }
 
+tbody tr[tabindex] {
+  cursor: pointer;
+}
+
+tbody tr[tabindex]:focus-visible {
+  outline: 3px solid var(--color-focus);
+  outline-offset: -3px;
+}
+
 .primary-cell,
 .secondary-cell {
   display: block;
@@ -277,6 +286,168 @@ tbody tr:last-child > * {
 button:disabled {
   cursor: not-allowed;
   opacity: 0.48;
+}
+
+.fleet-filters,
+.agent-status-summary,
+.overview-grid,
+.monitoring-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: var(--space-3);
+}
+
+.fleet-filters label {
+  display: grid;
+  gap: var(--space-1);
+  color: var(--color-muted);
+  font-size: 0.8rem;
+}
+
+.fleet-filters input,
+.fleet-filters select {
+  min-height: 44px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-raised);
+  color: var(--color-text);
+  padding: var(--space-2);
+}
+
+.table-sort {
+  min-height: 44px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+}
+
+.row-menu {
+  position: absolute;
+  z-index: var(--z-menu);
+  display: grid;
+  margin-top: var(--space-1);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-raised);
+  padding: var(--space-1);
+}
+
+.row-menu button {
+  min-height: 44px;
+  border: 0;
+  background: transparent;
+  color: var(--color-text);
+  padding: var(--space-2) var(--space-3);
+  text-align: left;
+}
+
+.fleet-card-list,
+.monitoring-list {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.fleet-card {
+  display: grid;
+  gap: var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  padding: var(--space-4);
+}
+
+.fleet-card > div,
+.monitoring-list li {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.fleet-card p {
+  margin: 0;
+  color: var(--color-muted);
+}
+
+.fleet-card .secondary-button {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  width: fit-content;
+  text-decoration: none;
+}
+
+.fleet-skeleton {
+  min-height: 12rem;
+  border-radius: var(--radius-md);
+  background: var(--color-surface-raised);
+  padding: var(--space-4);
+}
+
+.agent-header p {
+  margin-top: 0;
+}
+
+.agent-status-summary {
+  align-items: center;
+}
+
+.transport-alert {
+  border-left: 3px solid var(--color-warning-text);
+  background: var(--color-warning-surface);
+  color: var(--color-warning-text);
+  padding: var(--space-3);
+}
+
+.agent-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+.agent-tabs a {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  border-radius: var(--radius-sm);
+  color: var(--color-muted);
+  padding: 0 var(--space-3);
+}
+
+.agent-tabs a.active {
+  background: var(--color-surface-raised);
+  color: var(--color-text);
+}
+
+.agent-tabs a[aria-disabled="true"] {
+  cursor: not-allowed;
+  opacity: 0.64;
+}
+
+.overview-grid > * {
+  flex: 1 1 16rem;
+}
+
+.settings-list {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-2) var(--space-4);
+}
+
+.settings-list dt {
+  color: var(--color-muted);
+}
+
+.settings-list dd {
+  margin: 0;
+  overflow-wrap: anywhere;
 }
 
 .detail-panel,
@@ -386,6 +557,12 @@ pre {
 
   #main-content {
     padding: var(--space-4);
+  }
+
+  .table-region {
+    overflow: visible;
+    border: 0;
+    background: transparent;
   }
 }
 

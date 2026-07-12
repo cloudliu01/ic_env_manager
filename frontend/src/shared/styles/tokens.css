@@ -25,8 +25,10 @@
   --radius-sm: 0.375rem;
   --radius-md: 0.625rem;
   --z-sticky: 10;
+  --z-menu: 20;
   --z-dialog: 40;
   --motion-fast: 180ms;
+  --motion-standard: 220ms;
 
   /* Compatibility aliases for existing feature pages. */
   --bg-primary: var(--color-canvas);

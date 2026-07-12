@@ -1,24 +1,17 @@
 import { ChangeEvent, Suspense } from 'react';
-import { Link, Navigate, NavLink, Outlet, Route, Routes, useParams, useSearchParams } from 'react-router-dom';
+import { Link, Navigate, Outlet, Route, Routes, useSearchParams } from 'react-router-dom';
 import { useRuntime } from './RuntimeProvider';
 import { AppShell } from './shell/AppShell';
-import { Agent, ObservationFilters } from '../features/agent-registry/types';
-import { useAgent, useAgentObservations } from '../features/agent-registry/queries';
-import { useFleetOverview } from '../features/fleet/queries';
+import { ObservationFilters } from '../features/agent-registry/types';
+import { useAgentObservations } from '../features/agent-registry/queries';
+import { AgentLayout, useRouteAgent } from '../features/agent-registry/AgentLayout';
+import { AgentOverviewPage } from '../features/agent-registry/AgentOverviewPage';
+import { AgentSettingsPage } from '../features/agent-registry/AgentSettingsPage';
+import { FleetPage } from '../features/fleet/FleetPage';
+import { MonitoringPage } from '../features/fleet/MonitoringPage';
 import { CapabilityRoute } from '../shared/components/CapabilityRoute';
 import { RouteFocus } from '../shared/components/RouteFocus';
 import AgentEntry from './AgentEntry';
-
-const detailTabs = [
-  { path: 'overview', label: 'Overview' },
-  { path: 'terminal', label: 'Terminal', capability: 'terminals.v1' },
-  { path: 'services', label: 'Services', capability: 'services.v1' },
-  { path: 'observations', label: 'Observations', capability: 'observations.v2' },
-  { path: 'logs', label: 'Logs', capability: 'logs.v2' },
-  { path: 'metrics', label: 'Metrics', capability: 'monitoring.snapshot.v1' },
-  { path: 'audit', label: 'Audit', capability: 'audit.v1' },
-  { path: 'settings', label: 'Settings' },
-];
 
 function QueryError({ error }: { error: unknown }) {
   const correlationId = typeof error === 'object' && error && 'correlationId' in error
@@ -40,50 +33,8 @@ function ManagerLayout() {
   );
 }
 
-function FleetPage() {
-  const fleet = useFleetOverview();
-  return <section className="feature-page"><header className="page-header"><h1 tabIndex={-1}>Fleet</h1><p>Registered Agents and their cached health.</p></header>
-    {fleet.isPending ? <p role="status" aria-live="polite">Loading fleet…</p> : null}
-    {fleet.isError ? <QueryError error={fleet.error} /> : null}
-    {fleet.data ? <p aria-live="polite">{fleet.data.agents?.length ?? 0} Agents available.</p> : null}
-    <p><Link to="/agents/new">Add agent</Link> · <Link to="/discovery">Discover agents</Link></p>
-  </section>;
-}
-
 function PlaceholderPage({ title }: { title: string }) {
   return <section className="feature-page"><h1 tabIndex={-1}>{title}</h1><p>This route is ready for its dedicated feature.</p></section>;
-}
-
-function AgentLayout() {
-  const { agentId = '' } = useParams();
-  const agent = useAgent(agentId);
-  if (agent.isPending) return <p role="status" aria-live="polite">Loading Agent…</p>;
-  if (agent.isError) return <QueryError error={agent.error} />;
-  return <section className="feature-page">
-    <p><Link to="/fleet">Fleet</Link> / {agent.data.display_name}</p>
-    <nav aria-label="Agent detail navigation">
-      {detailTabs.map((tab) => {
-        const available = !tab.capability || agent.data.capabilities.includes(tab.capability);
-        const to = `/agents/${encodeURIComponent(agentId)}/${tab.path}`;
-        const reason = tab.capability ? `Unavailable: requires ${tab.capability}` : undefined;
-        return available ? <NavLink key={tab.path} to={to}>{tab.label}</NavLink> :
-          <a key={tab.path} href={to} aria-disabled="true" title={reason} onClick={(event) => event.preventDefault()}>{tab.label}<span className="sr-only"> — {reason}</span></a>;
-      })}
-    </nav>
-    <Outlet context={agent.data} />
-  </section>;
-}
-
-function useRouteAgent(): { agent: Agent; agentId: string } {
-  const { agentId = '' } = useParams();
-  const agent = useAgent(agentId);
-  if (agent.isPending || agent.isError || !agent.data) throw new Error('Agent route must be rendered inside AgentLayout');
-  return { agent: agent.data, agentId };
-}
-
-function AgentOverviewPage() {
-  const { agent } = useRouteAgent();
-  return <section><h1 tabIndex={-1}>Overview</h1><p>{agent.display_name}</p></section>;
 }
 
 function AgentCapabilityPlaceholder({ title, capability }: { title: string; capability: string }) {
@@ -120,7 +71,7 @@ function AgentRoutes() {
     <Route path="logs" element={<AgentCapabilityPlaceholder title="Logs" capability="logs.v2" />} />
     <Route path="metrics" element={<AgentCapabilityPlaceholder title="Metrics" capability="monitoring.snapshot.v1" />} />
     <Route path="audit" element={<AgentCapabilityPlaceholder title="Audit" capability="audit.v1" />} />
-    <Route path="settings" element={<PlaceholderPage title="Settings" />} />
+    <Route path="settings" element={<AgentSettingsPage />} />
   </Route>;
 }
 
@@ -130,7 +81,7 @@ function ManagerEntry() {
       <Route path="/fleet" element={<FleetPage />} />
       <Route path="/agents/new" element={<PlaceholderPage title="Add agent" />} />
       <Route path="/discovery" element={<PlaceholderPage title="Discovery" />} />
-      <Route path="/monitoring" element={<PlaceholderPage title="Monitoring" />} />
+      <Route path="/monitoring" element={<MonitoringPage />} />
       <Route path="/audit" element={<PlaceholderPage title="Audit" />} />
       {AgentRoutes()}
       <Route path="/" element={<Navigate to="/fleet" replace />} />
