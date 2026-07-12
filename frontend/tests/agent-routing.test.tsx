@@ -145,6 +145,20 @@ describe('agent-scoped API helpers', () => {
     expect(apiRequest).toHaveBeenCalledWith('/api/agents/agent-a/terminals/term-1/history?cursor=42');
     expect(apiRequest).toHaveBeenCalledWith('/api/agents/agent-a/terminals/term-1/connect-token', { method: 'POST' });
   });
+
+  it('encodes agent and resource IDs without losing Agent-scoped routing', async () => {
+    apiRequest.mockResolvedValue({ services: [], terminals: [] });
+
+    await listServices('lab/01');
+    await startService('lab/01', 'svc/main');
+    await listTerminals('lab/01');
+    await closeTerminal('lab/01', 'term/1');
+
+    expect(apiRequest).toHaveBeenCalledWith('/api/agents/lab%2F01/services');
+    expect(apiRequest).toHaveBeenCalledWith('/api/agents/lab%2F01/services/svc%2Fmain/start', { method: 'POST' });
+    expect(apiRequest).toHaveBeenCalledWith('/api/agents/lab%2F01/terminals');
+    expect(apiRequest).toHaveBeenCalledWith('/api/agents/lab%2F01/terminals/term%2F1', { method: 'DELETE' });
+  });
 });
 
 describe('AppRoutes fleet routing', () => {

@@ -45,8 +45,11 @@ def _ready_availability(config: AppConfig) -> AgentAvailabilityService:
 
 @pytest.mark.integration
 def test_overlapping_service_ids_stay_scoped_by_agent(tmp_path):
+    seen: list[tuple[str, str]] = []
+
     async def handler(request: httpx.Request) -> httpx.Response:
         agent_name = request.url.host.split(".")[0]
+        seen.append((request.url.host, request.url.path))
         return httpx.Response(
             200,
             json={
@@ -84,3 +87,7 @@ def test_overlapping_service_ids_stay_scoped_by_agent(tmp_path):
 
     assert first.json()["services"][0]["name"] == "Demo on lab-01"
     assert second.json()["services"][0]["name"] == "Demo on lab-02"
+    assert seen == [
+        ("lab-01.example", "/api/services"),
+        ("lab-02.example", "/api/services"),
+    ]

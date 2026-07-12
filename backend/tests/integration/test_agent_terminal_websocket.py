@@ -39,19 +39,29 @@ def _token_file(tmp_path, name="token"):
     return token_file
 
 
-def _config(tmp_path):
+def _config(tmp_path, *, include_lab_02: bool = False):
+    agents = [
+        AgentConfig(
+            id="lab-01",
+            name="Lab 01",
+            base_url="https://lab-01.example",
+            token_file=_token_file(tmp_path, "lab-01.token"),
+        )
+    ]
+    if include_lab_02:
+        agents.append(
+            AgentConfig(
+                id="lab-02",
+                name="Lab 02",
+                base_url="https://lab-02.example",
+                token_file=_token_file(tmp_path, "lab-02.token"),
+            )
+        )
     return AppConfig(
         auth=AuthConfig(token_file=_token_file(tmp_path)),
         mode="control-plane",
         control_plane=ControlPlaneConfig(audit_database=tmp_path / "control-plane.db"),
-        agents=[
-            AgentConfig(
-                id="lab-01",
-                name="Lab 01",
-                base_url="https://lab-01.example",
-                token_file=_token_file(tmp_path, "lab-01.token"),
-            )
-        ],
+        agents=agents,
     )
 
 
@@ -116,7 +126,8 @@ def _ws_headers() -> dict[str, str]:
 
 def _availability(config: AppConfig, capabilities: tuple[str, ...]) -> AgentAvailabilityService:
     service = AgentAvailabilityService(AgentRegistry(config.agents), AgentHttpClient())
-    service.record_ready_for_test("lab-01", datetime.now(UTC), capabilities=capabilities)
+    for agent in config.agents:
+        service.record_ready_for_test(agent.id, datetime.now(UTC), capabilities=capabilities)
     return service
 
 
@@ -399,6 +410,57 @@ def test_agent_terminal_websocket_rejects_mismatched_authenticated_actor(tmp_pat
     assert exc.value.code == 4403
     assert audit[0]["failure_category"] == "actor_mismatch"
     assert audit[0]["dispatch_state"] == "not_dispatched"
+
+
+@pytest.mark.integration
+def test_agent_terminal_ticket_is_agent_bound_and_single_use(tmp_path):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "lab-01.example"
+        assert request.url.path == "/api/terminals/term-1/connect-token"
+        return httpx.Response(201, json={"ticket": "upstream-ticket", "expires_in_seconds": 60})
+
+    config = _config(tmp_path, include_lab_02=True)
+    app = create_app(config=config)
+    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
+        transport=httpx.MockTransport(handler)
+    )
+    app.dependency_overrides[get_agent_availability] = lambda: _availability(
+        config, tuple(CAPABILITIES["capabilities"])
+    )
+    upstream = FakeUpstreamWebSocket()
+    connector = FakeConnector(upstream)
+    app.dependency_overrides[get_agent_ws_connector] = lambda: connector
+
+    with TestClient(app) as client:
+        headers = {"Authorization": "Bearer secret-token"}
+        ticket = client.post(
+            "/api/agents/lab-01/terminals/term-1/connect-token", headers=headers
+        ).json()["ticket"]
+
+        with pytest.raises(WebSocketDisconnect) as wrong_agent:
+            with client.websocket_connect(
+                f"/ws/agents/lab-02/terminals/term-1?ticket={ticket}&cursor=0",
+                headers=_ws_headers(),
+            ):
+                pass
+        assert wrong_agent.value.code == 4401
+
+        with client.websocket_connect(
+            f"/ws/agents/lab-01/terminals/term-1?ticket={ticket}&cursor=0",
+            headers=_ws_headers(),
+        ) as ws:
+            ws.send_text("input")
+            assert ws.receive_text() == "remote-output"
+
+        with pytest.raises(WebSocketDisconnect) as replay:
+            with client.websocket_connect(
+                f"/ws/agents/lab-01/terminals/term-1?ticket={ticket}&cursor=0",
+                headers=_ws_headers(),
+            ):
+                pass
+
+    assert replay.value.code == 4401
+    assert connector.calls[0][:4] == ("lab-01", "term-1", "upstream-ticket", 0)
 
 
 @pytest.mark.integration

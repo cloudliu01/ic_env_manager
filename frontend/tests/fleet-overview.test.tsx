@@ -22,7 +22,7 @@ function overview() {
   return {
     collected_at: '2026-06-26T00:00:00Z',
     hosts: [
-      { id: 'alpha', name: 'Alpha', status: 'ready', enabled: true, capabilities: CAPABILITIES, observed_at: '2026-06-26T00:00:00Z', stale_after: '2026-06-26T00:00:30Z' },
+      { id: 'alpha', name: 'Alpha', status: 'ready', enabled: true, capabilities: CAPABILITIES, observed_at: '2026-06-26T00:00:00Z', stale_after: '2026-06-26T00:00:30Z', token_file: '/secret/agent.token', credential_ref: 'credential-secret-ref' },
       { id: 'beta', name: 'Beta', status: 'unavailable', enabled: true, capabilities: [], observed_at: '2026-06-25T23:59:00Z', stale_after: '2026-06-25T23:59:30Z', last_error: 'agent_timeout' },
       { id: 'gamma', name: 'Gamma', status: 'disabled', enabled: false, capabilities: [] },
     ],
@@ -60,6 +60,8 @@ describe('HostOverviewPage fleet overview', () => {
     expect(screen.getByText('Last error: agent_timeout')).toBeTruthy();
     expect(screen.queryByText(/token/i)).toBeNull();
     expect(screen.queryByText(/base_url/i)).toBeNull();
+    expect(screen.queryByText('/secret/agent.token')).toBeNull();
+    expect(screen.queryByText('credential-secret-ref')).toBeNull();
   });
 
   it('supports search, status filter, and name sort', async () => {

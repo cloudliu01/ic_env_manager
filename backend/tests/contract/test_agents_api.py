@@ -73,6 +73,8 @@ def test_control_plane_inventory_returns_safe_agent_summaries(tmp_path):
     assert body["agents"][1]["status"] == "disabled"
     assert "base_url" not in body["agents"][0]
     assert "token_file" not in body["agents"][0]
+    assert "credential_ref" not in body["agents"][0]
+    assert "secret-token" not in response.text
 
 
 @pytest.mark.contract
@@ -97,6 +99,8 @@ def test_fleet_overview_returns_all_hosts_without_secrets(tmp_path):
     assert body["hosts"][1]["status"] == "disabled"
     assert "base_url" not in body["hosts"][0]
     assert "token_file" not in body["hosts"][0]
+    assert "credential_ref" not in body["hosts"][0]
+    assert "secret-token" not in response.text
 
 
 @pytest.mark.contract
