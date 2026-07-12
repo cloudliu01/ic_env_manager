@@ -171,7 +171,7 @@ def test_fleet_registry_migration_has_exact_control_plane_tables(tmp_path):
                 "enrollment_method", "remote_instance_id", "remote_credential_id",
                     "credential_temp_ref", "old_credential_ref", "old_remote_credential_id",
                     "save_requested", "expires_at", "last_error_code", "created_at", "updated_at",
-                    "recovery_owner", "recovery_lease_until",
+                    "recovery_owner", "recovery_lease_until", "recovery_revision",
             ),
         }
         for table, columns in expected_columns.items():
@@ -379,7 +379,7 @@ def test_legacy_manual_migration_preserves_rows_indexes_fks_and_checks(tmp_path)
             item[2] == "agents" and item[6] == "CASCADE"
             for item in connection.execute("PRAGMA foreign_key_list(agent_status)")
         )
-        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
         status_indexes = {
             row[1] for row in connection.execute("PRAGMA index_list(agent_status)")
         }
@@ -606,10 +606,11 @@ def test_enrollment_recovery_migration_preserves_legal_rows_and_adds_constraints
     connection = sqlite3.connect(db_path)
     try:
         row = connection.execute(
-            "SELECT state, credential_temp_ref, recovery_owner, recovery_lease_until "
+            "SELECT state, credential_temp_ref, recovery_owner, recovery_lease_until, "
+            "recovery_revision "
             "FROM agent_enrollment_jobs WHERE enrollment_id='enroll-legacy'"
         ).fetchone()
-        assert row == ("verifying", "a" * 48, None, None)
+        assert row == ("verifying", "a" * 48, None, None, 0)
         indexes = {
             item[1]
             for item in connection.execute("PRAGMA index_list(agent_enrollment_jobs)")
@@ -620,6 +621,37 @@ def test_enrollment_recovery_migration_preserves_legal_rows_and_adds_constraints
                 "UPDATE agent_enrollment_jobs SET credential_temp_ref=NULL "
                 "WHERE enrollment_id='enroll-legacy'"
             )
+    finally:
+        connection.close()
+
+
+@pytest.mark.contract
+def test_recovery_fencing_downgrade_is_forward_only_without_mutation(tmp_path):
+    db_path = tmp_path / "control-plane.db"
+    run_control_plane_migrations(db_path)
+    migration = _load_migration(
+        CONTROL_PLANE_MIGRATIONS / "0006_enrollment_recovery_fencing.py"
+    )
+    connection = sqlite3.connect(db_path)
+    try:
+        before_schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name='agent_enrollment_jobs'"
+        ).fetchone()[0]
+        before_versions = connection.execute(
+            "SELECT * FROM schema_versions ORDER BY version"
+        ).fetchall()
+        before_user_version = connection.execute("PRAGMA user_version").fetchone()
+
+        with pytest.raises(sqlite3.NotSupportedError, match="forward-only"):
+            migration.downgrade(connection)
+
+        assert connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name='agent_enrollment_jobs'"
+        ).fetchone()[0] == before_schema
+        assert connection.execute(
+            "SELECT * FROM schema_versions ORDER BY version"
+        ).fetchall() == before_versions
+        assert connection.execute("PRAGMA user_version").fetchone() == before_user_version
     finally:
         connection.close()
 

@@ -122,3 +122,4 @@ class EnrollmentJob:
     updated_at: datetime
     recovery_owner: str | None = None
     recovery_lease_until: datetime | None = None
+    recovery_revision: int = 0

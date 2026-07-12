@@ -66,6 +66,10 @@ class AgentHttpClient:
                 follow_redirects=False, transport=transport, trust_env=False
             )
 
+    @property
+    def max_request_timeout_seconds(self) -> float:
+        return max(self._connect_timeout_seconds, self._request_timeout_seconds)
+
     async def aclose(self) -> None:
         if self._client is not None:
             await self._client.aclose()

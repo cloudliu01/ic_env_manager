@@ -1,6 +1,6 @@
 import asyncio
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -278,7 +278,7 @@ async def test_pending_validation_rejects_helper_http_identity_mismatch():
     ("overrides", "code"),
     (
         ({"instance_id": "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"}, "agent_protocol_error"),
-        ({"agent_version": "9.9.9"}, "agent_protocol_error"),
+        ({"agent_version": "bad version"}, "agent_version_unsupported"),
         ({"capabilities": ["summary.v2"]}, "missing_capabilities"),
     ),
 )
@@ -368,7 +368,7 @@ async def test_pending_validation_accepts_exact_summary_and_warns_on_unhealthy_c
 
 
 @pytest.mark.integration
-async def test_pending_validation_rejects_malformed_summary_instead_of_warning():
+async def test_pending_validation_treats_malformed_summary_as_warning_only():
     responses = iter(
         (
             {
@@ -400,13 +400,100 @@ async def test_pending_validation_rejects_malformed_summary_instead_of_warning()
         transport_profiles=(),
         client=HttpClient(),  # type: ignore[arg-type]
     )
-    with pytest.raises(EnrollmentValidationError) as caught:
-        await client.validate_pending(
-            SimpleNamespace(normalized_endpoint="https://10.20.30.40:8765"),  # type: ignore[arg-type]
-            b"pending-secret",
-            helper_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    result = await client.validate_pending(
+        SimpleNamespace(normalized_endpoint="https://10.20.30.40:8765"),  # type: ignore[arg-type]
+        b"pending-secret",
+        helper_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    )
+    assert result.summary is None
+    assert result.readiness_warning == "agent_readiness_unavailable"
+
+
+@pytest.mark.integration
+async def test_pending_validation_treats_oversized_summary_as_warning_only():
+    capabilities = {
+        "api_version": "2",
+        "agent_version": "0.3.0",
+        "instance_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "name": "Lab Agent",
+        "capabilities": ["manager-enrollment.v1", "summary.v2"],
+    }
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return capabilities
+
+    class HttpClient:
+        calls = 0
+
+        async def request(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 2:
+                raise AgentClientError(
+                    "agent_protocol_error",
+                    "agent response is too large",
+                    dispatch_state="dispatched",
+                )
+            return Response()
+
+    client = EnrollmentAgentClient(
+        target_policy=None,  # type: ignore[arg-type]
+        transport_profiles=(),
+        client=HttpClient(),  # type: ignore[arg-type]
+    )
+    result = await client.validate_pending(
+        SimpleNamespace(normalized_endpoint="https://10.20.30.40:8765"),  # type: ignore[arg-type]
+        b"pending-secret",
+        helper_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    )
+    assert result.summary is None
+    assert result.readiness_warning == "agent_readiness_unavailable"
+
+
+@pytest.mark.integration
+async def test_pending_validation_accepts_rolling_agent_build_version():
+    responses = iter(
+        (
+            {
+                "api_version": "2",
+                "agent_version": "0.3.0",
+                "instance_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "name": "Lab Agent",
+                "capabilities": ["manager-enrollment.v1", "summary.v2"],
+            },
+            AgentSummary(
+                observed_at=NOW,
+                observations=ObservationCounts(total=0, warning=0, critical=0, stale=0),
+                logs=LogCounts(total=0, stale=0),
+                services=ServiceCounts(total=0, running=0, unhealthy=0),
+                terminals=TerminalCounts(active=0),
+            ).to_dict(),
         )
-    assert caught.value.code == "agent_protocol_error"
+    )
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return next(responses)
+
+    class HttpClient:
+        async def request(self, *_args, **_kwargs):
+            return Response()
+
+    client = EnrollmentAgentClient(
+        target_policy=None,  # type: ignore[arg-type]
+        transport_profiles=(),
+        client=HttpClient(),  # type: ignore[arg-type]
+    )
+    result = await client.validate_pending(
+        SimpleNamespace(normalized_endpoint="https://10.20.30.40:8765"),  # type: ignore[arg-type]
+        b"pending-secret",
+        helper_instance_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    )
+    assert result.agent_version == "0.3.0"
 
 
 @pytest.mark.integration
@@ -546,6 +633,161 @@ async def test_concurrent_recovery_claim_dispatches_network_once(tmp_path):
 
         assert calls == 1
         assert journal.get(pending.enrollment_id).state is EnrollmentState.VERIFIED
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_recovery_renews_one_second_lease_during_slow_network_call(tmp_path):
+    calls = 0
+
+    class Client:
+        def prepare(self, endpoint, _profile):
+            return SimpleNamespace(normalized_endpoint=endpoint)
+
+        async def validate_legacy(self, _target, _token):
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(1.4)
+            return validation()
+
+    first, jobs, journal, registry, store, engine = setup_services(tmp_path, Client())
+    monotonic_origin = asyncio.get_running_loop().time()
+    wall_origin = datetime.now(UTC)
+
+    def clock():
+        elapsed = asyncio.get_running_loop().time() - monotonic_origin
+        return wall_origin + timedelta(seconds=elapsed)
+
+    first._now = clock
+    second = EnrollmentOrchestrator(
+        jobs=jobs,
+        journal=journal,
+        credential_store=CredentialStore(store.directory),
+        agent_client=first.agent_client,
+        registry=registry,
+        clock=clock,
+    )
+    first._recovery_lease_seconds = second._recovery_lease_seconds = 1
+    try:
+        pending = jobs.create(
+            EnrollmentJobRequest(
+                normalized_endpoint="https://10.20.30.40:8765",
+                transport_profile_id="system-tls",
+                enrollment_method=EnrollmentMethod.LEGACY_ADMIN_TOKEN,
+            )
+        )
+        reference = store.put(b"renewed-single-dispatch")
+        running = journal.replace_if_state(
+            replace(pending, state=EnrollmentState.RUNNING),
+            expected_state=EnrollmentState.PENDING,
+        )
+        journal.replace_if_state(
+            replace(
+                running,
+                state=EnrollmentState.CREDENTIAL_ISSUED,
+                credential_temp_ref=reference,
+            ),
+            expected_state=EnrollmentState.RUNNING,
+        )
+
+        first_recovery = asyncio.create_task(first.recover())
+        await asyncio.sleep(1.05)
+        await second.recover()
+        await first_recovery
+
+        assert calls == 1
+        assert journal.get(pending.enrollment_id).state is EnrollmentState.VERIFIED
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_recovery_discards_network_result_when_renewal_fence_is_lost(
+    tmp_path, monkeypatch
+):
+    cancelled = False
+
+    class Client:
+        def prepare(self, endpoint, _profile):
+            return SimpleNamespace(normalized_endpoint=endpoint)
+
+        async def validate_legacy(self, _target, _token):
+            nonlocal cancelled
+            try:
+                await asyncio.sleep(1.4)
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            return validation()
+
+    orchestrator, jobs, journal, _registry, store, engine = setup_services(
+        tmp_path, Client()
+    )
+    orchestrator._recovery_lease_seconds = 1
+    try:
+        pending = jobs.create(
+            EnrollmentJobRequest(
+                normalized_endpoint="https://10.20.30.40:8765",
+                transport_profile_id="system-tls",
+                enrollment_method=EnrollmentMethod.LEGACY_ADMIN_TOKEN,
+            )
+        )
+        reference = store.put(b"discard-stale-result")
+        running = journal.replace_if_state(
+            replace(pending, state=EnrollmentState.RUNNING),
+            expected_state=EnrollmentState.PENDING,
+        )
+        journal.replace_if_state(
+            replace(
+                running,
+                state=EnrollmentState.CREDENTIAL_ISSUED,
+                credential_temp_ref=reference,
+            ),
+            expected_state=EnrollmentState.RUNNING,
+        )
+        monkeypatch.setattr(journal, "renew_recovery_claim", lambda *_args, **_kwargs: None)
+
+        await orchestrator.recover()
+
+        current = journal.get(pending.enrollment_id)
+        assert cancelled is True
+        assert current.state is EnrollmentState.VERIFYING
+        assert pending.enrollment_id not in orchestrator._validation_cache
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_terminal_cleanup_preserves_business_validation_error(tmp_path):
+    class Client:
+        def prepare(self, endpoint, _profile):
+            return SimpleNamespace(normalized_endpoint=endpoint)
+
+        async def validate_legacy(self, *_args):
+            raise EnrollmentValidationError(
+                "agent_auth_error", dispatch_state="dispatched"
+            )
+
+    orchestrator, _jobs, journal, _registry, _store, engine = setup_services(
+        tmp_path, Client()
+    )
+    try:
+        with pytest.raises(EnrollmentValidationError, match="agent_auth_error"):
+            await orchestrator.validate_legacy(
+                LegacyValidationRequest("https://10.20.30.40:8765", "system-tls"),
+                "business-error-survives-cleanup",
+            )
+        with engine.connect() as connection:
+            enrollment_id = connection.exec_driver_sql(
+                "SELECT enrollment_id FROM agent_enrollment_jobs"
+            ).scalar_one()
+        failed = journal.get(enrollment_id)
+        public = orchestrator.get(enrollment_id).to_public_dict()
+        assert failed.state is EnrollmentState.FAILED
+        assert failed.credential_temp_ref is None
+        assert failed.last_error_code == "agent_auth_error"
+        assert public["last_error_code"] == "agent_auth_error"
     finally:
         engine.dispose()
 

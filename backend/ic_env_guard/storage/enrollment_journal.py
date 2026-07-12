@@ -25,7 +25,7 @@ _COLUMNS = (
     "ssh_port, enrollment_method, remote_instance_id, remote_credential_id, "
     "credential_temp_ref, old_credential_ref, old_remote_credential_id, save_requested, "
     "expires_at, last_error_code, created_at, updated_at, recovery_owner, "
-    "recovery_lease_until"
+    "recovery_lease_until, recovery_revision"
 )
 _ENROLLMENT_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _CREDENTIAL_REF = re.compile(r"^[0-9a-f]{48}$")
@@ -136,6 +136,12 @@ def _validate_job(job: EnrollmentJob) -> None:
             raise RegistryInvariantError("recovery owner must be a UUID") from exc
         if str(owner) != job.recovery_owner:
             raise RegistryInvariantError("recovery owner must be canonical")
+    if (
+        not isinstance(job.recovery_revision, int)
+        or isinstance(job.recovery_revision, bool)
+        or job.recovery_revision < 0
+    ):
+        raise RegistryInvariantError("recovery revision must not be negative")
     if job.last_error_code is not None and not _ERROR_CODE.fullmatch(job.last_error_code):
         raise RegistryInvariantError("enrollment error code is invalid")
     for reference in (
@@ -175,6 +181,7 @@ def _job(row: Any) -> EnrollmentJob:
         updated_at=_parse_time(row[21]),
         recovery_owner=row[22],
         recovery_lease_until=_parse_time(row[23]),
+        recovery_revision=row[24],
     )
 
 
@@ -188,7 +195,7 @@ class EnrollmentJournalRepository(_SQLiteRepository):
             with self._write() as connection:
                 connection.execute(
                     f"INSERT INTO agent_enrollment_jobs ({_COLUMNS}) "
-                    f"VALUES ({','.join('?' * 24)})",
+                    f"VALUES ({','.join('?' * 25)})",
                     self._values(job),
                 )
             return job
@@ -232,7 +239,7 @@ class EnrollmentJournalRepository(_SQLiteRepository):
                     raise RegistryConflict("agent_enrollment_capacity")
                 connection.execute(
                     f"INSERT INTO agent_enrollment_jobs ({_COLUMNS}) "
-                    f"VALUES ({','.join('?' * 24)})",
+                    f"VALUES ({','.join('?' * 25)})",
                     self._values(job),
                 )
             return job
@@ -289,10 +296,18 @@ class EnrollmentJournalRepository(_SQLiteRepository):
         *,
         expected_state: EnrollmentState,
         expected_recovery_owner: str | None = None,
+        expected_recovery_revision: int | None = None,
+        recovery_now: datetime | None = None,
     ) -> EnrollmentJob:
         _validate_job(job)
         if job.state not in _ALLOWED_TRANSITIONS.get(expected_state, set()):
             raise RegistryInvariantError("invalid enrollment state transition")
+        if expected_recovery_owner is not None and (
+            expected_recovery_revision is None
+            or recovery_now is None
+            or job.recovery_revision != expected_recovery_revision + 1
+        ):
+            raise RegistryInvariantError("recovery transition fence is invalid")
         assignments = ", ".join(
             f"{column.strip()}=?"
             for column in _COLUMNS.split(",")
@@ -301,12 +316,20 @@ class EnrollmentJournalRepository(_SQLiteRepository):
         values = self._values(job)
         try:
             with self._write() as connection:
-                owner_clause = (
-                    " AND recovery_owner=?" if expected_recovery_owner is not None else ""
-                )
+                owner_clause = ""
                 parameters = [*values[1:], job.enrollment_id, expected_state.value]
                 if expected_recovery_owner is not None:
-                    parameters.append(expected_recovery_owner)
+                    owner_clause = (
+                        " AND recovery_owner=? AND recovery_revision=? "
+                        "AND recovery_lease_until>?"
+                    )
+                    parameters.extend(
+                        (
+                            expected_recovery_owner,
+                            expected_recovery_revision,
+                            _format_time(recovery_now),
+                        )
+                    )
                 cursor = connection.execute(
                     f"UPDATE agent_enrollment_jobs SET {assignments} "
                     f"WHERE enrollment_id=? AND state=?{owner_clause}",
@@ -334,19 +357,8 @@ class EnrollmentJournalRepository(_SQLiteRepository):
         except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
             raise RegistryError("enrollment journal storage is unavailable") from exc
 
-    def expire_and_claim_recovery(
-        self,
-        *,
-        owner: str,
-        now: datetime,
-        lease_seconds: int,
-    ) -> tuple[EnrollmentJob, ...]:
-        try:
-            parsed_owner = UUID(owner)
-        except ValueError as exc:
-            raise RegistryInvariantError("recovery owner must be a UUID") from exc
-        if str(parsed_owner) != owner or lease_seconds < 1:
-            raise RegistryInvariantError("recovery claim is invalid")
+    def prepare_recovery(self, *, now: datetime) -> tuple[str, ...]:
+        """Expire TTL phases and list currently claimable jobs without claiming them."""
         expirable = tuple(state.value for state in _EXPIRABLE_STATES)
         recoverable = (
             EnrollmentState.CREDENTIAL_ISSUED.value,
@@ -356,11 +368,11 @@ class EnrollmentJournalRepository(_SQLiteRepository):
             EnrollmentState.ACTIVATED.value,
         )
         try:
-            claimed_ids: list[str] = []
             with self._write() as connection:
                 connection.execute(
                     f"UPDATE agent_enrollment_jobs SET state=?, updated_at=?, "
-                    "recovery_owner=NULL, recovery_lease_until=NULL "
+                    "recovery_owner=NULL, recovery_lease_until=NULL, "
+                    "recovery_revision=recovery_revision+1 "
                     f"WHERE state IN ({','.join('?' for _ in expirable)}) "
                     "AND expires_at<=?",
                     (
@@ -371,47 +383,127 @@ class EnrollmentJournalRepository(_SQLiteRepository):
                     ),
                 )
                 rows = connection.execute(
-                    f"SELECT enrollment_id FROM agent_enrollment_jobs "
+                    "SELECT enrollment_id FROM agent_enrollment_jobs "
                     f"WHERE state IN ({','.join('?' for _ in recoverable)}) "
                     "AND (recovery_owner IS NULL OR recovery_lease_until<=?) "
                     "ORDER BY created_at, enrollment_id",
                     (*recoverable, _format_time(now)),
                 ).fetchall()
-                for position, row in enumerate(rows, start=1):
-                    lease_until = now + timedelta(seconds=lease_seconds * position)
-                    cursor = connection.execute(
-                        "UPDATE agent_enrollment_jobs SET recovery_owner=?, "
-                        "recovery_lease_until=?, updated_at=? WHERE enrollment_id=? "
-                        "AND (recovery_owner IS NULL OR recovery_lease_until<=?)",
-                        (
-                            owner,
-                            _format_time(lease_until),
-                            _format_time(now),
-                            row[0],
-                            _format_time(now),
-                        ),
-                    )
-                    if cursor.rowcount == 1:
-                        claimed_ids.append(row[0])
-                claimed = [
-                    connection.execute(
-                        f"SELECT {_COLUMNS} FROM agent_enrollment_jobs "
-                        "WHERE enrollment_id=?",
-                        (enrollment_id,),
-                    ).fetchone()
-                    for enrollment_id in claimed_ids
-                ]
-            return tuple(_job(row) for row in claimed if row is not None)
+            return tuple(row[0] for row in rows)
         except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
             raise RegistryError("enrollment journal storage is unavailable") from exc
 
-    def release_recovery_claim(self, enrollment_id: str, *, owner: str) -> bool:
+    def claim_recovery(
+        self,
+        enrollment_id: str,
+        *,
+        owner: str,
+        now: datetime,
+        lease_seconds: int,
+    ) -> EnrollmentJob | None:
+        try:
+            parsed_owner = UUID(owner)
+        except ValueError as exc:
+            raise RegistryInvariantError("recovery owner must be a UUID") from exc
+        if str(parsed_owner) != owner or lease_seconds < 1:
+            raise RegistryInvariantError("recovery claim is invalid")
+        recoverable = (
+            EnrollmentState.CREDENTIAL_ISSUED.value,
+            EnrollmentState.VERIFYING.value,
+            EnrollmentState.VERIFIED.value,
+            EnrollmentState.ACTIVATION_REQUESTED.value,
+            EnrollmentState.ACTIVATED.value,
+        )
+        expirable = tuple(state.value for state in _EXPIRABLE_STATES)
+        try:
+            with self._write() as connection:
+                connection.execute(
+                    "UPDATE agent_enrollment_jobs SET state=?, updated_at=?, "
+                    "recovery_owner=NULL, recovery_lease_until=NULL, "
+                    "recovery_revision=recovery_revision+1 WHERE enrollment_id=? "
+                    f"AND state IN ({','.join('?' for _ in expirable)}) "
+                    "AND expires_at<=?",
+                    (
+                        EnrollmentState.EXPIRED.value,
+                        _format_time(now),
+                        enrollment_id,
+                        *expirable,
+                        _format_time(now),
+                    ),
+                )
+                cursor = connection.execute(
+                    "UPDATE agent_enrollment_jobs SET recovery_owner=?, "
+                    "recovery_lease_until=?, recovery_revision=recovery_revision+1, "
+                    "updated_at=? WHERE enrollment_id=? "
+                    f"AND state IN ({','.join('?' for _ in recoverable)}) "
+                    "AND (recovery_owner IS NULL OR recovery_lease_until<=?)",
+                    (
+                        owner,
+                        _format_time(now + timedelta(seconds=lease_seconds)),
+                        _format_time(now),
+                        enrollment_id,
+                        *recoverable,
+                        _format_time(now),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    return None
+                row = connection.execute(
+                    f"SELECT {_COLUMNS} FROM agent_enrollment_jobs WHERE enrollment_id=?",
+                    (enrollment_id,),
+                ).fetchone()
+            return _job(row) if row is not None else None
+        except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise RegistryError("enrollment journal storage is unavailable") from exc
+
+    def renew_recovery_claim(
+        self,
+        enrollment_id: str,
+        *,
+        owner: str,
+        expected_revision: int,
+        now: datetime,
+        lease_seconds: int,
+    ) -> EnrollmentJob | None:
+        if lease_seconds < 1 or expected_revision < 1:
+            raise RegistryInvariantError("recovery renewal is invalid")
+        try:
+            with self._write() as connection:
+                cursor = connection.execute(
+                    "UPDATE agent_enrollment_jobs SET recovery_lease_until=?, "
+                    "recovery_revision=recovery_revision+1, updated_at=? "
+                    "WHERE enrollment_id=? AND recovery_owner=? AND recovery_revision=? "
+                    "AND recovery_lease_until>?",
+                    (
+                        _format_time(now + timedelta(seconds=lease_seconds)),
+                        _format_time(now),
+                        enrollment_id,
+                        owner,
+                        expected_revision,
+                        _format_time(now),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    return None
+                row = connection.execute(
+                    f"SELECT {_COLUMNS} FROM agent_enrollment_jobs WHERE enrollment_id=?",
+                    (enrollment_id,),
+                ).fetchone()
+            return _job(row) if row is not None else None
+        except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise RegistryError("enrollment journal storage is unavailable") from exc
+
+    def release_recovery_claim(
+        self, enrollment_id: str, *, owner: str, expected_revision: int, now: datetime
+    ) -> bool:
         try:
             with self._write() as connection:
                 cursor = connection.execute(
                     "UPDATE agent_enrollment_jobs SET recovery_owner=NULL, "
-                    "recovery_lease_until=NULL WHERE enrollment_id=? AND recovery_owner=?",
-                    (enrollment_id, owner),
+                    "recovery_lease_until=NULL, recovery_revision=recovery_revision+1 "
+                    "WHERE enrollment_id=? AND recovery_owner=? AND recovery_revision=? "
+                    "AND recovery_lease_until>?",
+                    (enrollment_id, owner, expected_revision, _format_time(now)),
                 )
             return cursor.rowcount == 1
         except (SQLAlchemyError, sqlite3.Error) as exc:
@@ -422,6 +514,7 @@ class EnrollmentJournalRepository(_SQLiteRepository):
         enrollment_id: str,
         *,
         owner: str,
+        expected_revision: int,
         error_code: str,
         now: datetime,
     ) -> bool:
@@ -431,9 +524,18 @@ class EnrollmentJournalRepository(_SQLiteRepository):
             with self._write() as connection:
                 cursor = connection.execute(
                     "UPDATE agent_enrollment_jobs SET recovery_owner=NULL, "
-                    "recovery_lease_until=NULL, last_error_code=?, updated_at=? "
-                    "WHERE enrollment_id=? AND recovery_owner=?",
-                    (error_code, _format_time(now), enrollment_id, owner),
+                    "recovery_lease_until=NULL, recovery_revision=recovery_revision+1, "
+                    "last_error_code=?, updated_at=? WHERE enrollment_id=? "
+                    "AND recovery_owner=? AND recovery_revision=? "
+                    "AND recovery_lease_until>?",
+                    (
+                        error_code,
+                        _format_time(now),
+                        enrollment_id,
+                        owner,
+                        expected_revision,
+                        _format_time(now),
+                    ),
                 )
             return cursor.rowcount == 1
         except (SQLAlchemyError, sqlite3.Error) as exc:
@@ -475,7 +577,9 @@ class EnrollmentJournalRepository(_SQLiteRepository):
             with self._write() as connection:
                 cursor = connection.execute(
                     "UPDATE agent_enrollment_jobs SET credential_temp_ref=NULL, "
-                    "last_error_code=NULL, updated_at=? WHERE enrollment_id=? AND state=? "
+                    "last_error_code=CASE WHEN last_error_code='credential_cleanup_failed' "
+                    "THEN NULL ELSE last_error_code END, updated_at=? "
+                    "WHERE enrollment_id=? AND state=? "
                     "AND credential_temp_ref=?",
                     (
                         _format_time(now),
@@ -508,7 +612,10 @@ class EnrollmentJournalRepository(_SQLiteRepository):
         try:
             with self._write() as connection:
                 cursor = connection.execute(
-                    "UPDATE agent_enrollment_jobs SET last_error_code=?, updated_at=? "
+                    "UPDATE agent_enrollment_jobs SET last_error_code=CASE "
+                    "WHEN last_error_code IS NULL OR "
+                    "last_error_code='credential_cleanup_failed' THEN ? "
+                    "ELSE last_error_code END, updated_at=? "
                     "WHERE enrollment_id=? AND state=? AND credential_temp_ref=?",
                     (
                         "credential_cleanup_failed",
@@ -585,4 +692,5 @@ class EnrollmentJournalRepository(_SQLiteRepository):
             _format_time(job.updated_at),
             job.recovery_owner,
             _format_time(job.recovery_lease_until),
+            job.recovery_revision,
         )

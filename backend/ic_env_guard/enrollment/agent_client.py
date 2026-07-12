@@ -5,13 +5,16 @@ from typing import Any
 from uuid import UUID
 
 from ic_env_guard.agents.client import AgentClientError, AgentHttpClient
-from ic_env_guard.agents.models import AGENT_VERSION
 from ic_env_guard.fleet.target_policy import AgentTargetPolicy, TargetPolicyError, ValidatedTarget
 from ic_env_guard.fleet.transport import TransportProfile
 
 _CAPABILITY = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
 _PENDING_CAPABILITIES = {"manager-enrollment.v1", "summary.v2"}
+
+
+class _UnsupportedAgentVersion(ValueError):
+    pass
 
 
 class EnrollmentValidationError(Exception):
@@ -44,6 +47,11 @@ class EnrollmentAgentClient:
         self._profiles = {profile.id: profile for profile in transport_profiles}
         self._client = client
 
+    @property
+    def max_network_operation_seconds(self) -> float:
+        # Pending validation performs capabilities and summary requests serially.
+        return float(self._client.max_request_timeout_seconds) * 2
+
     def prepare(self, endpoint: str, profile_id: str) -> ValidatedTarget:
         try:
             profile = self._profiles[profile_id]
@@ -71,6 +79,10 @@ class EnrollmentAgentClient:
             payload = _parse_capabilities(response.json(), expected_api="1", instance=False)
         except EnrollmentValidationError:
             raise
+        except _UnsupportedAgentVersion:
+            raise EnrollmentValidationError(
+                "agent_version_unsupported", dispatch_state="dispatched"
+            ) from None
         except AgentClientError as exc:
             raise EnrollmentValidationError(
                 exc.category, dispatch_state=exc.dispatch_state
@@ -134,11 +146,20 @@ class EnrollmentAgentClient:
                 if summary_response.status_code != 200:
                     warning = "agent_readiness_unavailable"
                 else:
-                    summary = _parse_summary(summary_response.json())
-                    if _summary_unhealthy(summary):
-                        warning = "agent_readiness_unhealthy"
+                    try:
+                        summary = _parse_summary(summary_response.json())
+                    except (TypeError, ValueError):
+                        summary = None
+                        warning = "agent_readiness_unavailable"
+                    else:
+                        if _summary_unhealthy(summary):
+                            warning = "agent_readiness_unhealthy"
         except EnrollmentValidationError:
             raise
+        except _UnsupportedAgentVersion:
+            raise EnrollmentValidationError(
+                "agent_version_unsupported", dispatch_state="dispatched"
+            ) from None
         except AgentClientError as exc:
             raise EnrollmentValidationError(
                 exc.category, dispatch_state=exc.dispatch_state
@@ -200,10 +221,7 @@ def _parse_capabilities(
     agent_version = value.get("agent_version")
     capabilities = value.get("capabilities")
     if (
-        not isinstance(agent_version, str)
-        or not _VERSION.fullmatch(agent_version)
-        or (instance and agent_version != AGENT_VERSION)
-        or not isinstance(capabilities, list)
+        not isinstance(capabilities, list)
         or len(capabilities) > 256
         or any(
             not isinstance(item, str) or not _CAPABILITY.fullmatch(item)
@@ -211,6 +229,8 @@ def _parse_capabilities(
         )
     ):
         raise ValueError
+    if not isinstance(agent_version, str) or not _VERSION.fullmatch(agent_version):
+        raise _UnsupportedAgentVersion
     result: dict[str, Any] = {
         "api_version": expected_api,
         "agent_version": agent_version,

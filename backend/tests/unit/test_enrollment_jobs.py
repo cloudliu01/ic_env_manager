@@ -13,7 +13,7 @@ from ic_env_guard.enrollment.jobs import (
     enrollment_input_fingerprint,
 )
 from ic_env_guard.enrollment.orchestrator import EnrollmentPublicResult
-from ic_env_guard.fleet.models import EnrollmentMethod, EnrollmentState
+from ic_env_guard.fleet.models import EnrollmentMethod, EnrollmentState, RevisionConflict
 from ic_env_guard.storage.enrollment_journal import EnrollmentJournalRepository
 
 NOW = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
@@ -226,14 +226,33 @@ def test_recovery_claim_expires_ttl_phases_before_dispatch(setup):
     jobs, repository, _engine = setup
     pending = jobs.create(ssh_request(), now=NOW)
 
-    claimed = repository.expire_and_claim_recovery(
+    candidates = repository.prepare_recovery(now=pending.expires_at)
+
+    assert candidates == ()
+    assert repository.get(pending.enrollment_id).state is EnrollmentState.EXPIRED
+
+
+def test_jit_claim_rechecks_ttl_after_candidate_listing(setup):
+    jobs, repository, _engine = setup
+    pending = jobs.create(ssh_request(), now=NOW)
+    advance(
+        repository,
+        pending,
+        EnrollmentState.RUNNING,
+        EnrollmentState.CREDENTIAL_ISSUED,
+        EnrollmentState.VERIFYING,
+    )
+    enrollment_id = repository.prepare_recovery(now=NOW)[0]
+
+    claimed = repository.claim_recovery(
+        enrollment_id,
         owner="11111111-1111-4111-8111-111111111111",
         now=pending.expires_at,
         lease_seconds=30,
     )
 
-    assert claimed == ()
-    assert repository.get(pending.enrollment_id).state is EnrollmentState.EXPIRED
+    assert claimed is None
+    assert repository.get(enrollment_id).state is EnrollmentState.EXPIRED
 
 
 def test_recovery_claim_is_exclusive_and_expired_lease_can_be_taken_over(setup):
@@ -258,24 +277,43 @@ def test_recovery_claim_is_exclusive_and_expired_lease_can_be_taken_over(setup):
     first_owner = "11111111-1111-4111-8111-111111111111"
     second_owner = "22222222-2222-4222-8222-222222222222"
 
-    first = repository.expire_and_claim_recovery(
-        owner=first_owner, now=NOW, lease_seconds=30
+    enrollment_id = repository.prepare_recovery(now=NOW)[0]
+    first = repository.claim_recovery(
+        enrollment_id, owner=first_owner, now=NOW, lease_seconds=30
     )
-    loser = repository.expire_and_claim_recovery(
-        owner=second_owner, now=NOW, lease_seconds=30
+    loser = repository.claim_recovery(
+        enrollment_id, owner=second_owner, now=NOW, lease_seconds=30
     )
-    takeover = repository.expire_and_claim_recovery(
-        owner=second_owner, now=NOW + timedelta(seconds=31), lease_seconds=30
+    takeover = repository.claim_recovery(
+        enrollment_id,
+        owner=second_owner,
+        now=NOW + timedelta(seconds=31),
+        lease_seconds=30,
     )
 
-    assert len(first) == 1
-    assert first[0].recovery_owner == first_owner
-    assert loser == ()
-    assert len(takeover) == 1
-    assert takeover[0].recovery_owner == second_owner
+    assert first is not None
+    assert first.recovery_owner == first_owner
+    assert loser is None
+    assert takeover is not None
+    assert takeover.recovery_owner == second_owner
+
+    with pytest.raises(RevisionConflict):
+        repository.replace_if_state(
+            replace(
+                first,
+                state=EnrollmentState.VERIFIED,
+                recovery_owner=None,
+                recovery_lease_until=None,
+                recovery_revision=first.recovery_revision + 1,
+            ),
+            expected_state=EnrollmentState.VERIFYING,
+            expected_recovery_owner=first_owner,
+            expected_recovery_revision=first.recovery_revision,
+            recovery_now=NOW + timedelta(seconds=31),
+        )
 
 
-def test_recovery_claim_leases_cover_sequential_dispatch_order(setup):
+def test_recovery_claims_are_jit_and_do_not_delay_later_crash_takeover(setup):
     jobs, repository, _engine = setup
     jobs = EnrollmentJobs(
         repository,
@@ -300,17 +338,74 @@ def test_recovery_claim_leases_cover_sequential_dispatch_order(setup):
             EnrollmentState.VERIFYING,
         )
 
-    claimed = repository.expire_and_claim_recovery(
+    candidates = repository.prepare_recovery(now=NOW)
+    claimed = repository.claim_recovery(
+        candidates[0],
         owner="11111111-1111-4111-8111-111111111111",
         now=NOW,
         lease_seconds=30,
     )
+    other = repository.claim_recovery(
+        candidates[1],
+        owner="22222222-2222-4222-8222-222222222222",
+        now=NOW + timedelta(seconds=1),
+        lease_seconds=30,
+    )
 
-    lease_deadlines = sorted(job.recovery_lease_until for job in claimed)
-    assert lease_deadlines == [
-        NOW + timedelta(seconds=30),
-        NOW + timedelta(seconds=60),
-    ]
+    assert claimed is not None
+    assert claimed.recovery_lease_until == NOW + timedelta(seconds=30)
+    assert other is not None
+    assert other.recovery_lease_until == NOW + timedelta(seconds=31)
+
+
+def test_128_recovery_candidates_do_not_receive_position_scaled_leases(setup):
+    jobs, repository, _engine = setup
+    jobs = EnrollmentJobs(
+        repository,
+        manager_id=jobs.manager_id,
+        pending_ttl_seconds=600,
+        max_active=128,
+    )
+    for index in range(128):
+        pending = jobs.create(
+            ssh_request(
+                normalized_endpoint=f"https://10.21.0.{index + 1}:8765",
+                ssh_host=f"10.21.0.{index + 1}",
+            ),
+            now=NOW,
+        )
+        advance(
+            repository,
+            pending,
+            EnrollmentState.RUNNING,
+            EnrollmentState.CREDENTIAL_ISSUED,
+            EnrollmentState.VERIFYING,
+        )
+
+    candidates = repository.prepare_recovery(now=NOW)
+    first = repository.claim_recovery(
+        candidates[0],
+        owner="11111111-1111-4111-8111-111111111111",
+        now=NOW,
+        lease_seconds=1,
+    )
+    last = repository.claim_recovery(
+        candidates[-1],
+        owner="22222222-2222-4222-8222-222222222222",
+        now=NOW,
+        lease_seconds=1,
+    )
+    takeover = repository.claim_recovery(
+        candidates[0],
+        owner="22222222-2222-4222-8222-222222222222",
+        now=NOW + timedelta(seconds=2),
+        lease_seconds=1,
+    )
+
+    assert len(candidates) == 128
+    assert first is not None and last is not None and takeover is not None
+    assert first.recovery_lease_until == last.recovery_lease_until
+    assert takeover.recovery_owner == "22222222-2222-4222-8222-222222222222"
 
 
 def test_activation_residual_is_claimed_without_business_ttl_expiry(setup):
@@ -355,13 +450,18 @@ def test_activation_residual_is_claimed_without_business_ttl_expiry(setup):
         expected_state=EnrollmentState.VERIFIED,
     )
 
-    claimed = repository.expire_and_claim_recovery(
+    candidates = repository.prepare_recovery(
+        now=requested.expires_at + timedelta(hours=1)
+    )
+    claimed = repository.claim_recovery(
+        candidates[0],
         owner="11111111-1111-4111-8111-111111111111",
         now=requested.expires_at + timedelta(hours=1),
         lease_seconds=30,
     )
 
-    assert claimed[0].state is EnrollmentState.ACTIVATION_REQUESTED
+    assert claimed is not None
+    assert claimed.state is EnrollmentState.ACTIVATION_REQUESTED
     assert repository.get(requested.enrollment_id).state is (
         EnrollmentState.ACTIVATION_REQUESTED
     )
@@ -417,6 +517,7 @@ def test_public_projection_folds_internal_states_and_exposes_only_safe_error(
     assert internal.value not in serialized
     assert "recovery_owner" not in serialized
     assert "recovery_lease_until" not in serialized
+    assert "recovery_revision" not in serialized
 
 
 def test_journal_serialization_contains_no_secret_shaped_fields(setup):
