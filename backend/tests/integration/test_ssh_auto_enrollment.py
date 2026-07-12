@@ -167,20 +167,28 @@ async def test_issue_runs_preflight_then_fixed_helper_and_returns_secret_safe_re
 
 
 @pytest.mark.integration
-async def test_v1_helper_expiry_allows_only_bounded_issuance_skew(tmp_path):
+@pytest.mark.parametrize("pending_ttl_seconds", (60, 600, 900))
+async def test_v1_helper_expiry_accepts_every_configured_pending_ttl(
+    tmp_path, pending_ttl_seconds
+):
     delayed_now = NOW + timedelta(minutes=5)
+    expected_expiry = delayed_now + timedelta(seconds=pending_ttl_seconds)
     within_skew = _script(
         tmp_path,
-        f"sys.stdout.write({_result_json(expires_at='2026-07-12T12:15:04Z')!r} + '\\n')",
+        f"sys.stdout.write({_result_json(expires_at=expected_expiry.isoformat())!r} + '\\n')",
     )
     accepted = await _adapter(within_skew, clock=lambda: delayed_now).issue(
         _request(), TRUSTED
     )
-    assert accepted.expires_at == delayed_now + timedelta(minutes=10, seconds=4)
+    assert accepted.expires_at == expected_expiry
 
+
+@pytest.mark.integration
+async def test_v1_helper_expiry_rejects_more_than_maximum_ttl_and_skew(tmp_path):
+    delayed_now = NOW + timedelta(minutes=5)
     outside_skew = _script(
         tmp_path,
-        f"sys.stdout.write({_result_json(expires_at='2026-07-12T12:15:06Z')!r} + '\\n')",
+        f"sys.stdout.write({_result_json(expires_at='2026-07-12T12:20:06Z')!r} + '\\n')",
     )
     with pytest.raises(SshEnrollmentError, match="ssh_remote_command_failed"):
         await _adapter(outside_skew, clock=lambda: delayed_now).issue(_request(), TRUSTED)

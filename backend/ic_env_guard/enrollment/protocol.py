@@ -17,7 +17,9 @@ from ic_env_guard.enrollment.models import valid_enrollment_id
 PROTOCOL = "manager-enrollment.v1"
 MAX_REQUEST_BYTES = 4096
 MAX_RESPONSE_BYTES = 8192
-PENDING_CREDENTIAL_TTL_SECONDS = 600
+MIN_PENDING_CREDENTIAL_TTL_SECONDS = 60
+DEFAULT_PENDING_CREDENTIAL_TTL_SECONDS = 600
+MAX_PENDING_CREDENTIAL_TTL_SECONDS = 900
 
 
 class EnrollmentProtocolError(ValueError):

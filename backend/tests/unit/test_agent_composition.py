@@ -58,6 +58,8 @@ def test_new_agent_configuration_models_enforce_documented_bounds():
     assert ObservationConfig().expired_retention_seconds == 86400
     assert LogsConfig().default_tail_lines == 100
     assert EnrollmentConfig().pending_ttl_seconds == 600
+    assert EnrollmentConfig(pending_ttl_seconds=60).pending_ttl_seconds == 60
+    assert EnrollmentConfig(pending_ttl_seconds=900).pending_ttl_seconds == 900
     assert "supplementary" in (
         EnrollmentConfig.model_fields["manager_socket_gid"].description or ""
     ).lower()
@@ -70,6 +72,10 @@ def test_new_agent_configuration_models_enforce_documented_bounds():
         LogsConfig(default_tail_lines=101, max_tail_lines=100)
     with pytest.raises(ValueError):
         EnrollmentConfig(max_pending=129)
+    with pytest.raises(ValueError):
+        EnrollmentConfig(pending_ttl_seconds=59)
+    with pytest.raises(ValueError):
+        EnrollmentConfig(pending_ttl_seconds=901)
 
 @pytest.mark.unit
 def test_trusted_lan_capability_is_config_derived_without_disclosing_cidrs(tmp_path):

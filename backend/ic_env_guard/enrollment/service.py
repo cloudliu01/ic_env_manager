@@ -16,7 +16,7 @@ from ic_env_guard.enrollment.models import (
     valid_enrollment_id,
 )
 from ic_env_guard.enrollment.ports import EnrollmentAudit, ManagerCredentialRepository
-from ic_env_guard.enrollment.protocol import PENDING_CREDENTIAL_TTL_SECONDS
+from ic_env_guard.enrollment.protocol import DEFAULT_PENDING_CREDENTIAL_TTL_SECONDS
 
 
 class EnrollmentService:
@@ -25,7 +25,7 @@ class EnrollmentService:
         repository: ManagerCredentialRepository,
         audit: EnrollmentAudit,
         *,
-        pending_ttl_seconds: int = PENDING_CREDENTIAL_TTL_SECONDS,
+        pending_ttl_seconds: int = DEFAULT_PENDING_CREDENTIAL_TTL_SECONDS,
         max_pending: int = 64,
     ) -> None:
         self.repository = repository

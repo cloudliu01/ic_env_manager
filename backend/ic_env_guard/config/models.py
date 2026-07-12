@@ -14,6 +14,11 @@ from pydantic import (
 )
 
 from ic_env_guard.auth.token import validate_token_file_permissions
+from ic_env_guard.enrollment.protocol import (
+    DEFAULT_PENDING_CREDENTIAL_TTL_SECONDS,
+    MAX_PENDING_CREDENTIAL_TTL_SECONDS,
+    MIN_PENDING_CREDENTIAL_TTL_SECONDS,
+)
 from ic_env_guard.fleet.transport import (
     SYSTEM_TLS_PROFILE,
     TransportProfile,
@@ -141,7 +146,11 @@ class EnrollmentConfig(BaseModel):
             "supplementary groups are not accepted"
         ),
     )
-    pending_ttl_seconds: int = Field(default=600, ge=60, le=900)
+    pending_ttl_seconds: int = Field(
+        default=DEFAULT_PENDING_CREDENTIAL_TTL_SECONDS,
+        ge=MIN_PENDING_CREDENTIAL_TTL_SECONDS,
+        le=MAX_PENDING_CREDENTIAL_TTL_SECONDS,
+    )
     max_pending: int = Field(default=16, ge=1, le=128)
     ssh_binary: Path = Path("/usr/bin/ssh")
     ssh_connect_timeout_seconds: int = Field(default=10, ge=1, le=60)

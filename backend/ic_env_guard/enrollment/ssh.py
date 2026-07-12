@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from ic_env_guard.enrollment.protocol import PENDING_CREDENTIAL_TTL_SECONDS
+from ic_env_guard.enrollment.protocol import MAX_PENDING_CREDENTIAL_TTL_SECONDS
 from ic_env_guard.enrollment.service_key import (
     ServiceKeyError,
     ServiceKeyPolicy,
@@ -486,7 +486,7 @@ def _parse_helper_result(
         raise ValueError
     expires_at = _parse_time(value["expires_at"])
     if now.tzinfo is None or not now < expires_at <= now + timedelta(
-        seconds=PENDING_CREDENTIAL_TTL_SECONDS + MAX_HELPER_EXPIRY_SKEW_SECONDS
+        seconds=MAX_PENDING_CREDENTIAL_TTL_SECONDS + MAX_HELPER_EXPIRY_SKEW_SECONDS
     ):
         raise ValueError
     return EnrollmentHelperResult(
