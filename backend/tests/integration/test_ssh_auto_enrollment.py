@@ -105,7 +105,12 @@ def _test_executable_identity(path: Path) -> ExecutableIdentity:
 
 
 def _adapter(
-    executable: Path, *, resolver=None, timeout=1.0, executable_validator=None
+    executable: Path,
+    *,
+    resolver=None,
+    timeout=1.0,
+    executable_validator=None,
+    clock=lambda: NOW,
 ):
     ssh_directory = executable.parent / "manager-home" / ".ssh"
     ssh_directory.mkdir(parents=True, exist_ok=True)
@@ -119,7 +124,7 @@ def _adapter(
         executable=executable,
         connect_timeout_seconds=1,
         total_timeout_seconds=timeout,
-        clock=lambda: NOW,
+        clock=clock,
         termination_grace_seconds=0.1,
         user_known_hosts_file=ssh_directory / "known_hosts",
         executable_validator=executable_validator or _test_executable_identity,
@@ -163,19 +168,22 @@ async def test_issue_runs_preflight_then_fixed_helper_and_returns_secret_safe_re
 
 @pytest.mark.integration
 async def test_v1_helper_expiry_allows_only_bounded_issuance_skew(tmp_path):
+    delayed_now = NOW + timedelta(minutes=5)
     within_skew = _script(
         tmp_path,
-        f"sys.stdout.write({_result_json(expires_at='2026-07-12T12:10:04Z')!r} + '\\n')",
+        f"sys.stdout.write({_result_json(expires_at='2026-07-12T12:15:04Z')!r} + '\\n')",
     )
-    accepted = await _adapter(within_skew).issue(_request(), TRUSTED)
-    assert accepted.expires_at == NOW + timedelta(minutes=10, seconds=4)
+    accepted = await _adapter(within_skew, clock=lambda: delayed_now).issue(
+        _request(), TRUSTED
+    )
+    assert accepted.expires_at == delayed_now + timedelta(minutes=10, seconds=4)
 
     outside_skew = _script(
         tmp_path,
-        f"sys.stdout.write({_result_json(expires_at='2026-07-12T12:10:06Z')!r} + '\\n')",
+        f"sys.stdout.write({_result_json(expires_at='2026-07-12T12:15:06Z')!r} + '\\n')",
     )
     with pytest.raises(SshEnrollmentError, match="ssh_remote_command_failed"):
-        await _adapter(outside_skew).issue(_request(), TRUSTED)
+        await _adapter(outside_skew, clock=lambda: delayed_now).issue(_request(), TRUSTED)
 
 
 @pytest.mark.integration

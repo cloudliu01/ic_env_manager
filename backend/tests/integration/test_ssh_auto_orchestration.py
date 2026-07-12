@@ -419,6 +419,36 @@ async def test_real_cli_socket_resumes_after_manager_restart_and_returns_accepta
 
 
 @pytest.mark.integration
+def test_cli_submission_rejects_a_durably_expired_manager_job(tmp_path):
+    clock = [NOW]
+    adapter = Adapter()
+    adapter.healthy = False
+    orchestrator, _jobs, journal, _store, _client, engine = setup_services(
+        tmp_path, adapter, clock=lambda: clock[0]
+    )
+    try:
+        created = orchestrator.create_auto(request(), AUDIT_CONTEXT)
+        assert journal.get(created.job.enrollment_id).state is EnrollmentState.AWAITING_CLI
+        clock[0] = created.job.expires_at + timedelta(seconds=1)
+
+        with pytest.raises(EnrollmentValidationError) as rejected:
+            orchestrator.begin_cli_submission(
+                enrollment_id=created.job.enrollment_id,
+                ssh_user="edaops",
+                ssh_host="agent.lab.example",
+                ssh_port=2222,
+                pinned_address="10.20.30.40",
+                peer_uid=os.geteuid(),
+                context=AUDIT_CONTEXT,
+            )
+
+        assert rejected.value.code == "agent_enrollment_conflict"
+        assert journal.get(created.job.enrollment_id).state is EnrollmentState.EXPIRED
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.integration
 async def test_create_auto_returns_running_then_background_persists_and_verifies(tmp_path):
     adapter = Adapter()
     audit = Audit()
