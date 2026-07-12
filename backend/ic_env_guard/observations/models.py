@@ -13,6 +13,7 @@ ObservationStatus = Literal["ok", "warning", "critical", "unknown"]
 
 _NAMESPACE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,126}$")
+_PROMETHEUS_RESERVED_LABELS = frozenset({"name", "namespace", "status"})
 _RFC3339_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
 )
@@ -132,6 +133,8 @@ class ObservationInput(BaseModel):
         if len(value) > 16:
             raise ValueError("labels exceed 16 entries")
         for key, item in value.items():
+            if key in _PROMETHEUS_RESERVED_LABELS:
+                raise ValueError(f"label key '{key}' is reserved")
             if not _NAMESPACE_PATTERN.fullmatch(key):
                 raise ValueError("invalid label key")
             if _utf8_size(item) > 128:

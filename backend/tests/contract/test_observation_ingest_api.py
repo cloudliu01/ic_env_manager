@@ -97,6 +97,24 @@ def test_ingest_rejects_producer_identity_and_maps_domain_failures(tmp_path):
 
 
 @pytest.mark.contract
+@pytest.mark.parametrize("reserved_label", ["namespace", "name", "status"])
+def test_ingest_rejects_prometheus_reserved_observation_labels(tmp_path, reserved_label):
+    container = _container(tmp_path)
+    client = TestClient(create_ingest_app(container), client=("127.0.0.1", 50000))
+
+    response = client.put(
+        "/api/v2/observations",
+        json=_payload(datetime.now(UTC), labels={reserved_label: "producer-value"}),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert response.json()["error"]["message"] == "request validation failed"
+    assert response.headers["X-Correlation-ID"] == response.json()["error"]["correlation_id"]
+    container.database_engine.dispose()
+
+
+@pytest.mark.contract
 def test_ingest_rejects_stale_and_conflicting_timestamps(tmp_path):
     container = _container(tmp_path)
     client = TestClient(create_ingest_app(container), client=("127.0.0.1", 50000))

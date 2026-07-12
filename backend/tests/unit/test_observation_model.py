@@ -130,3 +130,16 @@ def test_details_depth_counts_containers_not_scalar_leaves():
 def test_byte_limits_aware_time_and_caller_producer_are_enforced(overrides):
     with pytest.raises(ValidationError):
         ObservationInput.model_validate({**BASE, **overrides})
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("reserved_label", ["namespace", "name", "status"])
+def test_prometheus_reserved_label_errors_are_bound_to_labels_field(reserved_label):
+    with pytest.raises(ValidationError) as exc_info:
+        ObservationInput.model_validate(
+            {**BASE, "labels": {reserved_label: "producer-value"}}
+        )
+
+    error = exc_info.value.errors()[0]
+    assert error["loc"] == ("labels",)
+    assert error["msg"] == f"Value error, label key '{reserved_label}' is reserved"

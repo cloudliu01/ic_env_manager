@@ -376,7 +376,7 @@ SSH adapter 固定设置 `PreferredAuthentications=publickey`、`PasswordAuthent
 | `unit` | 可选；最多 32 字符，不参与唯一标识 |
 | `status` | 必填；`ok`、`warning`、`critical`、`unknown` |
 | `message` | 可选；UTF-8，最多 2048 bytes |
-| `labels` | 可选；最多 16 项；key 使用 namespace 规则；value 最多 128 bytes |
+| `labels` | 可选；最多 16 项；key 使用 namespace 规则且不得是 Prometheus 内建键 `namespace`、`name` 或 `status`；value 最多 128 bytes |
 | `details` | 可选 JSON object；序列化后最多 16 KiB；最大嵌套深度 4 |
 | `observed_at` | 必填 RFC 3339 UTC 时间；不得晚于 Agent 当前时间 60 秒以上 |
 | `ttl_seconds` | 必填整数；范围 1 至 604800 秒 |
@@ -997,6 +997,7 @@ ic_env_observation_status{
 
 - `gauge` 和 `counter` 的数值导出为 `ic_env_observation_value`。
 - `status` 导出为 one-hot `ic_env_observation_status`。
+- Producer labels 不得使用 exporter 注入的 `namespace`、`name` 或 `status`；模型校验把错误定位到 `labels`，Local Ingest 返回 `422 validation_error`，避免不同 Observation identity 被投影为重复 Prometheus series。
 - stale Observation 不导出 value/status 样本，使 Prometheus 按正常 scrape 语义将旧 series 标记 stale。
 - `message`、`unit` 和 `details` 不成为 labels。
 - Producer labels 必须先通过数量、key、value 和总序列数限制。
