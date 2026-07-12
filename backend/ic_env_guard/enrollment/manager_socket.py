@@ -27,6 +27,7 @@ class ManagerSocketError(RuntimeError):
 
 
 PeerAuthorizer = Callable[[socket.socket], bool]
+PeerCredentials = Callable[[socket.socket], tuple[int, int, int]]
 
 
 class ManagerEnrollmentSocket:
@@ -39,6 +40,7 @@ class ManagerEnrollmentSocket:
         allowed_uid: int,
         allowed_gid: int | None = None,
         peer_authorizer: PeerAuthorizer | None = None,
+        peer_credentials: PeerCredentials | None = None,
         max_concurrency: int = 4,
         io_timeout_seconds: float = 3.0,
         result_timeout_seconds: float = 120.0,
@@ -49,6 +51,7 @@ class ManagerEnrollmentSocket:
         self.allowed_uid = allowed_uid
         self.allowed_gid = allowed_gid
         self._peer_authorizer = peer_authorizer or self._authorize_peer
+        self._peer_credentials = peer_credentials or _peer_credentials
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._io_timeout_seconds = io_timeout_seconds
         self._result_timeout_seconds = result_timeout_seconds
@@ -122,19 +125,28 @@ class ManagerEnrollmentSocket:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         claim: CliSubmissionClaim | None = None
+        result_received = False
+        result_handled = False
         try:
             raw_socket = writer.get_extra_info("socket")
             if raw_socket is None or not self._peer_authorizer(raw_socket):
                 await self._send(writer, {"error": "unauthorized_peer"})
                 return
+            _pid, peer_uid, _gid = self._peer_credentials(raw_socket)
             async with self._semaphore:
                 header = await self._read_object(reader, MAX_HEADER_BYTES)
-                if set(header) != {
+                initial_keys = {
                     "protocol",
                     "enrollment_id",
                     "ssh",
                     "pinned_address",
-                } or header["protocol"] != "manager-cli-enrollment.header.v1":
+                }
+                resume_keys = {*initial_keys, "resume_nonce"}
+                key_sets = {frozenset(initial_keys), frozenset(resume_keys)}
+                if (
+                    frozenset(header) not in key_sets
+                    or header["protocol"] != "manager-cli-enrollment.header.v1"
+                ):
                     raise ManagerSocketError("invalid_request")
                 user, host, port = parse_ssh_argument(header["ssh"])
                 claim = self.orchestrator.begin_cli_submission(
@@ -143,12 +155,28 @@ class ManagerEnrollmentSocket:
                     ssh_host=host,
                     ssh_port=port,
                     pinned_address=header["pinned_address"],
+                    peer_uid=peer_uid,
+                    resume_nonce=header.get("resume_nonce"),
                     context=AutoEnrollmentAuditContext(
-                        actor_id=f"local-cli:{self.allowed_uid}",
+                        actor_id=f"local-cli:{peer_uid}",
                         source_addr="local-unix",
                         correlation_id=None,
                     ),
                 )
+                if claim.already_accepted:
+                    await self._send(
+                        writer,
+                        {
+                            "protocol": "manager-cli-enrollment.accepted.v1",
+                            "status": "already_accepted",
+                            "enrollment_id": claim.job.enrollment_id,
+                        },
+                    )
+                    self.orchestrator.release_cli_connection(
+                        claim, result_received=True, code="already_accepted"
+                    )
+                    claim = None
+                    return
                 await self._send(
                     writer,
                     {
@@ -174,6 +202,7 @@ class ManagerEnrollmentSocket:
                     MAX_RESULT_BYTES,
                     timeout=min(remaining, self._result_timeout_seconds),
                 )
+                result_received = True
                 if set(result) != {
                     "protocol",
                     "input_fingerprint",
@@ -190,12 +219,15 @@ class ManagerEnrollmentSocket:
                     reader.read(1), timeout=self._io_timeout_seconds
                 ) != b"":
                     raise ManagerSocketError("trailing_request_data")
-                completed = await self.orchestrator.complete_cli_submission(
-                    claim,
-                    helper_payload=helper_payload,
-                    input_fingerprint=result["input_fingerprint"],
-                    nonce=result["nonce"],
-                )
+                try:
+                    completed = await self.orchestrator.complete_cli_submission(
+                        claim,
+                        helper_payload=helper_payload,
+                        input_fingerprint=result["input_fingerprint"],
+                        nonce=result["nonce"],
+                    )
+                finally:
+                    result_handled = True
                 await self._send(
                     writer,
                     {"status": "verified", "enrollment_id": completed.job.enrollment_id},
@@ -206,8 +238,16 @@ class ManagerEnrollmentSocket:
         except Exception:
             await self._send(writer, {"error": "enrollment_rejected"})
         finally:
-            if claim is not None:
-                self.orchestrator.abort_cli_submission(claim, "cli_submission_interrupted")
+            if claim is not None and not result_handled:
+                self.orchestrator.release_cli_connection(
+                    claim,
+                    result_received=result_received,
+                    code=(
+                        "cli_result_rejected"
+                        if result_received
+                        else "cli_submission_interrupted"
+                    ),
+                )
             writer.close()
             await writer.wait_closed()
 
@@ -243,13 +283,9 @@ class ManagerEnrollmentSocket:
             return
 
     def _authorize_peer(self, connection: socket.socket) -> bool:
-        pid, uid, gid = _peer_credentials(connection)
-        if uid == self.allowed_uid or (
+        _pid, uid, gid = self._peer_credentials(connection)
+        return uid == self.allowed_uid or (
             self.allowed_gid is not None and gid == self.allowed_gid
-        ):
-            return True
-        return self.allowed_gid is not None and _linux_supplementary_group(
-            pid, uid, self.allowed_gid
         )
 
     def _validate_parent(self) -> None:
@@ -299,34 +335,6 @@ def _peer_credentials(connection: socket.socket) -> tuple[int, int, int]:
             raise ManagerSocketError("peer credentials are unavailable")
         return -1, uid, primary_gid
     raise ManagerSocketError("peer credentials are unavailable")
-
-
-def _linux_supplementary_group(pid: int, uid: int, allowed_gid: int) -> bool:
-    if not sys.platform.startswith("linux") or pid < 1:
-        return False
-    directory_fd = -1
-    status_fd = -1
-    try:
-        directory_fd = os.open(
-            f"/proc/{pid}", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-        )
-        if os.fstat(directory_fd).st_uid != uid:
-            return False
-        status_fd = os.open("status", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
-        payload = os.read(status_fd, 16 * 1024)
-        if len(payload) == 16 * 1024 or os.read(status_fd, 1):
-            return False
-        for line in payload.decode("ascii").splitlines():
-            if line.startswith("Groups:"):
-                return allowed_gid in {int(value) for value in line[7:].split()}
-    except (OSError, UnicodeError, ValueError):
-        return False
-    finally:
-        if status_fd >= 0:
-            os.close(status_fd)
-        if directory_fd >= 0:
-            os.close(directory_fd)
-    return False
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

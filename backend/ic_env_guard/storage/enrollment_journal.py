@@ -26,7 +26,8 @@ _COLUMNS = (
     "ssh_port, enrollment_method, remote_instance_id, remote_credential_id, "
     "credential_temp_ref, old_credential_ref, old_remote_credential_id, save_requested, "
     "expires_at, last_error_code, created_at, updated_at, recovery_owner, "
-    "recovery_lease_until, recovery_revision, validated_http_address"
+    "recovery_lease_until, recovery_revision, validated_http_address, cli_resume_nonce, "
+    "cli_peer_uid, cli_input_fingerprint, cli_pinned_address, cli_accept_receipt"
 )
 _ENROLLMENT_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _CREDENTIAL_REF = re.compile(r"^[0-9a-f]{48}$")
@@ -153,6 +154,59 @@ def _validate_job(job: EnrollmentJob) -> None:
                 raise ValueError
         except ValueError as exc:
             raise RegistryInvariantError("validated HTTP address is invalid") from exc
+    cli_claim = (
+        job.cli_resume_nonce,
+        job.cli_peer_uid,
+        job.cli_input_fingerprint,
+        job.cli_pinned_address,
+    )
+    if any(value is not None for value in cli_claim):
+        if any(value is None for value in cli_claim):
+            raise RegistryInvariantError("CLI resume claim fields must be set together")
+        if job.enrollment_method is not EnrollmentMethod.SSH_CLI:
+            raise RegistryInvariantError("CLI resume claim requires CLI enrollment")
+        if job.state not in {
+            EnrollmentState.RUNNING,
+            EnrollmentState.CREDENTIAL_ISSUED,
+            EnrollmentState.VERIFYING,
+            EnrollmentState.VERIFIED,
+            EnrollmentState.ACTIVATION_REQUESTED,
+            EnrollmentState.ACTIVATED,
+        }:
+            raise RegistryInvariantError("CLI resume claim is invalid for enrollment phase")
+        try:
+            nonce = UUID(job.cli_resume_nonce or "")
+        except ValueError as exc:
+            raise RegistryInvariantError("CLI resume nonce must be a UUID") from exc
+        if str(nonce) != job.cli_resume_nonce:
+            raise RegistryInvariantError("CLI resume nonce must be canonical")
+        if not isinstance(job.cli_peer_uid, int) or isinstance(job.cli_peer_uid, bool):
+            raise RegistryInvariantError("CLI peer UID is invalid")
+        if job.cli_peer_uid < 0:
+            raise RegistryInvariantError("CLI peer UID is invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", job.cli_input_fingerprint or ""):
+            raise RegistryInvariantError("CLI input fingerprint is invalid")
+        try:
+            if str(ip_address(job.cli_pinned_address or "")) != job.cli_pinned_address:
+                raise ValueError
+        except ValueError as exc:
+            raise RegistryInvariantError("CLI pinned address is invalid") from exc
+    elif (
+        job.enrollment_method is EnrollmentMethod.SSH_CLI
+        and job.state is EnrollmentState.RUNNING
+        and job.credential_temp_ref is None
+    ):
+        raise RegistryInvariantError("running CLI enrollment requires resume identity")
+    receipt = job.cli_accept_receipt
+    if receipt is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", receipt):
+            raise RegistryInvariantError("CLI accept receipt is invalid")
+        if (
+            job.state is not EnrollmentState.CONSUMED
+            or job.enrollment_method is not EnrollmentMethod.SSH_CLI
+            or any(value is not None for value in cli_claim)
+        ):
+            raise RegistryInvariantError("CLI accept receipt is invalid for phase")
     credential_pin_required = job.state in credential_states or (
         job.state.terminal and job.credential_temp_ref is not None
     )
@@ -200,6 +254,11 @@ def _job(row: Any) -> EnrollmentJob:
         recovery_lease_until=_parse_time(row[23]),
         recovery_revision=row[24],
         validated_http_address=row[25],
+        cli_resume_nonce=row[26],
+        cli_peer_uid=row[27],
+        cli_input_fingerprint=row[28],
+        cli_pinned_address=row[29],
+        cli_accept_receipt=row[30],
     )
 
 
@@ -213,7 +272,7 @@ class EnrollmentJournalRepository(_SQLiteRepository):
             with self._write() as connection:
                 connection.execute(
                     f"INSERT INTO agent_enrollment_jobs ({_COLUMNS}) "
-                    f"VALUES ({','.join('?' * 26)})",
+                    f"VALUES ({','.join('?' * 31)})",
                     self._values(job),
                 )
             return job
@@ -257,7 +316,7 @@ class EnrollmentJournalRepository(_SQLiteRepository):
                     raise RegistryConflict("agent_enrollment_capacity")
                 connection.execute(
                     f"INSERT INTO agent_enrollment_jobs ({_COLUMNS}) "
-                    f"VALUES ({','.join('?' * 26)})",
+                    f"VALUES ({','.join('?' * 31)})",
                     self._values(job),
                 )
             return job
@@ -456,7 +515,9 @@ class EnrollmentJournalRepository(_SQLiteRepository):
                 connection.execute(
                     "UPDATE agent_enrollment_jobs SET state=?, updated_at=?, "
                     "recovery_owner=NULL, recovery_lease_until=NULL, "
-                    "recovery_revision=recovery_revision+1 "
+                    "recovery_revision=recovery_revision+1, cli_resume_nonce=NULL, "
+                    "cli_peer_uid=NULL, cli_input_fingerprint=NULL, "
+                    "cli_pinned_address=NULL, cli_accept_receipt=NULL "
                     "WHERE enrollment_id=? AND state=? AND recovery_owner=? "
                     "AND recovery_revision=? AND expires_at<=?",
                     (
@@ -503,7 +564,9 @@ class EnrollmentJournalRepository(_SQLiteRepository):
                 connection.execute(
                     f"UPDATE agent_enrollment_jobs SET state=?, updated_at=?, "
                     "recovery_owner=NULL, recovery_lease_until=NULL, "
-                    "recovery_revision=recovery_revision+1 "
+                    "recovery_revision=recovery_revision+1, cli_resume_nonce=NULL, "
+                    "cli_peer_uid=NULL, cli_input_fingerprint=NULL, "
+                    "cli_pinned_address=NULL, cli_accept_receipt=NULL "
                     f"WHERE state IN ({','.join('?' for _ in expirable)}) "
                     "AND expires_at<=?",
                     (
@@ -551,7 +614,10 @@ class EnrollmentJournalRepository(_SQLiteRepository):
                 connection.execute(
                     "UPDATE agent_enrollment_jobs SET state=?, updated_at=?, "
                     "recovery_owner=NULL, recovery_lease_until=NULL, "
-                    "recovery_revision=recovery_revision+1 WHERE enrollment_id=? "
+                    "recovery_revision=recovery_revision+1, cli_resume_nonce=NULL, "
+                    "cli_peer_uid=NULL, cli_input_fingerprint=NULL, "
+                    "cli_pinned_address=NULL, cli_accept_receipt=NULL "
+                    "WHERE enrollment_id=? "
                     f"AND state IN ({','.join('?' for _ in expirable)}) "
                     "AND expires_at<=?",
                     (
@@ -656,6 +722,9 @@ class EnrollmentJournalRepository(_SQLiteRepository):
                 cursor = connection.execute(
                     "UPDATE agent_enrollment_jobs SET state=?, recovery_owner=NULL, "
                     "recovery_lease_until=NULL, recovery_revision=recovery_revision+1, "
+                    "cli_resume_nonce=NULL, cli_peer_uid=NULL, "
+                    "cli_input_fingerprint=NULL, cli_pinned_address=NULL, "
+                    "cli_accept_receipt=NULL, "
                     "last_error_code=?, updated_at=? WHERE enrollment_id=? "
                     "AND recovery_owner=? AND recovery_revision=? "
                     "AND recovery_lease_until>?",
@@ -777,7 +846,22 @@ class EnrollmentJournalRepository(_SQLiteRepository):
                 rows = connection.exec_driver_sql(
                     f"SELECT {_COLUMNS} FROM agent_enrollment_jobs ORDER BY enrollment_id"
                 ).mappings().all()
-            return json.dumps([dict(row) for row in rows], sort_keys=True, default=str)
+            projected = []
+            private = {
+                "recovery_owner",
+                "recovery_lease_until",
+                "recovery_revision",
+                "cli_resume_nonce",
+                "cli_peer_uid",
+                "cli_input_fingerprint",
+                "cli_pinned_address",
+                "cli_accept_receipt",
+            }
+            for row in rows:
+                projected.append(
+                    {key: value for key, value in row.items() if key not in private}
+                )
+            return json.dumps(projected, sort_keys=True, default=str)
         except (SQLAlchemyError, sqlite3.Error) as exc:
             raise RegistryError("enrollment journal storage is unavailable") from exc
 
@@ -827,4 +911,9 @@ class EnrollmentJournalRepository(_SQLiteRepository):
             _format_time(job.recovery_lease_until),
             job.recovery_revision,
             job.validated_http_address,
+            job.cli_resume_nonce,
+            job.cli_peer_uid,
+            job.cli_input_fingerprint,
+            job.cli_pinned_address,
+            job.cli_accept_receipt,
         )

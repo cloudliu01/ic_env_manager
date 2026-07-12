@@ -301,7 +301,7 @@ SSH adapter 固定设置 `PreferredAuthentications=publickey`、`PasswordAuthent
 #### 6.2.3 两种 Manager 运行方式
 
 - **普通用户进程：** Manager 使用自己的进程环境调用系统 OpenSSH，并以 `BatchMode=yes` 自动尝试现有 `ssh-agent`、SSH config 和可非交互使用的 key。加密 key 未加入 `ssh-agent`、需要密码或 sudo 交互时，自动路径立即失败并切换到 CLI 指引；Web 后台不得等待密码输入。
-- **systemd 服务：** Web 创建 pending enrollment 并显示不含 secret 的 CLI 命令。当前 Linux 用户运行 `ic-env-guardctl agent enroll --manager-socket ... --enrollment-id ... --ssh user@host`；CLI 使用该用户自己的 OpenSSH 环境，捕获并解析有界 JSON stdout 但不回显 token，再通过 Manager 本地 Unix socket 提交结果。socket 必须验证 peer credentials、owner/group/mode、enrollment ID、TTL 和单次提交，拒绝 replay。Agent token 不进入 CLI 参数、shell history 或浏览器。
+- **systemd 服务：** Web 创建 pending enrollment 并显示不含 secret 的 CLI 命令。当前 Linux 用户运行 `ic-env-guardctl agent enroll --manager-socket ... --enrollment-id ... --ssh user@host`；CLI 使用该用户自己的 OpenSSH 环境，捕获并解析有界 JSON stdout 但不回显 token，再通过 Manager 本地 Unix socket 提交结果。socket 必须验证 peer credentials、owner/group/mode、enrollment ID、TTL 和单次提交，拒绝 replay。按 group 授权时只接受 `SO_PEERCRED` 返回的 primary GID，不解析或接受 supplementary groups；无法取得可信 peer credentials 的平台必须 fail closed。Agent token 不进入 CLI 参数、shell history 或浏览器。
 - **可选无人值守：** systemd Manager 可以配置一把 Manager 专用 Ed25519 SSH key，但不创建专用远端用户。管理员把公钥安装到远端现有用户的 `authorized_keys`，并使用 forced command、禁止 PTY、agent/X11/port forwarding 等限制，使该 key 只能进入 enrollment helper。项目提供精确配置模板和 Agent 端检查命令，但不自动分发或修改该文件，也不声称 Manager 能从网络证明远端限制正确。
 
 三种路径产生完全相同的 Manager-specific token 和 Registry 记录；差异只存在于 SSH adapter。Manager 不读取、上传、复制或保存个人私钥，也不要求 Manager 与 Agent 共享用户名、UID、NIS、LDAP 或其他用户目录。

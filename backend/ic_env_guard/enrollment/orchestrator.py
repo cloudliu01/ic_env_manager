@@ -1,10 +1,13 @@
 import asyncio
+import hashlib
+import hmac
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from ipaddress import ip_address
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from ic_env_guard.enrollment.agent_client import (
     EnrollmentAgentClient,
@@ -70,10 +73,11 @@ class AutoEnrollmentAuditContext:
 @dataclass(frozen=True)
 class CliSubmissionClaim:
     job: EnrollmentJob
-    target: ValidatedTarget
+    target: ValidatedTarget | None
     input_fingerprint: str
     audit_event_id: Any
     nonce: str
+    already_accepted: bool = False
 
 
 @dataclass(frozen=True)
@@ -253,6 +257,8 @@ class EnrollmentOrchestrator:
         ssh_host: str,
         ssh_port: int,
         pinned_address: str,
+        peer_uid: int,
+        resume_nonce: str | None = None,
         context: AutoEnrollmentAuditContext,
     ) -> CliSubmissionClaim:
         if self._closing or self.agent_client is None or self._auto_audit is None:
@@ -260,9 +266,9 @@ class EnrollmentOrchestrator:
                 "enrollment_unavailable", dispatch_state="not_dispatched"
             )
         try:
-            record_intent = getattr(
-                self._auto_audit, "record_cli_intent", self._auto_audit.record_intent
-            )
+            record_intent = getattr(self._auto_audit, "record_cli_intent", None)
+            if record_intent is None:
+                record_intent = self._auto_audit.record_intent
             event_id = record_intent(enrollment_id, context)
         except Exception:
             raise EnrollmentValidationError(
@@ -270,10 +276,6 @@ class EnrollmentOrchestrator:
             ) from None
         try:
             job = self.jobs.get(enrollment_id, now=self._now())
-            if job.state is not EnrollmentState.AWAITING_CLI:
-                raise EnrollmentValidationError(
-                    "agent_enrollment_conflict", dispatch_state="not_dispatched"
-                )
             if (job.ssh_user, job.ssh_host, job.ssh_port) != (
                 ssh_user,
                 ssh_host,
@@ -281,6 +283,100 @@ class EnrollmentOrchestrator:
             ):
                 raise EnrollmentValidationError(
                     "agent_enrollment_input_changed", dispatch_state="not_dispatched"
+                )
+            expected_fingerprint = job_input_fingerprint(
+                replace(job, enrollment_method=EnrollmentMethod.SSH_CLI)
+            )
+            if resume_nonce is not None:
+                try:
+                    parsed_nonce = UUID(resume_nonce)
+                    parsed_pin = ip_address(pinned_address)
+                except (TypeError, ValueError):
+                    raise EnrollmentValidationError(
+                        "agent_enrollment_conflict", dispatch_state="not_dispatched"
+                    ) from None
+                if (
+                    str(parsed_nonce) != resume_nonce
+                    or str(parsed_pin) != pinned_address
+                    or not isinstance(peer_uid, int)
+                    or isinstance(peer_uid, bool)
+                    or peer_uid < 0
+                ):
+                    raise EnrollmentValidationError(
+                        "agent_enrollment_conflict", dispatch_state="not_dispatched"
+                    )
+                if job.state is EnrollmentState.CONSUMED:
+                    candidate = _cli_accept_receipt(
+                        enrollment_id=job.enrollment_id,
+                        nonce=resume_nonce,
+                        peer_uid=peer_uid,
+                        input_fingerprint=expected_fingerprint,
+                        pinned_address=pinned_address,
+                    )
+                    if job.cli_accept_receipt is not None and hmac.compare_digest(
+                        job.cli_accept_receipt, candidate
+                    ):
+                        return CliSubmissionClaim(
+                            job=job,
+                            target=None,
+                            input_fingerprint=expected_fingerprint,
+                            audit_event_id=event_id,
+                            nonce=resume_nonce,
+                            already_accepted=True,
+                        )
+                    raise EnrollmentValidationError(
+                        "agent_enrollment_conflict", dispatch_state="not_dispatched"
+                    )
+                durable_match = (
+                    job.enrollment_method is EnrollmentMethod.SSH_CLI
+                    and job.cli_resume_nonce == resume_nonce
+                    and job.cli_peer_uid == peer_uid
+                    and job.cli_input_fingerprint == expected_fingerprint
+                    and job.cli_pinned_address == pinned_address
+                )
+                if not durable_match:
+                    raise EnrollmentValidationError(
+                        "agent_enrollment_conflict", dispatch_state="not_dispatched"
+                    )
+                target = self.agent_client.prepare_pinned(
+                    job.normalized_endpoint,
+                    job.transport_profile_id,
+                    pinned_address,
+                )
+                if job.state in {
+                    EnrollmentState.CREDENTIAL_ISSUED,
+                    EnrollmentState.VERIFYING,
+                    EnrollmentState.VERIFIED,
+                    EnrollmentState.ACTIVATION_REQUESTED,
+                    EnrollmentState.ACTIVATED,
+                }:
+                    return CliSubmissionClaim(
+                        job=job,
+                        target=target,
+                        input_fingerprint=expected_fingerprint,
+                        audit_event_id=event_id,
+                        nonce=resume_nonce,
+                        already_accepted=True,
+                    )
+                if (
+                    job.state is EnrollmentState.RUNNING
+                    and job.recovery_owner == resume_nonce
+                    and job.recovery_lease_until is not None
+                    and job.recovery_lease_until > self._now()
+                ):
+                    return CliSubmissionClaim(
+                        job=job,
+                        target=target,
+                        input_fingerprint=expected_fingerprint,
+                        audit_event_id=event_id,
+                        nonce=resume_nonce,
+                    )
+                raise EnrollmentValidationError(
+                    "agent_enrollment_conflict", dispatch_state="not_dispatched"
+                )
+            if job.state is not EnrollmentState.AWAITING_CLI:
+                raise EnrollmentValidationError(
+                    "agent_enrollment_conflict", dispatch_state="not_dispatched"
                 )
             target = self.agent_client.prepare_cli_target(
                 job.normalized_endpoint,
@@ -298,6 +394,10 @@ class EnrollmentOrchestrator:
                     recovery_owner=nonce,
                     recovery_lease_until=job.expires_at,
                     recovery_revision=job.recovery_revision + 1,
+                    cli_resume_nonce=nonce,
+                    cli_peer_uid=peer_uid,
+                    cli_input_fingerprint=expected_fingerprint,
+                    cli_pinned_address=pinned_address,
                     updated_at=self._now(),
                 ),
                 expected_state=EnrollmentState.AWAITING_CLI,
@@ -305,7 +405,7 @@ class EnrollmentOrchestrator:
             return CliSubmissionClaim(
                 job=claimed,
                 target=target,
-                input_fingerprint=job_input_fingerprint(claimed),
+                input_fingerprint=expected_fingerprint,
                 audit_event_id=event_id,
                 nonce=nonce,
             )
@@ -327,10 +427,34 @@ class EnrollmentOrchestrator:
         input_fingerprint: str,
         nonce: str,
     ) -> EnrollmentPublicResult:
+        try:
+            return await self._complete_cli_submission(
+                claim,
+                helper_payload=helper_payload,
+                input_fingerprint=input_fingerprint,
+                nonce=nonce,
+            )
+        except Exception as exc:
+            code = getattr(exc, "code", "ssh_remote_command_failed")
+            self._record_auto_outcome(
+                claim.audit_event_id,
+                result="failure",
+                dispatch_state="dispatched",
+                failure_category=code,
+            )
+            raise
+
+    async def _complete_cli_submission(
+        self,
+        claim: CliSubmissionClaim,
+        *,
+        helper_payload: bytes,
+        input_fingerprint: str,
+        nonce: str,
+    ) -> EnrollmentPublicResult:
         if nonce != claim.nonce or input_fingerprint != claim.input_fingerprint:
-            self.abort_cli_submission(claim, "agent_enrollment_input_changed")
             raise EnrollmentValidationError(
-                "agent_enrollment_input_changed", dispatch_state="not_dispatched"
+                "agent_enrollment_input_changed", dispatch_state="dispatched"
             )
         now = self._now()
         current = self.journal.recheck_cli_submission(
@@ -346,13 +470,7 @@ class EnrollmentOrchestrator:
                 if latest is not None and latest.state is EnrollmentState.EXPIRED
                 else "agent_enrollment_conflict"
             )
-            self._record_auto_outcome(
-                claim.audit_event_id,
-                result="failure",
-                dispatch_state="not_dispatched",
-                failure_category=code,
-            )
-            raise EnrollmentValidationError(code, dispatch_state="not_dispatched")
+            raise EnrollmentValidationError(code, dispatch_state="dispatched")
         request = SshEnrollmentRequest(
             manager_id=current.manager_id,
             enrollment_id=current.enrollment_id,
@@ -362,54 +480,36 @@ class EnrollmentOrchestrator:
             ssh_port=current.ssh_port or 0,
             expires_at=current.expires_at,
         )
+        if claim.target is None:
+            raise EnrollmentValidationError(
+                "agent_enrollment_conflict", dispatch_state="dispatched"
+            )
         helper = parse_submitted_helper_result(
             helper_payload,
             request=request,
             validation_target=claim.target,
             now=now,
         )
-        try:
-            await self._publish_cli_helper(current, helper)
-        except Exception:
-            self._record_auto_outcome(
-                claim.audit_event_id,
-                result="failure",
-                dispatch_state="dispatched",
-                failure_category="ssh_remote_command_failed",
-            )
-            raise
+        await self._publish_cli_helper(current, helper)
         self._record_auto_outcome(
             claim.audit_event_id, result="success", dispatch_state="dispatched"
         )
         return self.get(claim.job.enrollment_id)
 
-    def abort_cli_submission(self, claim: CliSubmissionClaim, code: str) -> None:
-        current = self.journal.get(claim.job.enrollment_id)
-        if (
-            current is None
-            or current.state is not EnrollmentState.RUNNING
-            or current.recovery_owner != claim.nonce
-        ):
-            return
-        try:
-            self.journal.replace_if_state(
-                replace(
-                    current,
-                    state=EnrollmentState.AWAITING_CLI,
-                    last_error_code=code,
-                    recovery_owner=None,
-                    recovery_lease_until=None,
-                    recovery_revision=current.recovery_revision + 1,
-                    updated_at=self._now(),
-                ),
-                expected_state=EnrollmentState.RUNNING,
+    def release_cli_connection(
+        self, claim: CliSubmissionClaim, *, result_received: bool, code: str
+    ) -> None:
+        if code == "already_accepted":
+            self._record_auto_outcome(
+                claim.audit_event_id,
+                result="success",
+                dispatch_state="not_dispatched",
             )
-        except (RegistryError, RevisionConflict):
             return
         self._record_auto_outcome(
             claim.audit_event_id,
             result="failure",
-            dispatch_state="unknown",
+            dispatch_state="dispatched" if result_received else "unknown",
             failure_category=code,
         )
 
@@ -948,6 +1048,35 @@ class EnrollmentOrchestrator:
         clear_claim: bool = False,
     ) -> EnrollmentJob | None:
         now = self._now()
+        clear_cli = state in {
+            EnrollmentState.CANCELLED,
+            EnrollmentState.EXPIRED,
+            EnrollmentState.FAILED,
+            EnrollmentState.CONSUMED,
+        }
+        receipt = job.cli_accept_receipt
+        if state is EnrollmentState.CONSUMED and all(
+            value is not None
+            for value in (
+                job.cli_resume_nonce,
+                job.cli_peer_uid,
+                job.cli_input_fingerprint,
+                job.cli_pinned_address,
+            )
+        ):
+            receipt = _cli_accept_receipt(
+                enrollment_id=job.enrollment_id,
+                nonce=job.cli_resume_nonce or "",
+                peer_uid=job.cli_peer_uid or 0,
+                input_fingerprint=job.cli_input_fingerprint or "",
+                pinned_address=job.cli_pinned_address or "",
+            )
+        elif state in {
+            EnrollmentState.CANCELLED,
+            EnrollmentState.EXPIRED,
+            EnrollmentState.FAILED,
+        }:
+            receipt = None
         try:
             return self.journal.replace_if_state(
                 replace(
@@ -959,6 +1088,13 @@ class EnrollmentOrchestrator:
                         None if clear_claim else job.recovery_lease_until
                     ),
                     recovery_revision=job.recovery_revision + 1,
+                    cli_resume_nonce=None if clear_cli else job.cli_resume_nonce,
+                    cli_peer_uid=None if clear_cli else job.cli_peer_uid,
+                    cli_input_fingerprint=(
+                        None if clear_cli else job.cli_input_fingerprint
+                    ),
+                    cli_pinned_address=None if clear_cli else job.cli_pinned_address,
+                    cli_accept_receipt=receipt,
                 ),
                 expected_state=job.state,
                 expected_recovery_owner=self._recovery_owner,
@@ -1148,6 +1284,8 @@ class EnrollmentOrchestrator:
                         correlation_id=None,
                     ),
                 )
+            elif job.enrollment_method is EnrollmentMethod.SSH_CLI:
+                continue
             elif (
                 job.state is EnrollmentState.RUNNING
                 and job.credential_temp_ref is None
@@ -1181,3 +1319,25 @@ def _same_committed_agent(existing: AgentRecord, expected: AgentRecord) -> bool:
         and existing.enabled == expected.enabled
         and existing.source == expected.source
     )
+
+
+def _cli_accept_receipt(
+    *,
+    enrollment_id: str,
+    nonce: str,
+    peer_uid: int,
+    input_fingerprint: str,
+    pinned_address: str,
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"ic-env-guard.cli-accept-receipt.v1\x00")
+    for value in (
+        enrollment_id.encode("utf-8"),
+        nonce.encode("ascii"),
+        str(peer_uid).encode("ascii"),
+        input_fingerprint.encode("ascii"),
+        pinned_address.encode("ascii"),
+    ):
+        digest.update(len(value).to_bytes(4, "big"))
+        digest.update(value)
+    return digest.hexdigest()

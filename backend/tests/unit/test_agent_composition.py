@@ -58,6 +58,9 @@ def test_new_agent_configuration_models_enforce_documented_bounds():
     assert ObservationConfig().expired_retention_seconds == 86400
     assert LogsConfig().default_tail_lines == 100
     assert EnrollmentConfig().pending_ttl_seconds == 600
+    assert "supplementary" in (
+        EnrollmentConfig.model_fields["manager_socket_gid"].description or ""
+    ).lower()
 
     with pytest.raises(ValueError):
         ObservationConfig(cleanup_interval_seconds=0)

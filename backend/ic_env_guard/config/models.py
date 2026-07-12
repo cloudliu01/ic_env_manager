@@ -126,7 +126,14 @@ class EnrollmentConfig(BaseModel):
     socket_mode: Literal["0600", "0660"] = "0600"
     manager_socket_path: Path | None = None
     manager_socket_mode: Literal["0600", "0660"] = "0600"
-    manager_socket_gid: int | None = Field(default=None, ge=0)
+    manager_socket_gid: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Authorize only a peer whose SO_PEERCRED primary GID matches; "
+            "supplementary groups are not accepted"
+        ),
+    )
     pending_ttl_seconds: int = Field(default=600, ge=60, le=900)
     max_pending: int = Field(default=16, ge=1, le=128)
     ssh_binary: Path = Path("/usr/bin/ssh")

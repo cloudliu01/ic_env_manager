@@ -132,7 +132,19 @@ class EnrollmentJobs:
         if job.state in EXPIRABLE_STATES and now >= job.expires_at:
             try:
                 job = self.repository.replace_if_state(
-                    replace(job, state=EnrollmentState.EXPIRED, updated_at=now),
+                    replace(
+                        job,
+                        state=EnrollmentState.EXPIRED,
+                        recovery_owner=None,
+                        recovery_lease_until=None,
+                        recovery_revision=job.recovery_revision + 1,
+                        cli_resume_nonce=None,
+                        cli_peer_uid=None,
+                        cli_input_fingerprint=None,
+                        cli_pinned_address=None,
+                        cli_accept_receipt=None,
+                        updated_at=now,
+                    ),
                     expected_state=job.state,
                 )
             except RevisionConflict:
@@ -155,7 +167,19 @@ class EnrollmentJobs:
             raise EnrollmentConflict("agent_enrollment_not_cancellable")
         try:
             return self.repository.replace_if_state(
-                replace(job, state=EnrollmentState.CANCELLED, updated_at=now),
+                replace(
+                    job,
+                    state=EnrollmentState.CANCELLED,
+                    recovery_owner=None,
+                    recovery_lease_until=None,
+                    recovery_revision=job.recovery_revision + 1,
+                    cli_resume_nonce=None,
+                    cli_peer_uid=None,
+                    cli_input_fingerprint=None,
+                    cli_pinned_address=None,
+                    cli_accept_receipt=None,
+                    updated_at=now,
+                ),
                 expected_state=job.state,
             )
         except RevisionConflict as exc:

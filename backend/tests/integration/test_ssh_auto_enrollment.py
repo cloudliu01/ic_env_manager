@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from ic_env_guard.enrollment.service_key import validate_service_key_files
 from ic_env_guard.enrollment.ssh import (
     EnrollmentHelperResult,
     ExecutableIdentity,
@@ -54,6 +55,8 @@ def _script(tmp_path: Path, actual: str, *, preflight_rewrite: str = "") -> Path
         "        opts['hostname'] = rewrite\n"
         "    for key in keys:\n"
         "        print(key, opts[key])\n"
+        "    for key in ('identityfile','identityagent','identitiesonly'):\n"
+        "        if key in opts: print(key, opts[key])\n"
         "    raise SystemExit(0)\n"
         "payload = sys.stdin.buffer.read()\n"
         "with open(sys.argv[0] + '.stdin', 'wb') as stream:\n"
@@ -234,6 +237,158 @@ async def test_issue_binds_http_validation_and_ssh_to_deterministic_shared_addre
     assert "Hostname=10.20.30.40" in json.loads(
         Path(f"{executable}.argv").read_text()
     )
+
+
+@pytest.mark.integration
+async def test_service_key_uses_validated_non_dot_ssh_known_hosts_for_health_and_issue(
+    tmp_path,
+):
+    executable = _script(
+        tmp_path,
+        f"sys.stdout.write({_result_json()!r} + '\\n'); sys.stdout.flush()",
+    )
+    service_dir = tmp_path / "var/lib/ic-env-guard/ssh"
+    service_dir.mkdir(parents=True, mode=0o700)
+    service_dir.chmod(0o700)
+    identity = service_dir / "id_ed25519"
+    identity.write_text(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n"
+        "-----END OPENSSH PRIVATE KEY-----\n"
+    )
+    identity.chmod(0o600)
+    known_hosts = service_dir / "known_hosts"
+    known_hosts.write_text("agent.example ssh-ed25519 AAAAFixture\n")
+    known_hosts.chmod(0o600)
+    policy = validate_service_key_files(
+        identity,
+        known_hosts,
+        inspect_key=lambda _path: "ssh-ed25519 AAAAFixture",
+    )
+    adapter = SshEnrollmentAdapter(
+        target_policy=AgentTargetPolicy(
+            allowed_agent_cidrs=["10.0.0.0/8"],
+            self_targets=[("10.0.0.1", 8765)],
+            resolver=lambda _host, _port: ("10.20.30.40",),
+        ),
+        executable=executable,
+        connect_timeout_seconds=1,
+        total_timeout_seconds=2,
+        clock=lambda: NOW,
+        user_known_hosts_file=known_hosts,
+        identity_file=identity,
+        service_key_policy=policy,
+        executable_validator=_test_executable_identity,
+    )
+
+    assert await adapter.check_available() is True
+    await adapter.issue(_request(), TRUSTED)
+
+    argv = json.loads(Path(f"{executable}.argv").read_text())
+    assert f"UserKnownHostsFile={known_hosts}" in argv
+    assert f"IdentityFile={identity}" in argv
+
+
+@pytest.mark.integration
+async def test_service_known_hosts_replacement_marks_unhealthy_before_actual_spawn(tmp_path):
+    executable = _script(tmp_path, "raise AssertionError('must not run')")
+    service_dir = tmp_path / "var/lib/ic-env-guard/ssh"
+    service_dir.mkdir(parents=True)
+    service_dir.chmod(0o700)
+    identity = service_dir / "id_ed25519"
+    identity.write_text(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n"
+        "-----END OPENSSH PRIVATE KEY-----\n"
+    )
+    identity.chmod(0o600)
+    known_hosts = service_dir / "known_hosts"
+    known_hosts.write_text("agent.example ssh-ed25519 AAAAFixture\n")
+    known_hosts.chmod(0o600)
+    policy = validate_service_key_files(
+        identity,
+        known_hosts,
+        inspect_key=lambda _path: "ssh-ed25519 AAAAFixture",
+    )
+    adapter = SshEnrollmentAdapter(
+        target_policy=AgentTargetPolicy(
+            allowed_agent_cidrs=["10.0.0.0/8"],
+            self_targets=[("10.0.0.1", 8765)],
+            resolver=lambda _host, _port: ("10.20.30.40",),
+        ),
+        executable=executable,
+        connect_timeout_seconds=1,
+        total_timeout_seconds=2,
+        user_known_hosts_file=known_hosts,
+        identity_file=identity,
+        service_key_policy=policy,
+        executable_validator=_test_executable_identity,
+    )
+    assert await adapter.check_available() is True
+    target = service_dir / "replacement-known-hosts"
+    target.write_text("replacement\n")
+    target.chmod(0o600)
+    known_hosts.unlink()
+    known_hosts.symlink_to(target)
+
+    with pytest.raises(SshEnrollmentError, match="ssh_unavailable"):
+        await adapter.issue(_request(), TRUSTED)
+
+    assert adapter.healthy is False
+    assert not Path(f"{executable}.argv").exists()
+
+
+@pytest.mark.integration
+async def test_service_policy_is_revalidated_immediately_before_each_ssh_spawn(
+    tmp_path, monkeypatch
+):
+    executable = _script(
+        tmp_path,
+        f"sys.stdout.write({_result_json()!r} + '\\n'); sys.stdout.flush()",
+    )
+    service_dir = tmp_path / "service-ssh"
+    service_dir.mkdir(mode=0o700)
+    identity = service_dir / "id_ed25519"
+    identity.write_text(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n"
+        "-----END OPENSSH PRIVATE KEY-----\n"
+    )
+    identity.chmod(0o600)
+    known_hosts = service_dir / "known_hosts"
+    known_hosts.write_text("agent.example ssh-ed25519 AAAAFixture\n")
+    known_hosts.chmod(0o600)
+    policy = validate_service_key_files(
+        identity,
+        known_hosts,
+        inspect_key=lambda _path: "ssh-ed25519 AAAAFixture",
+    )
+    from ic_env_guard.enrollment import ssh as ssh_module
+
+    actual_validate = ssh_module.validate_service_key_snapshot
+    calls = []
+
+    def counted_validate(value):
+        calls.append(value)
+        actual_validate(value)
+
+    monkeypatch.setattr(ssh_module, "validate_service_key_snapshot", counted_validate)
+    adapter = SshEnrollmentAdapter(
+        target_policy=AgentTargetPolicy(
+            allowed_agent_cidrs=["10.0.0.0/8"],
+            self_targets=[("10.0.0.1", 8765)],
+            resolver=lambda _host, _port: ("10.20.30.40",),
+        ),
+        executable=executable,
+        connect_timeout_seconds=1,
+        total_timeout_seconds=2,
+        clock=lambda: NOW,
+        user_known_hosts_file=known_hosts,
+        identity_file=identity,
+        service_key_policy=policy,
+        executable_validator=_test_executable_identity,
+    )
+
+    await adapter.issue(_request(), TRUSTED)
+
+    assert calls == [policy, policy, policy, policy]
 
 
 @pytest.mark.integration

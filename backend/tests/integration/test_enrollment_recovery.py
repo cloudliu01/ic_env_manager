@@ -14,8 +14,13 @@ from ic_env_guard.enrollment.agent_client import (
     EnrollmentValidationError,
 )
 from ic_env_guard.enrollment.credential_store import CredentialStore, CredentialStoreError
-from ic_env_guard.enrollment.jobs import EnrollmentJobRequest, EnrollmentJobs
+from ic_env_guard.enrollment.jobs import (
+    EnrollmentJobRequest,
+    EnrollmentJobs,
+    job_input_fingerprint,
+)
 from ic_env_guard.enrollment.orchestrator import (
+    AutoEnrollmentAuditContext,
     EnrollmentOrchestrator,
     LegacyValidationRequest,
 )
@@ -331,8 +336,19 @@ async def test_ssh_activated_recovery_commits_registry_and_atomically_clears_ref
         async def activate(self, *_args, **_kwargs):
             raise AssertionError("already activated residual must not dispatch")
 
+        def prepare_cli_target(
+            self, endpoint, _profile, *, ssh_host, ssh_port, pinned_address
+        ):
+            assert (ssh_host, ssh_port) == ("agent.example", 22)
+            return SimpleNamespace(
+                normalized_endpoint=endpoint,
+                pinned_address=pinned_address,
+                profile=SimpleNamespace(),
+            )
+
+    client = Client()
     orchestrator, jobs, journal, registry, store, engine = setup_services(
-        tmp_path, Client()
+        tmp_path, client
     )
     try:
         pending = jobs.create(
@@ -349,6 +365,8 @@ async def test_ssh_activated_recovery_commits_registry_and_atomically_clears_ref
         )
         reference = store.put(b"registry-owned")
         current = pending
+        cli_nonce = "11111111-1111-4111-8111-111111111111"
+        cli_fingerprint = job_input_fingerprint(pending)
         for state in (
             EnrollmentState.RUNNING,
             EnrollmentState.CREDENTIAL_ISSUED,
@@ -387,6 +405,16 @@ async def test_ssh_activated_recovery_commits_registry_and_atomically_clears_ref
                         EnrollmentState.ACTIVATED,
                     },
                     requested_display_name="Lab SSH",
+                    cli_resume_nonce=(
+                        cli_nonce if method is EnrollmentMethod.SSH_CLI else None
+                    ),
+                    cli_peer_uid=501 if method is EnrollmentMethod.SSH_CLI else None,
+                    cli_input_fingerprint=(
+                        cli_fingerprint if method is EnrollmentMethod.SSH_CLI else None
+                    ),
+                    cli_pinned_address=(
+                        "10.20.30.40" if method is EnrollmentMethod.SSH_CLI else None
+                    ),
                 ),
                 expected_state=current.state,
             )
@@ -401,12 +429,64 @@ async def test_ssh_activated_recovery_commits_registry_and_atomically_clears_ref
         assert consumed.state is EnrollmentState.CONSUMED
         assert consumed.credential_temp_ref is None
         assert consumed.validated_http_address is None
+        if method is EnrollmentMethod.SSH_CLI:
+            assert consumed.cli_resume_nonce is None
+            assert consumed.cli_peer_uid is None
+            assert consumed.cli_input_fingerprint is None
+            assert consumed.cli_pinned_address is None
+            assert consumed.cli_accept_receipt is not None
+            assert consumed.cli_accept_receipt not in journal.dump_serialized_rows()
+            assert "cli_accept_receipt" not in journal.dump_serialized_rows()
         assert store.read(reference) == b"registry-owned"
         await orchestrator.recover_and_cleanup()
         assert registry.get(pending.enrollment_id) == saved
         assert calls == [
             ("https://agent.example:8765", "system-tls", "10.20.30.40")
         ]
+        if method is EnrollmentMethod.SSH_CLI:
+            class Audit:
+                def record_cli_intent(self, *_args):
+                    return 1
+
+                def record_outcome(self, *_args, **_kwargs):
+                    return None
+
+            restarted = EnrollmentOrchestrator(
+                jobs=jobs,
+                journal=journal,
+                credential_store=store,
+                agent_client=client,
+                registry=registry,
+                auto_audit=Audit(),
+                clock=lambda: NOW,
+            )
+            accepted = restarted.begin_cli_submission(
+                enrollment_id=pending.enrollment_id,
+                ssh_user="edaops",
+                ssh_host="agent.example",
+                ssh_port=22,
+                pinned_address="10.20.30.40",
+                peer_uid=501,
+                resume_nonce=cli_nonce,
+                context=AutoEnrollmentAuditContext(None, None, None),
+            )
+            assert accepted.already_accepted is True
+            for peer_uid, nonce, pin in (
+                (502, cli_nonce, "10.20.30.40"),
+                (501, "22222222-2222-4222-8222-222222222222", "10.20.30.40"),
+                (501, cli_nonce, "10.20.30.41"),
+            ):
+                with pytest.raises(EnrollmentValidationError, match="conflict"):
+                    restarted.begin_cli_submission(
+                        enrollment_id=pending.enrollment_id,
+                        ssh_user="edaops",
+                        ssh_host="agent.example",
+                        ssh_port=22,
+                        pinned_address=pin,
+                        peer_uid=peer_uid,
+                        resume_nonce=nonce,
+                        context=AutoEnrollmentAuditContext(None, None, None),
+                    )
     finally:
         engine.dispose()
 

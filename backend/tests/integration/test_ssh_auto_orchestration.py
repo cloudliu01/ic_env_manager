@@ -17,6 +17,7 @@ from ic_env_guard.enrollment.jobs import EnrollmentJobRequest, EnrollmentJobs
 from ic_env_guard.enrollment.orchestrator import (
     AutoEnrollmentAuditContext,
     EnrollmentOrchestrator,
+    _cli_accept_receipt,
 )
 from ic_env_guard.enrollment.ssh import (
     EnrollmentHelperResult,
@@ -46,6 +47,26 @@ AUDIT_CONTEXT = AutoEnrollmentAuditContext(
     source_addr="127.0.0.1",
     correlation_id="corr-ssh-auto",
 )
+
+
+def test_cli_accept_receipt_is_domain_separated_and_binds_every_field():
+    values = {
+        "enrollment_id": ENROLLMENT_ID,
+        "nonce": "11111111-1111-4111-8111-111111111111",
+        "peer_uid": 501,
+        "input_fingerprint": "a" * 64,
+        "pinned_address": "10.20.30.40",
+    }
+    receipt = _cli_accept_receipt(**values)
+
+    for key, replacement in (
+        ("enrollment_id", "different-enrollment"),
+        ("nonce", "22222222-2222-4222-8222-222222222222"),
+        ("peer_uid", 502),
+        ("input_fingerprint", "b" * 64),
+        ("pinned_address", "10.20.30.41"),
+    ):
+        assert _cli_accept_receipt(**{**values, key: replacement}) != receipt
 
 
 class Audit:
@@ -84,6 +105,11 @@ class AgentClient:
             "10.20.30.40",
         )
         assert endpoint == "http://10.20.30.40:8765"
+        return VALIDATION_TARGET
+
+    def prepare_pinned(self, endpoint, _profile_id, stored_ip):
+        assert endpoint == "http://10.20.30.40:8765"
+        assert stored_ip == "10.20.30.40"
         return VALIDATION_TARGET
 
     async def validate_pending(self, _target, token, *, helper_instance_id):
@@ -661,11 +687,21 @@ async def test_cli_claim_nonce_publication_and_replay_are_fenced(tmp_path):
             ssh_host="agent.lab.example",
             ssh_port=2222,
             pinned_address="10.20.30.40",
+            peer_uid=501,
             context=AUDIT_CONTEXT,
         )
         assert claim.job.state is EnrollmentState.RUNNING
         assert claim.job.enrollment_method is EnrollmentMethod.SSH_CLI
         assert claim.job.recovery_owner == claim.nonce
+        assert claim.job.cli_resume_nonce == claim.nonce
+        assert claim.job.cli_peer_uid == 501
+        assert claim.job.cli_input_fingerprint == claim.input_fingerprint
+        assert claim.job.cli_pinned_address == "10.20.30.40"
+        serialized = journal.dump_serialized_rows()
+        assert claim.nonce not in serialized
+        assert claim.input_fingerprint not in serialized
+        assert '"cli_peer_uid"' not in serialized
+        assert '"cli_pinned_address"' not in serialized
         payload = (
             b'{"protocol":"manager-enrollment.v1",'
             b'"instance_id":"33333333-3333-4333-8333-333333333333",'
@@ -683,6 +719,7 @@ async def test_cli_claim_nonce_publication_and_replay_are_fenced(tmp_path):
         assert completed.job.state is EnrollmentState.VERIFIED
         assert completed.job.validated_http_address == "10.20.30.40"
         assert completed.job.recovery_owner is None
+        assert completed.job.cli_resume_nonce == claim.nonce
         assert store.read(completed.job.credential_temp_ref) == TOKEN
         with pytest.raises(EnrollmentValidationError, match="agent_enrollment_conflict"):
             orchestrator.begin_cli_submission(
@@ -691,6 +728,7 @@ async def test_cli_claim_nonce_publication_and_replay_are_fenced(tmp_path):
                 ssh_host="agent.lab.example",
                 ssh_port=2222,
                 pinned_address="10.20.30.40",
+                peer_uid=501,
                 context=AUDIT_CONTEXT,
             )
     finally:
@@ -702,8 +740,9 @@ async def test_cli_claim_nonce_publication_and_replay_are_fenced(tmp_path):
 async def test_cli_wrong_nonce_aborts_to_awaiting_without_storing_token(tmp_path):
     adapter = Adapter()
     adapter.healthy = False
+    audit = Audit()
     orchestrator, _jobs, journal, store, _client, engine = setup_services(
-        tmp_path, adapter
+        tmp_path, adapter, audit=audit
     )
     try:
         awaiting = orchestrator.create_auto(request(), AUDIT_CONTEXT).job
@@ -713,6 +752,7 @@ async def test_cli_wrong_nonce_aborts_to_awaiting_without_storing_token(tmp_path
             ssh_host="agent.lab.example",
             ssh_port=2222,
             pinned_address="10.20.30.40",
+            peer_uid=501,
             context=AUDIT_CONTEXT,
         )
         with pytest.raises(EnrollmentValidationError, match="input_changed"):
@@ -724,11 +764,16 @@ async def test_cli_wrong_nonce_aborts_to_awaiting_without_storing_token(tmp_path
             )
 
         current = journal.get(awaiting.enrollment_id)
-        assert current.state is EnrollmentState.AWAITING_CLI
-        assert current.recovery_owner is None
+        assert current.state is EnrollmentState.RUNNING
+        assert current.recovery_owner == claim.nonce
         assert not [
             path for path in store.directory.iterdir() if not path.name.startswith(".")
         ]
+        assert audit.events[-1][2:] == (
+            "failure",
+            "dispatched",
+            "agent_enrollment_input_changed",
+        )
     finally:
         await orchestrator.shutdown()
         engine.dispose()
@@ -750,6 +795,7 @@ async def test_cli_result_atomically_expires_before_helper_token_is_parsed(tmp_p
             ssh_host="agent.lab.example",
             ssh_port=2222,
             pinned_address="10.20.30.40",
+            peer_uid=501,
             context=AUDIT_CONTEXT,
         )
         now[0] = awaiting.expires_at
@@ -765,6 +811,10 @@ async def test_cli_result_atomically_expires_before_helper_token_is_parsed(tmp_p
         current = journal.get(awaiting.enrollment_id)
         assert current.state is EnrollmentState.EXPIRED
         assert current.recovery_owner is None
+        assert current.cli_resume_nonce is None
+        assert current.cli_peer_uid is None
+        assert current.cli_input_fingerprint is None
+        assert current.cli_pinned_address is None
         assert not [
             path for path in store.directory.iterdir() if not path.name.startswith(".")
         ]
@@ -775,6 +825,146 @@ async def test_cli_result_atomically_expires_before_helper_token_is_parsed(tmp_p
 
 @pytest.mark.integration
 async def test_cli_disconnect_abort_fences_late_result_handler(tmp_path):
+    adapter = Adapter()
+    adapter.healthy = False
+    audit = Audit()
+    orchestrator, _jobs, journal, store, _client, engine = setup_services(
+        tmp_path, adapter, audit=audit
+    )
+    try:
+        awaiting = orchestrator.create_auto(request(), AUDIT_CONTEXT).job
+        claim = orchestrator.begin_cli_submission(
+            enrollment_id=awaiting.enrollment_id,
+            ssh_user="edaops",
+            ssh_host="agent.lab.example",
+            ssh_port=2222,
+            pinned_address="10.20.30.40",
+            peer_uid=501,
+            context=AUDIT_CONTEXT,
+        )
+        orchestrator.release_cli_connection(
+            claim, result_received=False, code="cli_submission_interrupted"
+        )
+
+        resumed = orchestrator.begin_cli_submission(
+            enrollment_id=awaiting.enrollment_id,
+            ssh_user="edaops",
+            ssh_host="agent.lab.example",
+            ssh_port=2222,
+            pinned_address="10.20.30.40",
+            peer_uid=501,
+            resume_nonce=claim.nonce,
+            context=AUDIT_CONTEXT,
+        )
+        assert resumed.nonce == claim.nonce
+        assert resumed.input_fingerprint == claim.input_fingerprint
+        assert resumed.job.recovery_revision == claim.job.recovery_revision
+        assert resumed.job.state is EnrollmentState.RUNNING
+        assert audit.events[1][2:] == (
+            "failure",
+            "unknown",
+            "cli_submission_interrupted",
+        )
+        assert not [
+            path for path in store.directory.iterdir() if not path.name.startswith(".")
+        ]
+    finally:
+        await orchestrator.shutdown()
+        engine.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(("peer_uid", "nonce"), ((502, None), (501, "wrong-nonce")))
+def test_cli_resume_rejects_wrong_peer_or_nonce_without_unlocking_claim(
+    tmp_path, peer_uid, nonce
+):
+    adapter = Adapter()
+    adapter.healthy = False
+    orchestrator, _jobs, journal, _store, _client, engine = setup_services(
+        tmp_path, adapter
+    )
+    try:
+        awaiting = orchestrator.create_auto(request(), AUDIT_CONTEXT).job
+        claim = orchestrator.begin_cli_submission(
+            enrollment_id=awaiting.enrollment_id,
+            ssh_user="edaops",
+            ssh_host="agent.lab.example",
+            ssh_port=2222,
+            pinned_address="10.20.30.40",
+            peer_uid=501,
+            context=AUDIT_CONTEXT,
+        )
+        with pytest.raises(EnrollmentValidationError, match="conflict"):
+            orchestrator.begin_cli_submission(
+                enrollment_id=awaiting.enrollment_id,
+                ssh_user="edaops",
+                ssh_host="agent.lab.example",
+                ssh_port=2222,
+                pinned_address="10.20.30.40",
+                peer_uid=peer_uid,
+                resume_nonce=nonce or claim.nonce,
+                context=AUDIT_CONTEXT,
+            )
+        current = journal.get(awaiting.enrollment_id)
+        assert current.state is EnrollmentState.RUNNING
+        assert current.cli_resume_nonce == claim.nonce
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_cli_resume_after_publication_returns_already_accepted_without_token(tmp_path):
+    adapter = Adapter()
+    adapter.healthy = False
+    orchestrator, _jobs, _journal, _store, _client, engine = setup_services(
+        tmp_path, adapter
+    )
+    try:
+        awaiting = orchestrator.create_auto(request(), AUDIT_CONTEXT).job
+        claim = orchestrator.begin_cli_submission(
+            enrollment_id=awaiting.enrollment_id,
+            ssh_user="edaops",
+            ssh_host="agent.lab.example",
+            ssh_port=2222,
+            pinned_address="10.20.30.40",
+            peer_uid=501,
+            context=AUDIT_CONTEXT,
+        )
+        payload = (
+            b'{"protocol":"manager-enrollment.v1",'
+            b'"instance_id":"33333333-3333-4333-8333-333333333333",'
+            b'"credential_id":"44444444-4444-4444-8444-444444444444",'
+            b'"token":"eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg",'
+            b'"expires_at":"2026-07-12T12:05:00Z"}'
+        )
+        await orchestrator.complete_cli_submission(
+            claim,
+            helper_payload=payload,
+            input_fingerprint=claim.input_fingerprint,
+            nonce=claim.nonce,
+        )
+
+        resumed = orchestrator.begin_cli_submission(
+            enrollment_id=awaiting.enrollment_id,
+            ssh_user="edaops",
+            ssh_host="agent.lab.example",
+            ssh_port=2222,
+            pinned_address="10.20.30.40",
+            peer_uid=501,
+            resume_nonce=claim.nonce,
+            context=AUDIT_CONTEXT,
+        )
+
+        assert resumed.already_accepted is True
+        assert resumed.job.state is EnrollmentState.VERIFIED
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_cli_result_read_before_put_failure_can_resume_and_publish_once(
+    tmp_path, monkeypatch
+):
     adapter = Adapter()
     adapter.healthy = False
     orchestrator, _jobs, journal, store, _client, engine = setup_services(
@@ -788,24 +978,89 @@ async def test_cli_disconnect_abort_fences_late_result_handler(tmp_path):
             ssh_host="agent.lab.example",
             ssh_port=2222,
             pinned_address="10.20.30.40",
+            peer_uid=501,
             context=AUDIT_CONTEXT,
         )
-        orchestrator.abort_cli_submission(claim, "cli_submission_interrupted")
+        payload = (
+            b'{"protocol":"manager-enrollment.v1",'
+            b'"instance_id":"33333333-3333-4333-8333-333333333333",'
+            b'"credential_id":"44444444-4444-4444-8444-444444444444",'
+            b'"token":"eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg",'
+            b'"expires_at":"2026-07-12T12:05:00Z"}'
+        )
+        publish = orchestrator._publish_cli_helper
 
-        with pytest.raises(EnrollmentValidationError, match="conflict"):
+        async def crash_before_put(*_args, **_kwargs):
+            raise RuntimeError("manager crashed before put")
+
+        monkeypatch.setattr(orchestrator, "_publish_cli_helper", crash_before_put)
+        with pytest.raises(RuntimeError, match="before put"):
             await orchestrator.complete_cli_submission(
                 claim,
-                helper_payload=b"must-not-be-parsed",
+                helper_payload=payload,
                 input_fingerprint=claim.input_fingerprint,
                 nonce=claim.nonce,
             )
-
-        assert journal.get(awaiting.enrollment_id).state is EnrollmentState.AWAITING_CLI
+        assert journal.get(awaiting.enrollment_id).state is EnrollmentState.RUNNING
         assert not [
             path for path in store.directory.iterdir() if not path.name.startswith(".")
         ]
+
+        resumed = orchestrator.begin_cli_submission(
+            enrollment_id=awaiting.enrollment_id,
+            ssh_user="edaops",
+            ssh_host="agent.lab.example",
+            ssh_port=2222,
+            pinned_address="10.20.30.40",
+            peer_uid=501,
+            resume_nonce=claim.nonce,
+            context=AUDIT_CONTEXT,
+        )
+        monkeypatch.setattr(orchestrator, "_publish_cli_helper", publish)
+        completed = await orchestrator.complete_cli_submission(
+            resumed,
+            helper_payload=payload,
+            input_fingerprint=resumed.input_fingerprint,
+            nonce=resumed.nonce,
+        )
+        assert completed.job.state is EnrollmentState.VERIFIED
+        assert store.read(completed.job.credential_temp_ref) == TOKEN
     finally:
-        await orchestrator.shutdown()
+        engine.dispose()
+
+
+@pytest.mark.integration
+async def test_cli_running_claim_survives_startup_recovery_and_cancel_clears_identity(
+    tmp_path,
+):
+    adapter = Adapter()
+    adapter.healthy = False
+    orchestrator, _jobs, journal, _store, _client, engine = setup_services(
+        tmp_path, adapter
+    )
+    try:
+        awaiting = orchestrator.create_auto(request(), AUDIT_CONTEXT).job
+        claim = orchestrator.begin_cli_submission(
+            enrollment_id=awaiting.enrollment_id,
+            ssh_user="edaops",
+            ssh_host="agent.lab.example",
+            ssh_port=2222,
+            pinned_address="10.20.30.40",
+            peer_uid=501,
+            context=AUDIT_CONTEXT,
+        )
+        await orchestrator.recover_and_cleanup()
+        recovered = journal.get(awaiting.enrollment_id)
+        assert recovered.state is EnrollmentState.RUNNING
+        assert recovered.cli_resume_nonce == claim.nonce
+
+        cancelled = await orchestrator.cancel(awaiting.enrollment_id)
+        assert cancelled.job.state is EnrollmentState.CANCELLED
+        assert cancelled.job.cli_resume_nonce is None
+        assert cancelled.job.cli_peer_uid is None
+        assert cancelled.job.cli_input_fingerprint is None
+        assert cancelled.job.cli_pinned_address is None
+    finally:
         engine.dispose()
 
 

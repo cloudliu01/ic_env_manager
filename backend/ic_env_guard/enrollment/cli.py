@@ -4,6 +4,8 @@ import os
 import re
 import signal
 import socket
+import time
+from datetime import UTC, datetime
 from ipaddress import IPv4Address, IPv6Address, ip_address
 from pathlib import Path
 from typing import Any, TextIO
@@ -134,80 +136,76 @@ def run_cli_enrollment(
     total_timeout_seconds: float = 120,
     runner: CliSshRunner | None = None,
 ) -> int:
+    client: socket.socket | None = None
     try:
         user, host, port = parse_ssh_argument(ssh)
         pinned = _resolve_cli_address(host, port)
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(3)
-            client.connect(str(manager_socket))
-            _send_object(
-                client,
-                {
-                    "protocol": "manager-cli-enrollment.header.v1",
-                    "enrollment_id": enrollment_id,
-                    "ssh": ssh,
-                    "pinned_address": str(pinned),
-                },
-            )
-            ready = _read_object(client, 4096)
-            if set(ready) != {
-                "protocol",
-                "manager_id",
-                "enrollment_id",
-                "input_fingerprint",
-                "nonce",
-                "expires_at",
-                "host_key_policy",
-            } or ready.get("protocol") != "manager-cli-enrollment.ready.v1":
-                raise CliEnrollmentError("enrollment_rejected")
-            profile = TrustedLanHttpProfile(
-                id="cli", allowed_cidrs=["10.0.0.0/8", "fc00::/7"]
-            )
-            argv = build_cli_ssh_argv(
-                executable=executable,
-                pinned_address=pinned,
-                user=user,
+        header = {
+            "protocol": "manager-cli-enrollment.header.v1",
+            "enrollment_id": enrollment_id,
+            "ssh": ssh,
+            "pinned_address": str(pinned),
+        }
+        client = _connect_manager(manager_socket, header)
+        ready = _read_object(client, 4096)
+        _validate_ready(ready)
+        profile = TrustedLanHttpProfile(
+            id="cli", allowed_cidrs=["10.0.0.0/8", "fc00::/7"]
+        )
+        argv = build_cli_ssh_argv(
+            executable=executable,
+            pinned_address=pinned,
+            user=user,
+            host=host,
+            port=port,
+            profile=profile,
+            connect_timeout_seconds=connect_timeout_seconds,
+            strict_host_key_checking=ready["host_key_policy"],
+        )
+        request = json.dumps(
+            {
+                "protocol": "manager-enrollment.v1",
+                "manager_id": ready["manager_id"],
+                "enrollment_id": ready["enrollment_id"],
+            },
+            separators=(",", ":"),
+        ).encode()
+        helper_payload = asyncio.run(
+            (runner or CliSshRunner()).run(
+                argv,
+                request,
                 host=host,
+                user=user,
                 port=port,
-                profile=profile,
+                pinned=str(pinned),
+                strict=ready["host_key_policy"],
                 connect_timeout_seconds=connect_timeout_seconds,
-                strict_host_key_checking=ready["host_key_policy"],
+                total_timeout_seconds=total_timeout_seconds,
             )
-            request = json.dumps(
-                {
-                    "protocol": "manager-enrollment.v1",
-                    "manager_id": ready["manager_id"],
-                    "enrollment_id": ready["enrollment_id"],
-                },
-                separators=(",", ":"),
-            ).encode()
-            helper_payload = asyncio.run(
-                (runner or CliSshRunner()).run(
-                    argv,
-                    request,
-                    host=host,
-                    user=user,
-                    port=port,
-                    pinned=str(pinned),
-                    strict=ready["host_key_policy"],
-                    connect_timeout_seconds=connect_timeout_seconds,
-                    total_timeout_seconds=total_timeout_seconds,
-                )
-            )
-            helper = parse_response(helper_payload)
-            _send_object(
-                client,
+        )
+        helper = parse_response(helper_payload)
+        result_frame = (
+            json.dumps(
                 {
                     "protocol": "manager-cli-enrollment.result.v1",
                     "input_fingerprint": ready["input_fingerprint"],
                     "nonce": ready["nonce"],
                     "helper": helper.model_dump(mode="json"),
                 },
-            )
-            client.shutdown(socket.SHUT_WR)
-            response = _read_object(client, 4096)
-            if response.get("status") != "verified":
-                raise CliEnrollmentError("enrollment_rejected")
+                separators=(",", ":"),
+            ).encode()
+            + b"\n"
+        )
+        del helper_payload, helper
+        _submit_result_with_resume(
+            client=client,
+            manager_socket=manager_socket,
+            initial_header=header,
+            ready=ready,
+            result_frame=result_frame,
+            total_timeout_seconds=total_timeout_seconds,
+        )
+        client = None
         stdout.write("Enrollment verified.\n")
         stdout.flush()
         return 0
@@ -215,6 +213,9 @@ def run_cli_enrollment(
         stderr.write("ic-env-guardctl: enrollment failed\n")
         stderr.flush()
         return 1
+    finally:
+        if client is not None:
+            client.close()
 
 
 async def _run_cli_ssh(
@@ -318,6 +319,95 @@ def _resolve_cli_address(host: str, port: int) -> IPv4Address | IPv6Address:
 
 def _send_object(client: socket.socket, value: dict[str, object]) -> None:
     client.sendall(json.dumps(value, separators=(",", ":")).encode() + b"\n")
+
+
+def _connect_manager(
+    manager_socket: Path, header: dict[str, object]
+) -> socket.socket:
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.settimeout(3)
+        client.connect(str(manager_socket))
+        _send_object(client, header)
+        return client
+    except BaseException:
+        client.close()
+        raise
+
+
+def _validate_ready(
+    ready: dict[str, object], *, expected: dict[str, object] | None = None
+) -> None:
+    if set(ready) != {
+        "protocol",
+        "manager_id",
+        "enrollment_id",
+        "input_fingerprint",
+        "nonce",
+        "expires_at",
+        "host_key_policy",
+    } or ready.get("protocol") != "manager-cli-enrollment.ready.v1":
+        raise CliEnrollmentError("enrollment_rejected")
+    if expected is not None and ready != expected:
+        raise CliEnrollmentError("enrollment_rejected")
+
+
+def _submit_result_with_resume(
+    *,
+    client: socket.socket,
+    manager_socket: Path,
+    initial_header: dict[str, object],
+    ready: dict[str, object],
+    result_frame: bytes,
+    total_timeout_seconds: float,
+) -> None:
+    try:
+        expires_at = datetime.fromisoformat(str(ready["expires_at"]).replace("Z", "+00:00"))
+        if expires_at.tzinfo is None:
+            raise ValueError
+    except (TypeError, ValueError):
+        client.close()
+        raise CliEnrollmentError("enrollment_rejected") from None
+    deadline = min(
+        time.monotonic() + total_timeout_seconds,
+        time.monotonic() + max(0.0, (expires_at - datetime.now(UTC)).total_seconds()),
+    )
+    resume_header = {**initial_header, "resume_nonce": ready["nonce"]}
+    current: socket.socket | None = client
+    for attempt in range(5):
+        try:
+            if current is None:
+                current = _connect_manager(manager_socket, resume_header)
+                response = _read_object(current, 4096)
+                if response.get("protocol") == "manager-cli-enrollment.accepted.v1":
+                    if set(response) != {
+                        "protocol",
+                        "status",
+                        "enrollment_id",
+                    } or response.get("status") != "already_accepted":
+                        raise ValueError("permanent enrollment rejection")
+                    current.close()
+                    return
+                _validate_ready(response, expected=ready)
+            current.sendall(result_frame)
+            current.shutdown(socket.SHUT_WR)
+            response = _read_object(current, 4096)
+            if response.get("status") != "verified":
+                raise ValueError("permanent enrollment rejection")
+            current.close()
+            return
+        except (OSError, CliEnrollmentError):
+            if current is not None:
+                current.close()
+                current = None
+            if attempt == 4 or time.monotonic() >= deadline:
+                raise CliEnrollmentError("enrollment_rejected") from None
+            time.sleep(min(0.1 * (2**attempt), max(0.0, deadline - time.monotonic())))
+        except ValueError:
+            if current is not None:
+                current.close()
+            raise CliEnrollmentError("enrollment_rejected") from None
+    raise CliEnrollmentError("enrollment_rejected")
 
 
 def _read_object(client: socket.socket, limit: int) -> dict[str, object]:

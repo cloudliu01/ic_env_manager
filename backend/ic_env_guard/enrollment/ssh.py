@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from ic_env_guard.enrollment.service_key import ServiceKeyError
+from ic_env_guard.enrollment.service_key import (
+    ServiceKeyError,
+    ServiceKeyPolicy,
+    validate_service_key_snapshot,
+)
 from ic_env_guard.enrollment.ssh_config import (
     MAX_EFFECTIVE_CONFIG_BYTES,
     SshConfigError,
@@ -100,6 +104,7 @@ class SshEnrollmentAdapter:
         user_known_hosts_file: Path | None = None,
         identity_file: Path | None = None,
         identity_policy_validator: Callable[[], None] | None = None,
+        service_key_policy: ServiceKeyPolicy | None = None,
         executable_validator: Callable[[Path], ExecutableIdentity] | None = None,
     ) -> None:
         self._target_policy = target_policy
@@ -111,6 +116,12 @@ class SshEnrollmentAdapter:
         self._user_known_hosts_file = user_known_hosts_file
         self._identity_file = identity_file
         self._identity_policy_validator = identity_policy_validator
+        self._service_key_policy = service_key_policy
+        if service_key_policy is not None and (
+            identity_file != service_key_policy.identity_file
+            or user_known_hosts_file != service_key_policy.known_hosts_file
+        ):
+            raise ValueError("service key policy paths do not match adapter paths")
         self._executable_validator = executable_validator or _validate_executable
         self._executable_identity: ExecutableIdentity | None = None
         self.healthy = False
@@ -121,9 +132,7 @@ class SshEnrollmentAdapter:
             if self._identity_policy_validator is not None:
                 self._identity_policy_validator()
             self._executable_identity = self._executable_validator(self._executable)
-            known_hosts_file = _validate_user_known_hosts_file(
-                self._user_known_hosts_file
-            )
+            known_hosts_file = self._validated_known_hosts_file()
             profile = TrustedLanHttpProfile(
                 id="ssh-runtime-check", allowed_cidrs=["10.0.0.0/8"]
             )
@@ -215,9 +224,7 @@ class SshEnrollmentAdapter:
                 http_target,
                 pinned_address=pinned_address,
             )
-            known_hosts_file = _validate_user_known_hosts_file(
-                self._user_known_hosts_file
-            )
+            known_hosts_file = self._validated_known_hosts_file()
             actual = build_ssh_argv(
                 executable=self._executable,
                 pinned_address=pinned_address,
@@ -282,7 +289,7 @@ class SshEnrollmentAdapter:
                 stderr_limit=MAX_HELPER_STDERR_BYTES,
                 timeout=self._total_timeout_seconds,
             )
-        except OSError:
+        except (OSError, ServiceKeyError):
             self.healthy = False
             raise SshEnrollmentError("ssh_unavailable") from None
         except (_StreamLimitExceeded, _ProcessTimedOut):
@@ -294,8 +301,9 @@ class SshEnrollmentAdapter:
                 _classify_failure(stderr), dispatch_state="dispatched"
             )
         try:
-            _validate_user_known_hosts_file(known_hosts_file)
-        except OSError:
+            if self._validated_known_hosts_file() != known_hosts_file:
+                raise OSError
+        except (OSError, ServiceKeyError):
             self.healthy = False
             raise SshEnrollmentError(
                 "ssh_unavailable", dispatch_state="dispatched"
@@ -321,6 +329,8 @@ class SshEnrollmentAdapter:
         stderr_limit: int,
         timeout: float,
     ) -> tuple[bytes, bytes, int]:
+        if self._service_key_policy is not None:
+            validate_service_key_snapshot(self._service_key_policy)
         if (
             self._executable_identity is None
             or self._executable_validator(self._executable)
@@ -374,6 +384,12 @@ class SshEnrollmentAdapter:
                 # pipes/tasks are already drained and awaited at this point.
                 process._transport.close()  # type: ignore[attr-defined]
                 await asyncio.sleep(0)
+
+    def _validated_known_hosts_file(self) -> Path:
+        if self._service_key_policy is not None:
+            validate_service_key_snapshot(self._service_key_policy)
+            return self._service_key_policy.known_hosts_file
+        return _validate_user_known_hosts_file(self._user_known_hosts_file)
 
     async def _stop_process(self, process: asyncio.subprocess.Process) -> None:
         if process.returncode is not None:

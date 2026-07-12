@@ -124,3 +124,8 @@ class EnrollmentJob:
     recovery_lease_until: datetime | None = None
     recovery_revision: int = 0
     validated_http_address: str | None = None
+    cli_resume_nonce: str | None = None
+    cli_peer_uid: int | None = None
+    cli_input_fingerprint: str | None = None
+    cli_pinned_address: str | None = None
+    cli_accept_receipt: str | None = None

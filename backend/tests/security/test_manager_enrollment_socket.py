@@ -35,14 +35,15 @@ class Orchestrator:
             target=SimpleNamespace(profile=VerifiedTlsProfile(id="tls")),
             input_fingerprint="f" * 64,
             nonce="nonce-1",
+            already_accepted=kwargs.get("resume_nonce") == "nonce-1",
         )
 
     async def complete_cli_submission(self, claim, **kwargs):
         self.completes.append((claim, kwargs))
         return SimpleNamespace(job=claim.job)
 
-    def abort_cli_submission(self, claim, code):
-        self.aborts.append((claim, code))
+    def release_cli_connection(self, claim, *, result_received, code):
+        self.aborts.append((claim, result_received, code))
 
 
 @pytest.fixture
@@ -185,3 +186,67 @@ async def test_manager_socket_parent_fails_closed(tmp_path, problem):
 
     with pytest.raises(ManagerSocketError, match="parent is unsafe"):
         await server.start()
+
+
+@pytest.mark.security
+def test_manager_socket_group_authorization_uses_primary_gid_only(tmp_path):
+    primary = ManagerEnrollmentSocket(
+        path=tmp_path / "primary.sock",
+        mode=0o660,
+        orchestrator=Orchestrator(),
+        allowed_uid=501,
+        allowed_gid=700,
+        peer_credentials=lambda _socket: (123, 999, 700),
+    )
+    supplementary_only = ManagerEnrollmentSocket(
+        path=tmp_path / "supplementary.sock",
+        mode=0o660,
+        orchestrator=Orchestrator(),
+        allowed_uid=501,
+        allowed_gid=700,
+        peer_credentials=lambda _socket: (123, 999, 701),
+    )
+
+    assert primary._authorize_peer(object()) is True
+    assert supplementary_only._authorize_peer(object()) is False
+
+
+@pytest.mark.security
+async def test_manager_socket_resume_returns_accepted_before_reading_result(socket_dir):
+    orchestrator = Orchestrator()
+    server = ManagerEnrollmentSocket(
+        path=socket_dir / "accepted.sock",
+        mode=0o600,
+        orchestrator=orchestrator,
+        allowed_uid=os.geteuid(),
+        peer_authorizer=lambda _socket: True,
+    )
+    await server.start()
+    try:
+        reader, writer = await asyncio.open_unix_connection(server.path)
+        writer.write(
+            json.dumps(
+                {
+                    "protocol": "manager-cli-enrollment.header.v1",
+                    "enrollment_id": "enrollment-1",
+                    "ssh": "edaops@agent.example:2222",
+                    "pinned_address": "10.20.30.40",
+                    "resume_nonce": "nonce-1",
+                }
+            ).encode()
+            + b"\n"
+        )
+        await writer.drain()
+
+        assert await _line(reader) == {
+            "protocol": "manager-cli-enrollment.accepted.v1",
+            "status": "already_accepted",
+            "enrollment_id": "enrollment-1",
+        }
+        assert await reader.read() == b""
+        assert orchestrator.completes == []
+        assert orchestrator.aborts[-1][1:] == (True, "already_accepted")
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await server.stop()

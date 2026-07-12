@@ -45,7 +45,7 @@ def ssh_request(**changes):
         "ssh_user": "edaops",
         "ssh_host": "10.20.30.40",
         "ssh_port": 22,
-        "enrollment_method": EnrollmentMethod.SSH_CLI,
+        "enrollment_method": EnrollmentMethod.SSH_AUTO,
     }
     values.update(changes)
     return EnrollmentJobRequest(**values)

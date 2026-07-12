@@ -13,6 +13,7 @@ from ic_env_guard.enrollment.cli import (
     CliEnrollmentError,
     CliSshRunner,
     _resolve_cli_address,
+    _submit_result_with_resume,
     build_cli_ssh_argv,
     parse_ssh_argument,
 )
@@ -145,10 +146,15 @@ def test_guardctl_real_unix_framing_keeps_token_out_of_cli_surfaces(capsys):
                 result = _socket_line(connection)
                 received.append(result)
                 assert connection.recv(1) == b""
-                connection.sendall(b'{"status":"verified"}\n')
             with listener.accept()[0] as connection:
-                received.append(_socket_line(connection))
-                connection.sendall(b'{"error":"replayed_enrollment"}\n')
+                resume = _socket_line(connection)
+                received.append(resume)
+                assert resume["resume_nonce"] == "nonce-1"
+                connection.sendall(
+                    b'{"protocol":"manager-cli-enrollment.accepted.v1",'
+                    b'"status":"already_accepted",'
+                    b'"enrollment_id":"01J2A3B4C5D6E7F8G9H0JKMNPQ"}\n'
+                )
 
     class Runner(CliSshRunner):
         def __init__(self):
@@ -190,7 +196,6 @@ def test_guardctl_real_unix_framing_keeps_token_out_of_cli_surfaces(capsys):
     ]
 
     assert ctl_main(arguments, runner=runner) == 0
-    assert ctl_main(arguments, runner=runner) == 1
     thread.join(2)
     assert not thread.is_alive()
     output = capsys.readouterr()
@@ -201,6 +206,7 @@ def test_guardctl_real_unix_framing_keeps_token_out_of_cli_surfaces(capsys):
     assert token.encode() not in runner.request
     assert received[1]["helper"]["token"] == token
     assert sum(token in json.dumps(value) for value in received) == 1
+    assert received[2]["resume_nonce"] == "nonce-1"
     shutil.rmtree(socket_dir)
 
 
@@ -212,3 +218,61 @@ def _socket_line(connection):
             break
         payload += chunk
     return json.loads(payload)
+
+
+def test_cli_resume_retries_transient_manager_reconnect_failure(monkeypatch, tmp_path):
+    class BrokenResultSocket:
+        def sendall(self, _payload):
+            raise OSError("reply path lost")
+
+        def close(self):
+            return None
+
+    class AcceptedSocket:
+        def close(self):
+            return None
+
+    accepted = AcceptedSocket()
+    attempts = []
+
+    def reconnect(_path, _header):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise OSError("manager restarting")
+        return accepted
+
+    monkeypatch.setattr("ic_env_guard.enrollment.cli._connect_manager", reconnect)
+    monkeypatch.setattr(
+        "ic_env_guard.enrollment.cli._read_object",
+        lambda client, _limit: {
+            "protocol": "manager-cli-enrollment.accepted.v1",
+            "status": "already_accepted",
+            "enrollment_id": "enrollment-1",
+        }
+        if client is accepted
+        else {},
+    )
+
+    _submit_result_with_resume(
+        client=BrokenResultSocket(),
+        manager_socket=tmp_path / "manager.sock",
+        initial_header={
+            "protocol": "manager-cli-enrollment.header.v1",
+            "enrollment_id": "enrollment-1",
+            "ssh": "edaops@10.20.30.40",
+            "pinned_address": "10.20.30.40",
+        },
+        ready={
+            "protocol": "manager-cli-enrollment.ready.v1",
+            "manager_id": "11111111-1111-4111-8111-111111111111",
+            "enrollment_id": "enrollment-1",
+            "input_fingerprint": "f" * 64,
+            "nonce": "22222222-2222-4222-8222-222222222222",
+            "expires_at": (datetime.now(UTC) + timedelta(minutes=1)).isoformat(),
+            "host_key_policy": "ask",
+        },
+        result_frame=b"secret-result-once\n",
+        total_timeout_seconds=2,
+    )
+
+    assert len(attempts) == 2

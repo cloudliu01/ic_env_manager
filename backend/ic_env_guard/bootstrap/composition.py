@@ -41,7 +41,6 @@ from ic_env_guard.enrollment.service import EnrollmentService
 from ic_env_guard.enrollment.service_key import (
     ServiceKeyError,
     validate_service_key_files,
-    validate_service_key_snapshot,
 )
 from ic_env_guard.enrollment.socket_server import EnrollmentSocketServer
 from ic_env_guard.enrollment.ssh import SshEnrollmentAdapter
@@ -361,9 +360,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
                     total_timeout_seconds=config.enrollment.ssh_total_timeout_seconds,
                     user_known_hosts_file=service_key.known_hosts_file,
                     identity_file=service_key.identity_file,
-                    identity_policy_validator=lambda: validate_service_key_snapshot(
-                        service_key
-                    ),
+                    service_key_policy=service_key,
                 )
         enrollment_agent_client = EnrollmentAgentClient(
             target_policy=target_policy,
