@@ -2,6 +2,9 @@ import os
 import re
 import secrets
 import stat
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Protocol
 
@@ -15,7 +18,7 @@ class RegistryCredentialReferences(Protocol):
 
 
 class JournalCredentialReferences(Protocol):
-    def non_terminal_credential_references(self) -> set[str]: ...
+    def recovery_credential_references(self) -> set[str]: ...
 
 
 _REFERENCE = re.compile(r"^[0-9a-f]{48}$")
@@ -23,76 +26,102 @@ _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 
 
+class CredentialLifecycleCoordinator:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+
+    @contextmanager
+    def exclusive_lease(self) -> Iterator[None]:
+        with self._lock:
+            yield
+
+
 class CredentialStore:
-    def __init__(self, directory: Path) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        *,
+        coordinator: CredentialLifecycleCoordinator | None = None,
+    ) -> None:
         self.directory = Path(directory)
+        self._coordinator = coordinator or CredentialLifecycleCoordinator()
+        created = False
         try:
             self.directory.lstat()
         except FileNotFoundError:
             try:
                 self.directory.mkdir(mode=0o700, parents=True)
                 self.directory.chmod(0o700)
+                created = True
             except OSError as exc:
                 raise CredentialStoreError("credential directory is unavailable") from exc
         self._validate_directory()
+        if created:
+            self._fsync_parent_entry()
+
+    def lifecycle_lease(self) -> Iterator[None]:
+        return self._coordinator.exclusive_lease()
 
     def put(self, secret: bytes) -> str:
         self._validate_secret(secret)
-        for _ in range(8):
-            reference = secrets.token_hex(24)
-            target = self.directory / reference
-            if not target.exists():
-                self._publish(target, secret)
-                return reference
+        with self._coordinator.exclusive_lease():
+            for _ in range(8):
+                reference = secrets.token_hex(24)
+                if self._publish_new(self.directory / reference, secret):
+                    return reference
         raise CredentialStoreError("could not allocate a credential reference")
 
     def read(self, reference: str) -> bytes:
-        path = self._path(reference)
-        fd = self._open_validated(path)
-        try:
-            chunks = []
-            while chunk := os.read(fd, 65536):
-                chunks.append(chunk)
-            return b"".join(chunks)
-        except OSError as exc:
-            raise CredentialStoreError("credential could not be read") from exc
-        finally:
-            os.close(fd)
+        with self._coordinator.exclusive_lease():
+            path = self._path(reference)
+            fd = self._open_validated(path)
+            try:
+                chunks = []
+                while chunk := os.read(fd, 65536):
+                    chunks.append(chunk)
+                return b"".join(chunks)
+            except OSError as exc:
+                raise CredentialStoreError("credential could not be read") from exc
+            finally:
+                os.close(fd)
 
     def replace(self, reference: str, secret: bytes) -> None:
         self._validate_secret(secret)
-        path = self._path(reference)
-        fd = self._open_validated(path)
-        os.close(fd)
-        self._publish(path, secret)
+        with self._coordinator.exclusive_lease():
+            path = self._path(reference)
+            fd = self._open_validated(path)
+            os.close(fd)
+            self._publish_replace(path, secret)
 
     def delete(self, reference: str) -> None:
-        path = self._path(reference)
-        fd = self._open_validated(path)
-        os.close(fd)
-        try:
-            path.unlink()
-            self._fsync_directory()
-        except OSError as exc:
-            raise CredentialStoreError("credential could not be deleted") from exc
+        with self._coordinator.exclusive_lease():
+            path = self._path(reference)
+            fd = self._open_validated(path)
+            os.close(fd)
+            try:
+                path.unlink()
+                self._fsync_directory()
+            except OSError as exc:
+                raise CredentialStoreError("credential could not be deleted") from exc
 
     def cleanup_orphans(
         self,
         registry: RegistryCredentialReferences,
         journal: JournalCredentialReferences,
     ) -> tuple[dict[str, str], ...]:
-        retained = registry.credential_references()
-        retained.update(journal.non_terminal_credential_references())
-        findings: list[dict[str, str]] = []
-        for entry in sorted(self.directory.iterdir(), key=lambda path: path.name):
-            if not _REFERENCE.fullmatch(entry.name):
-                findings.append({"entry": "unrecognized", "action": "retained"})
-                continue
-            if entry.name in retained:
-                continue
-            self.delete(entry.name)
-            findings.append({"reference": entry.name, "action": "deleted"})
-        return tuple(findings)
+        with self._coordinator.exclusive_lease():
+            retained = registry.credential_references()
+            retained.update(journal.recovery_credential_references())
+            findings: list[dict[str, str]] = []
+            for entry in sorted(self.directory.iterdir(), key=lambda path: path.name):
+                if not _REFERENCE.fullmatch(entry.name):
+                    findings.append({"entry": "unrecognized", "action": "retained"})
+                    continue
+                if entry.name in retained:
+                    continue
+                self.delete(entry.name)
+                findings.append({"entry": "credential", "action": "deleted"})
+            return tuple(findings)
 
     def resolve_for_test(self, reference: str) -> Path:
         return self._path(reference)
@@ -146,7 +175,7 @@ class CredentialStore:
             os.close(fd)
             raise
 
-    def _publish(self, target: Path, secret: bytes) -> None:
+    def _write_temporary(self, secret: bytes) -> Path:
         temporary = self.directory / f".tmp-{secrets.token_hex(24)}"
         fd = -1
         try:
@@ -165,13 +194,46 @@ class CredentialStore:
             os.fsync(fd)
             os.close(fd)
             fd = -1
+            return temporary
+        except OSError as exc:
+            if fd >= 0:
+                os.close(fd)
+                fd = -1
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            raise CredentialStoreError("credential could not be published") from exc
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+    def _publish_new(self, target: Path, secret: bytes) -> bool:
+        temporary = self._write_temporary(secret)
+        try:
+            try:
+                os.link(temporary, target, follow_symlinks=False)
+            except FileExistsError:
+                return False
+            temporary.unlink()
+            self._fsync_directory()
+            return True
+        except OSError as exc:
+            raise CredentialStoreError("credential could not be published") from exc
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _publish_replace(self, target: Path, secret: bytes) -> None:
+        temporary = self._write_temporary(secret)
+        try:
             os.replace(temporary, target)
             self._fsync_directory()
         except OSError as exc:
             raise CredentialStoreError("credential could not be published") from exc
         finally:
-            if fd >= 0:
-                os.close(fd)
             try:
                 temporary.unlink()
             except FileNotFoundError:
@@ -186,3 +248,22 @@ class CredentialStore:
                 os.close(fd)
         except OSError as exc:
             raise CredentialStoreError("credential directory could not be synchronized") from exc
+
+    def _fsync_parent_entry(self) -> None:
+        parent = self.directory.parent
+        try:
+            before = parent.lstat()
+            if not stat.S_ISDIR(before.st_mode):
+                raise OSError("parent is not a real directory")
+            fd = os.open(parent, os.O_RDONLY | _DIRECTORY | _NOFOLLOW)
+            try:
+                metadata = os.fstat(fd)
+                if (metadata.st_dev, metadata.st_ino) != (before.st_dev, before.st_ino):
+                    raise OSError("parent changed during access")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            raise CredentialStoreError(
+                "credential directory entry could not be synchronized"
+            ) from exc

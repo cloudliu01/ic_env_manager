@@ -104,6 +104,12 @@ def test_fleet_registry_migration_has_exact_control_plane_tables(tmp_path):
             )
             assert actual == columns
 
+        enrollment_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_enrollment_jobs'"
+        ).fetchone()[0]
+        assert "'consumed'" in enrollment_sql
+        assert "'completed'" not in enrollment_sql
+
         agent_indexes = {
             tuple(
                 column[2]

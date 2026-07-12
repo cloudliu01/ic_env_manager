@@ -44,7 +44,12 @@ class EnrollmentJournalRepository(Protocol):
     def get(self, enrollment_id: str) -> EnrollmentJob | None: ...
 
     def set_state(
-        self, enrollment_id: str, state: EnrollmentState, updated_at: datetime
+        self,
+        enrollment_id: str,
+        state: EnrollmentState,
+        updated_at: datetime,
+        *,
+        expected_state: EnrollmentState,
     ) -> None: ...
 
-    def non_terminal_credential_references(self) -> set[str]: ...
+    def recovery_credential_references(self) -> set[str]: ...

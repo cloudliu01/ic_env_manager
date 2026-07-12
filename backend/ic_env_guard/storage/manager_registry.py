@@ -1,10 +1,13 @@
 import json
+import math
+import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from sqlalchemy import Engine
@@ -31,6 +34,9 @@ _STATUS_COLUMNS = (
     "agent_id, target_revision, connection_status, workload_status, observed_at, stale_after, "
     "api_version, agent_version, capabilities_json, summary_json, last_error_code, updated_at"
 )
+_CREDENTIAL_REF = re.compile(r"^[0-9a-f]{48}$")
+_CONNECTION_STATUSES = {"disabled", "unknown", "ready", "degraded", "unavailable"}
+_WORKLOAD_STATUSES = {"unknown", "healthy", "warning", "critical", "stale"}
 
 
 def _format_time(value: datetime | None) -> str | None:
@@ -45,6 +51,82 @@ def _parse_time(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value.replace("Z", "+00:00")) if value is not None else None
 
 
+def _canonical_endpoint(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise RegistryInvariantError("invalid normalized endpoint") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RegistryInvariantError("invalid normalized endpoint")
+    try:
+        hostname = parsed.hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise RegistryInvariantError("invalid normalized endpoint hostname") from exc
+    rendered_host = f"[{hostname}]" if ":" in hostname else hostname
+    return f"{parsed.scheme}://{rendered_host}:{port}"
+
+
+def _validate_json_value(value: Any, *, depth: int = 0, seen: set[int] | None = None) -> None:
+    if depth > 32:
+        raise RegistryInvariantError("summary JSON is too deeply nested")
+    if value is None or isinstance(value, (bool, str, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise RegistryInvariantError("summary JSON contains a non-finite number")
+        return
+    if isinstance(value, (dict, list)):
+        identity = id(value)
+        active = seen if seen is not None else set()
+        if identity in active:
+            raise RegistryInvariantError("summary JSON contains a cycle")
+        active.add(identity)
+        try:
+            if isinstance(value, dict):
+                if any(not isinstance(key, str) for key in value):
+                    raise RegistryInvariantError("summary JSON object keys must be strings")
+                for child in value.values():
+                    _validate_json_value(child, depth=depth + 1, seen=active)
+            else:
+                for child in value:
+                    _validate_json_value(child, depth=depth + 1, seen=active)
+        finally:
+            active.remove(identity)
+        return
+    raise RegistryInvariantError("summary contains an unsupported JSON value")
+
+
+def _serialize_json(value: Any) -> str:
+    _validate_json_value(value)
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise RegistryInvariantError("summary JSON could not be serialized") from exc
+
+
+def _load_json(value: str) -> Any:
+    try:
+        loaded = json.loads(
+            value,
+            parse_constant=lambda _constant: (_ for _ in ()).throw(
+                ValueError("non-finite JSON constant")
+            ),
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RegistryError("stored agent status JSON is invalid") from exc
+    _validate_json_value(loaded)
+    return loaded
+
+
 def _validate_record(record: AgentRecord) -> None:
     required = (
         record.agent_id,
@@ -55,6 +137,10 @@ def _validate_record(record: AgentRecord) -> None:
     )
     if any(not value or not value.strip() for value in required):
         raise RegistryInvariantError("agent fields must not be empty")
+    if not _CREDENTIAL_REF.fullmatch(record.credential_ref):
+        raise RegistryInvariantError("invalid credential reference")
+    if record.normalized_endpoint != _canonical_endpoint(record.normalized_endpoint):
+        raise RegistryInvariantError("agent endpoint is not canonical")
     if record.revision < 1:
         raise RegistryInvariantError("agent revision must be positive")
     if record.source not in {"config_import", "manual", "discovery"}:
@@ -257,10 +343,14 @@ class AgentStatusRepository(_SQLiteRepository):
     ) -> bool:
         if observation.target_revision != expected_revision or expected_revision < 1:
             raise RegistryInvariantError("status target revision is inconsistent")
-        capabilities = json.dumps(
-            list(observation.capabilities), sort_keys=True, separators=(",", ":")
-        )
-        summary = json.dumps(observation.summary, sort_keys=True, separators=(",", ":"))
+        if observation.connection_status not in _CONNECTION_STATUSES:
+            raise RegistryInvariantError("invalid connection status")
+        if observation.workload_status not in _WORKLOAD_STATUSES:
+            raise RegistryInvariantError("invalid workload status")
+        if any(not isinstance(value, str) or not value for value in observation.capabilities):
+            raise RegistryInvariantError("invalid Agent capability")
+        capabilities = _serialize_json(list(observation.capabilities))
+        summary = _serialize_json(observation.summary)
         try:
             with self._write() as connection:
                 current = connection.execute(
@@ -301,8 +391,8 @@ class AgentStatusRepository(_SQLiteRepository):
 
     @staticmethod
     def _record(row: Any) -> AgentStatus:
-        capabilities = json.loads(row[8])
-        summary = json.loads(row[9])
+        capabilities = _load_json(row[8])
+        summary = _load_json(row[9])
         if not isinstance(capabilities, list) or not all(
             isinstance(value, str) for value in capabilities
         ):

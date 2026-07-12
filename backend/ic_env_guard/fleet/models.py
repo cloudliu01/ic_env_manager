@@ -36,7 +36,7 @@ class EnrollmentState(str, Enum):
     VERIFIED = "verified"
     ACTIVATION_REQUESTED = "activation_requested"
     ACTIVATED = "activated"
-    COMPLETED = "completed"
+    CONSUMED = "consumed"
     CANCELLED = "cancelled"
     FAILED = "failed"
     EXPIRED = "expired"
@@ -44,7 +44,7 @@ class EnrollmentState(str, Enum):
     @property
     def terminal(self) -> bool:
         return self in {
-            EnrollmentState.COMPLETED,
+            EnrollmentState.CONSUMED,
             EnrollmentState.CANCELLED,
             EnrollmentState.FAILED,
             EnrollmentState.EXPIRED,

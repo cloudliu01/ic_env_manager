@@ -14,6 +14,7 @@ from ic_env_guard.fleet.models import (
     RegistryConflict,
     RegistryError,
     RegistryInvariantError,
+    RevisionConflict,
 )
 from ic_env_guard.storage.manager_registry import _format_time, _parse_time, _SQLiteRepository
 
@@ -26,6 +27,50 @@ _COLUMNS = (
 )
 _ENROLLMENT_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _CREDENTIAL_REF = re.compile(r"^[0-9a-f]{48}$")
+_ALLOWED_TRANSITIONS = {
+    EnrollmentState.PENDING: {
+        EnrollmentState.RUNNING,
+        EnrollmentState.AWAITING_CLI,
+        EnrollmentState.CANCELLED,
+        EnrollmentState.EXPIRED,
+    },
+    EnrollmentState.RUNNING: {
+        EnrollmentState.AWAITING_CLI,
+        EnrollmentState.CREDENTIAL_ISSUED,
+        EnrollmentState.CANCELLED,
+        EnrollmentState.FAILED,
+        EnrollmentState.EXPIRED,
+    },
+    EnrollmentState.AWAITING_CLI: {
+        EnrollmentState.CREDENTIAL_ISSUED,
+        EnrollmentState.CANCELLED,
+        EnrollmentState.FAILED,
+        EnrollmentState.EXPIRED,
+    },
+    EnrollmentState.CREDENTIAL_ISSUED: {
+        EnrollmentState.VERIFYING,
+        EnrollmentState.CANCELLED,
+        EnrollmentState.EXPIRED,
+    },
+    EnrollmentState.VERIFYING: {
+        EnrollmentState.VERIFIED,
+        EnrollmentState.FAILED,
+        EnrollmentState.EXPIRED,
+    },
+    EnrollmentState.VERIFIED: {
+        EnrollmentState.ACTIVATION_REQUESTED,
+        EnrollmentState.CANCELLED,
+        EnrollmentState.EXPIRED,
+    },
+    EnrollmentState.ACTIVATION_REQUESTED: {
+        EnrollmentState.ACTIVATED,
+        EnrollmentState.FAILED,
+    },
+    EnrollmentState.ACTIVATED: {
+        EnrollmentState.CONSUMED,
+        EnrollmentState.FAILED,
+    },
+}
 
 
 def _validate_job(job: EnrollmentJob) -> None:
@@ -120,35 +165,47 @@ class EnrollmentJournalRepository(_SQLiteRepository):
             raise RegistryError("enrollment journal storage is unavailable") from exc
 
     def set_state(
-        self, enrollment_id: str, state: EnrollmentState, updated_at: datetime
+        self,
+        enrollment_id: str,
+        state: EnrollmentState,
+        updated_at: datetime,
+        *,
+        expected_state: EnrollmentState,
     ) -> None:
+        if state not in _ALLOWED_TRANSITIONS.get(expected_state, set()):
+            raise RegistryInvariantError("invalid enrollment state transition")
         try:
             with self._write() as connection:
                 cursor = connection.execute(
                     "UPDATE agent_enrollment_jobs SET state=?, updated_at=? "
-                    "WHERE enrollment_id=?",
-                    (state.value, _format_time(updated_at), enrollment_id),
+                    "WHERE enrollment_id=? AND state=?",
+                    (
+                        state.value,
+                        _format_time(updated_at),
+                        enrollment_id,
+                        expected_state.value,
+                    ),
                 )
                 if cursor.rowcount != 1:
-                    raise RegistryConflict("enrollment job does not exist")
-        except RegistryConflict:
+                    raise RevisionConflict("enrollment state changed")
+        except RevisionConflict:
             raise
         except (SQLAlchemyError, sqlite3.Error) as exc:
             raise RegistryError("enrollment journal storage is unavailable") from exc
 
-    def non_terminal_credential_references(self) -> set[str]:
-        terminal = tuple(state.value for state in EnrollmentState if state.terminal)
-        placeholders = ",".join("?" * len(terminal))
+    def recovery_credential_references(self) -> set[str]:
         try:
             with self.engine.connect() as connection:
                 rows = connection.exec_driver_sql(
                     "SELECT credential_temp_ref, old_credential_ref "
-                    f"FROM agent_enrollment_jobs WHERE state NOT IN ({placeholders})",
-                    terminal,
+                    "FROM agent_enrollment_jobs",
                 ).fetchall()
             return {value for row in rows for value in row if value is not None}
         except (SQLAlchemyError, sqlite3.Error) as exc:
             raise RegistryError("enrollment journal storage is unavailable") from exc
+
+    def non_terminal_credential_references(self) -> set[str]:
+        return self.recovery_credential_references()
 
     @staticmethod
     def _values(job: EnrollmentJob) -> tuple[Any, ...]:

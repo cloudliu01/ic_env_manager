@@ -1,10 +1,15 @@
 import os
 import stat
+import threading
 from pathlib import Path
 
 import pytest
 
-from ic_env_guard.enrollment.credential_store import CredentialStore, CredentialStoreError
+from ic_env_guard.enrollment.credential_store import (
+    CredentialLifecycleCoordinator,
+    CredentialStore,
+    CredentialStoreError,
+)
 
 
 class References:
@@ -19,7 +24,7 @@ class JournalReferences:
     def __init__(self, values=()):
         self.values = set(values)
 
-    def non_terminal_credential_references(self):
+    def recovery_credential_references(self):
         return set(self.values)
 
 
@@ -45,6 +50,78 @@ def test_credential_store_creates_owner_only_atomic_file(tmp_path, monkeypatch):
     assert store.read(reference) == b"manager-token"
     assert len(fsync_calls) >= 2
     assert not tuple(directory.glob(".tmp-*"))
+
+
+@pytest.mark.unit
+def test_put_never_replaces_same_reference_under_concurrency(tmp_path, monkeypatch):
+    store = CredentialStore(tmp_path / "credentials")
+    local = threading.local()
+
+    def deterministic_token(_size):
+        count = getattr(local, "count", 0)
+        local.count = count + 1
+        return "a" * 48 if count % 2 == 0 else f"{threading.get_ident():048x}"[-48:]
+
+    monkeypatch.setattr(
+        "ic_env_guard.enrollment.credential_store.secrets.token_hex", deterministic_token
+    )
+    barrier = threading.Barrier(2)
+    results = []
+
+    def publish(value):
+        barrier.wait()
+        try:
+            results.append(("ok", store.put(value)))
+        except CredentialStoreError:
+            results.append(("error", None))
+
+    threads = [
+        threading.Thread(target=publish, args=(b"first",)),
+        threading.Thread(target=publish, args=(b"second",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(result[0] for result in results) == ["error", "ok"]
+    assert store.read("a" * 48) in {b"first", b"second"}
+
+
+@pytest.mark.unit
+def test_put_retries_destination_collision_without_overwrite(tmp_path, monkeypatch):
+    store = CredentialStore(tmp_path / "credentials")
+    existing = store.put(b"existing")
+    replacement = "b" * 48
+    values = iter((existing, "c" * 48, replacement, "d" * 48))
+    monkeypatch.setattr(
+        "ic_env_guard.enrollment.credential_store.secrets.token_hex", lambda _size: next(values)
+    )
+
+    created = store.put(b"new")
+
+    assert created == replacement
+    assert store.read(existing) == b"existing"
+    assert store.read(replacement) == b"new"
+
+
+@pytest.mark.unit
+def test_new_credential_directory_parent_fsync_failure_is_mapped(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "fsync", lambda _fd: (_ for _ in ()).throw(OSError("fsync")))
+
+    with pytest.raises(CredentialStoreError, match="directory entry"):
+        CredentialStore(tmp_path / "credentials")
+
+
+@pytest.mark.unit
+def test_put_fsync_failure_removes_unpublished_temporary_file(tmp_path, monkeypatch):
+    store = CredentialStore(tmp_path / "credentials")
+    monkeypatch.setattr(os, "fsync", lambda _fd: (_ for _ in ()).throw(OSError("fsync")))
+
+    with pytest.raises(CredentialStoreError, match="could not be published"):
+        store.put(b"secret")
+
+    assert tuple(store.directory.iterdir()) == ()
 
 
 @pytest.mark.unit
@@ -164,8 +241,48 @@ def test_orphan_cleanup_preserves_registry_and_nonterminal_journal_references(tm
         References({registered}), JournalReferences({recovering})
     )
 
-    assert findings == ({"reference": orphan, "action": "deleted"},)
+    assert findings == ({"entry": "credential", "action": "deleted"},)
+    assert orphan not in repr(findings)
     assert store.read(registered) == b"registered"
     assert store.read(recovering) == b"recovering"
     with pytest.raises(CredentialStoreError, match="not found"):
         store.read(orphan)
+
+
+@pytest.mark.unit
+def test_cleanup_cannot_interleave_between_publish_and_journal_commit(tmp_path):
+    coordinator = CredentialLifecycleCoordinator()
+    store = CredentialStore(tmp_path / "credentials", coordinator=coordinator)
+    registry = References()
+    journal = JournalReferences()
+    published = threading.Event()
+    release = threading.Event()
+    cleanup_finished = threading.Event()
+    result = {}
+
+    def mutation():
+        with store.lifecycle_lease():
+            reference = store.put(b"recoverable")
+            result["reference"] = reference
+            published.set()
+            release.wait(timeout=2)
+            journal.values.add(reference)
+
+    cleanup_result = []
+
+    def cleanup():
+        cleanup_result.extend(store.cleanup_orphans(registry, journal))
+        cleanup_finished.set()
+
+    mutation_thread = threading.Thread(target=mutation)
+    mutation_thread.start()
+    assert published.wait(timeout=2)
+    cleanup_thread = threading.Thread(target=cleanup)
+    cleanup_thread.start()
+    assert not cleanup_finished.wait(timeout=0.1)
+    release.set()
+    mutation_thread.join()
+    cleanup_thread.join()
+
+    assert cleanup_result == []
+    assert store.read(result["reference"]) == b"recoverable"

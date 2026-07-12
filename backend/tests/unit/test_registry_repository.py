@@ -120,13 +120,30 @@ def test_registry_requires_identity_except_for_legacy_config_import(repositories
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"credential_ref": "not-a-reference"},
+        {"normalized_endpoint": "HTTPS://Lab-01.Example/"},
+        {"normalized_endpoint": "https://user@lab-01.example:8765"},
+        {"normalized_endpoint": "https://lab-01.example:8765/path"},
+    ),
+)
+def test_registry_rejects_noncanonical_security_fields(repositories, changes):
+    registry, _, _ = repositories
+    with pytest.raises(RegistryInvariantError):
+        registry.create(agent_record(**changes))
+    assert registry.list(AgentQuery()).items == ()
+
+
+@pytest.mark.unit
 def test_status_write_is_bound_to_registry_revision_and_cascades(repositories):
     registry, statuses, _ = repositories
     registry.create(agent_record())
     observation = AgentStatus(
         agent_id="lab-01",
         target_revision=1,
-        connection_status="online",
+        connection_status="ready",
         workload_status="healthy",
         observed_at=NOW,
         stale_after=NOW + timedelta(seconds=45),
@@ -147,6 +164,39 @@ def test_status_write_is_bound_to_registry_revision_and_cascades(repositories):
     assert statuses.get("lab-01") == observation
 
     registry.delete("lab-01")
+    assert statuses.get("lab-01") is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"connection_status": "online"},
+        {"workload_status": "excellent"},
+        {"summary": {"bad": float("nan")}},
+        {"summary": {"bad": object()}},
+        {"summary": {1: "non-string key"}},
+    ),
+)
+def test_status_rejects_invalid_enums_and_unsafe_json(repositories, changes):
+    registry, statuses, _ = repositories
+    registry.create(agent_record())
+    observation = AgentStatus(
+        agent_id="lab-01",
+        target_revision=1,
+        connection_status="ready",
+        workload_status="healthy",
+        observed_at=NOW,
+        stale_after=NOW + timedelta(seconds=45),
+        api_version="v2",
+        agent_version="0.1.0",
+        capabilities=("summary.v2",),
+        summary={},
+        last_error_code=None,
+        updated_at=NOW,
+    )
+    with pytest.raises(RegistryInvariantError):
+        statuses.update_if_target_revision(replace(observation, **changes), expected_revision=1)
     assert statuses.get("lab-01") is None
 
 
@@ -207,5 +257,60 @@ def test_enrollment_journal_enforces_method_and_recovery_invariants(repositories
     assert journal.get(valid.enrollment_id) == valid
     assert journal.non_terminal_credential_references() == {"b" * 48}
 
-    journal.set_state(valid.enrollment_id, EnrollmentState.CANCELLED, NOW + timedelta(seconds=1))
-    assert journal.non_terminal_credential_references() == set()
+    journal.set_state(
+        valid.enrollment_id,
+        EnrollmentState.CANCELLED,
+        NOW + timedelta(seconds=1),
+        expected_state=EnrollmentState.PENDING,
+    )
+    assert journal.recovery_credential_references() == {"b" * 48}
+
+
+@pytest.mark.unit
+def test_enrollment_state_transition_is_compare_and_swap_and_rejects_regression(repositories):
+    _, _, journal = repositories
+    valid = journal.create(enrollment_job())
+
+    with pytest.raises(RevisionConflict):
+        journal.set_state(
+            valid.enrollment_id,
+            EnrollmentState.CREDENTIAL_ISSUED,
+            NOW + timedelta(seconds=1),
+            expected_state=EnrollmentState.RUNNING,
+        )
+    journal.set_state(
+        valid.enrollment_id,
+        EnrollmentState.RUNNING,
+        NOW + timedelta(seconds=1),
+        expected_state=EnrollmentState.PENDING,
+    )
+    with pytest.raises(RegistryInvariantError):
+        journal.set_state(
+            valid.enrollment_id,
+            EnrollmentState.CANCELLED,
+            NOW + timedelta(seconds=2),
+            expected_state=EnrollmentState.ACTIVATED,
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("expected_state", "new_state"),
+    (
+        (EnrollmentState.PENDING, EnrollmentState.FAILED),
+        (EnrollmentState.CREDENTIAL_ISSUED, EnrollmentState.FAILED),
+        (EnrollmentState.VERIFIED, EnrollmentState.FAILED),
+    ),
+)
+def test_enrollment_state_machine_matches_plan_boundaries(
+    repositories, expected_state, new_state
+):
+    _, _, journal = repositories
+    journal.create(enrollment_job())
+    with pytest.raises(RegistryInvariantError):
+        journal.set_state(
+            "enroll-01",
+            new_state,
+            NOW + timedelta(seconds=1),
+            expected_state=expected_state,
+        )
