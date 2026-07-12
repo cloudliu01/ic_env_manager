@@ -1,9 +1,12 @@
 import { cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+// @ts-expect-error Vitest runs tests in Node; the frontend compiler intentionally omits Node types.
+import { readFileSync } from 'node:fs';
 import { App } from '../src/app/App';
 
 const apiRequest = vi.hoisted(() => vi.fn());
+const baseStyles = readFileSync('src/shared/styles/base.css', 'utf8');
 
 vi.mock('../src/shared/api/client', () => ({ apiClient: { request: apiRequest } }));
 
@@ -70,6 +73,22 @@ describe('Fleet table', () => {
     expect(within(row).getByText('Unencrypted')).toBeTruthy();
     expect(within(row).getByText('Last error: agent_network_error')).toBeTruthy();
     expect(within(row).getByLabelText('Degraded status').querySelector('svg')).toBeTruthy();
+  });
+
+  it('uses a 48px dense row contract with independent 44px Open and actions hit targets', async () => {
+    render(<App />);
+
+    const table = await screen.findByRole('table', { name: 'Fleet agents' });
+    const row = within(table).getByRole('row', { name: /Alpha/ });
+    expect(row.classList).toContain('fleet-row');
+    expect(within(row).getByRole('link', { name: 'Open Alpha' }).classList).toContain('fleet-open');
+    expect(within(row).getByRole('button', { name: 'Actions for Alpha' }).classList).toContain('fleet-actions-trigger');
+  });
+
+  it('defines semantic status styles for every emitted connection and workload state', () => {
+    for (const status of ['ready', 'healthy', 'degraded', 'unavailable', 'disabled']) {
+      expect(baseStyles).toContain(`.status-${status}`);
+    }
   });
 
   it('keeps filters in the URL and exposes only non-mutating row entry points', async () => {

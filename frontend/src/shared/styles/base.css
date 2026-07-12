@@ -233,6 +233,84 @@ tbody tr[tabindex]:focus-visible {
   outline-offset: -3px;
 }
 
+.fleet-table .fleet-row > td {
+  height: 48px;
+  padding-top: 0;
+  padding-bottom: 0;
+  white-space: nowrap;
+}
+
+.fleet-agent-cell,
+.fleet-health-cell,
+.fleet-transport-cell,
+.fleet-actions {
+  overflow: hidden;
+}
+
+.fleet-agent-cell,
+.fleet-health-cell,
+.fleet-transport-cell {
+  max-width: 15rem;
+}
+
+.fleet-agent-cell,
+.fleet-health-cell,
+.fleet-transport-cell,
+.fleet-actions {
+  white-space: nowrap;
+}
+
+.fleet-agent-cell .primary-cell,
+.fleet-agent-cell .secondary-cell,
+.fleet-agent-cell .row-last-error,
+.fleet-health-cell .status,
+.fleet-transport-cell .status {
+  display: inline-flex;
+  vertical-align: middle;
+}
+
+.fleet-agent-cell .secondary-cell,
+.row-last-error {
+  margin-left: var(--space-2);
+}
+
+.row-last-error,
+.fleet-transport-cell .data-cell,
+.fleet-cell {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fleet-row .status {
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.fleet-health-cell .status + .status,
+.fleet-transport-cell .status {
+  margin-left: var(--space-1);
+}
+
+.fleet-actions {
+  position: relative;
+  overflow: visible;
+}
+
+.secondary-button.fleet-open,
+.icon-button.fleet-actions-trigger {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+}
+
+.icon-button.fleet-actions-trigger {
+  width: 44px;
+  margin-left: var(--space-1);
+  padding: 0;
+}
+
 .primary-cell,
 .secondary-cell {
   display: block;
@@ -260,13 +338,18 @@ tbody tr[tabindex]:focus-visible {
 }
 
 .status-ok,
-.status-active { color: var(--color-success-text); background: var(--color-success-surface); }
+.status-active,
+.status-ready,
+.status-healthy { color: var(--color-success-text); background: var(--color-success-surface); }
 .status-warning,
 .status-pending,
-.status-stale { color: var(--color-warning-text); background: var(--color-warning-surface); }
+.status-stale,
+.status-degraded { color: var(--color-warning-text); background: var(--color-warning-surface); }
 .status-critical,
-.status-revoked { color: var(--color-danger-text); background: var(--color-danger-surface); }
-.status-unknown { color: var(--color-muted); background: var(--color-neutral-surface); }
+.status-revoked,
+.status-unavailable { color: var(--color-danger-text); background: var(--color-danger-surface); }
+.status-unknown,
+.status-disabled { color: var(--color-muted); background: var(--color-neutral-surface); }
 
 .secondary-button,
 .danger-button,

@@ -11,7 +11,7 @@ const detail = {
   transport_profile_id: 'trusted-lan', transport_warning: 'trusted_lan_http_unencrypted',
   connection_status: 'degraded', workload_status: 'critical', observed_at: '2026-07-12T08:00:00Z',
   agent_version: '2.4.0', capabilities: ['observations.v2'], last_error_code: 'agent_network_error',
-  summary: { observations: { total: 4, critical: 1, warning: 0, stale: 0 }, services: { total: 3, running: 1, unhealthy: 2 } },
+  summary: { observations: { total: 4, critical: 1, warning: 0, stale: 2 }, services: { total: 3, running: 1, unhealthy: 2 } },
 };
 
 function renderManagerAt(path: string) {
@@ -41,6 +41,7 @@ describe('Agent detail shell', () => {
     expect(screen.getAllByText('Critical')).toHaveLength(2);
     expect(screen.getAllByRole('alert').some((alert) => alert.textContent?.includes('Trusted-LAN connection is unencrypted'))).toBe(true);
     expect(screen.getByText('1 critical')).toBeTruthy();
+    expect(screen.getByText('2 stale')).toBeTruthy();
     expect(apiRequest).toHaveBeenCalledWith('/api/v2/agents/agent-a', expect.anything());
   });
 
