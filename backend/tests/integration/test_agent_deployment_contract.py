@@ -103,7 +103,22 @@ def _upgrade_environment(
         "  touch \"$FAIL_ONCE_DIR/install\"\n"
         "  exit 1\n"
         "fi\n"
-        "exec \"$REAL_INSTALL\" \"$@\"\n",
+        "\"$REAL_INSTALL\" \"$@\"\n"
+        "target=${@: -1}\n"
+        "if [[ -n \"${INTERRUPT_AFTER_CREATE_PATH:-}\" "
+        "&& \"$target\" = \"$INTERRUPT_AFTER_CREATE_PATH\" ]]; then\n"
+        "  kill -9 \"$PPID\"; exit 99\n"
+        "fi\n",
+    )
+    _write_executable(
+        fake_bin / "cp",
+        "#!/usr/bin/env bash\n"
+        "/bin/cp \"$@\"\n"
+        "target=${@: -1}\n"
+        "if [[ -n \"${INTERRUPT_AFTER_CREATE_PATH:-}\" "
+        "&& \"$target\" = \"$INTERRUPT_AFTER_CREATE_PATH\" ]]; then\n"
+        "  kill -9 \"$PPID\"; exit 99\n"
+        "fi\n",
     )
     _write_executable(
         fake_bin / "ic-env-guard-config",
@@ -179,6 +194,7 @@ def _upgrade_environment(
             "INTERRUPT_BEFORE_CHMOD": "",
             "INTERRUPT_ON_SYNC_PATH": "",
             "INTERRUPT_AFTER_MV_DEST": "",
+            "INTERRUPT_AFTER_CREATE_PATH": "",
         }
     )
     return environment, root
@@ -638,6 +654,41 @@ def test_existing_user_upgrade_recovers_unit_backup_hard_windows(tmp_path, windo
     assert recovered.returncode == 0, recovered.stdout + recovered.stderr
     assert not backup.exists()
     assert (tmp_path / "service-state/active-ic-env-guard@edaops.service").is_file()
+
+
+def test_existing_user_upgrade_recovers_backup_present_pre_chmod_kill(tmp_path):
+    environment, root = _upgrade_environment(tmp_path)
+    _prepare_current_user_layout(tmp_path, root, active=True, enabled=True)
+    unit_dir = root / "etc/systemd/system"
+    unit_dir.mkdir(parents=True)
+    unit_file = unit_dir / "ic-env-guard@.service"
+    unit_file.write_text("OLD\n", encoding="utf-8")
+    unit_file.chmod(0o644)
+    present = unit_dir / ".ic-env-guard@.service.backup.new/present"
+    environment["INTERRUPT_AFTER_CREATE_PATH"] = str(present)
+
+    interrupted = subprocess.run(
+        [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert interrupted.returncode != 0
+    assert present.is_file()
+    assert present.stat().st_mode & 0o777 == 0o600
+
+    environment["INTERRUPT_AFTER_CREATE_PATH"] = ""
+    recovered = subprocess.run(
+        [str(PROJECT_ROOT / "packaging/install/upgrade.sh"), "edaops"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    assert not present.parent.exists()
 
 
 @pytest.mark.parametrize("kind", ["symlink", "wrong-mode"])

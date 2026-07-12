@@ -175,9 +175,9 @@ create_unit_backup() {
   mkdir -m 0700 "${unit_backup_build}"
   chown root:root "${unit_backup_build}"
   if [[ -f "${unit_file}" && ! -L "${unit_file}" ]]; then
-    cp -p "${unit_file}" "${unit_backup_build}/present"
-    chmod 0600 "${unit_backup_build}/present"
     mode="$(path_metadata "${unit_file}")"
+    install -m 0600 "${unit_file}" "${unit_backup_build}/present"
+    chown root:root "${unit_backup_build}/present"
     printf '%s\n' "${mode##* }" > "${unit_backup_build}/mode"
     chmod 0600 "${unit_backup_build}/mode"
     sync "${unit_backup_build}/present" "${unit_backup_build}/mode"
