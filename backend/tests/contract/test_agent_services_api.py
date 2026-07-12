@@ -110,8 +110,8 @@ def test_agent_service_list_dispatches_to_selected_agent(tmp_path):
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
 
@@ -138,8 +138,8 @@ def test_agent_service_mutation_preserves_upstream_status_and_audits(tmp_path):
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
 
@@ -176,8 +176,8 @@ def test_agent_service_intent_commit_failure_fails_closed_before_dispatch(tmp_pa
     audit_health = AuditStorageHealth()
     audit_repo = _CommitFailureAuditRepository(_CommitFailureSession(fail_on_commit=1))
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
     app.dependency_overrides[get_audit_storage_health] = lambda: audit_health
@@ -208,8 +208,8 @@ def test_agent_service_outcome_commit_failure_preserves_upstream_response_and_de
     audit_health = AuditStorageHealth()
     audit_repo = _CommitFailureAuditRepository(_CommitFailureSession(fail_on_commit=2))
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
     app.dependency_overrides[get_audit_storage_health] = lambda: audit_health
@@ -235,8 +235,8 @@ def test_agent_service_mutation_timeout_is_reported_indeterminate_and_audited(tm
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
 
@@ -268,8 +268,8 @@ def test_invalid_agent_service_action_is_audited_before_dispatch(tmp_path):
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
 
@@ -316,8 +316,8 @@ def test_agent_service_read_routes_dispatch_to_selected_agent_and_audit(tmp_path
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
 
@@ -355,8 +355,8 @@ def test_agent_service_upstream_error_body_includes_agent_and_correlation(tmp_pa
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
 
@@ -383,8 +383,8 @@ def test_unknown_agent_service_route_rejects_without_dispatch(tmp_path):
         return httpx.Response(200, json={})
 
     app = create_app(config=_config(tmp_path))
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
 
     with TestClient(app) as client:
@@ -429,13 +429,11 @@ def test_agent_service_route_rejects_missing_capability_before_dispatch(tmp_path
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     availability = AgentAvailabilityService(AgentRegistry(config.agents), AgentHttpClient())
-    availability.record_ready_for_test(
-        "lab-01", datetime.now(UTC), capabilities=("terminals.v1",)
-    )
+    availability.record_ready_for_test("lab-01", datetime.now(UTC), capabilities=("terminals.v1",))
     app.dependency_overrides[get_agent_availability] = lambda: availability
 
     with TestClient(app) as client:

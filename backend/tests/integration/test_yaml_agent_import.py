@@ -244,6 +244,37 @@ def test_commit_then_raise_is_verified_as_success_without_credential_cleanup(
 
 
 @pytest.mark.integration
+def test_mixed_commit_verification_preserves_referenced_ref_and_deletes_only_unreferenced(
+    tmp_path, import_context, monkeypatch
+):
+    engine, store, registry, _ = import_context
+
+    def commit_delete_one_then_raise(connection):
+        connection.commit()
+        with engine.begin() as other:
+            other.exec_driver_sql("DELETE FROM agents WHERE agent_id='lab-01'")
+        raise RuntimeError("lost commit acknowledgement")
+
+    monkeypatch.setattr(
+        "ic_env_guard.fleet.importer._commit_transaction",
+        commit_delete_one_then_raise,
+    )
+    imported = import_yaml_agents_once(
+        engine,
+        store,
+        [_agent(tmp_path, "lab-01"), _agent(tmp_path, "lab-02")],
+        manager_token=b"manager",
+    )
+
+    assert imported is False
+    remaining = registry.get("lab-02")
+    assert remaining is not None
+    assert {entry.name for entry in store.directory.iterdir()} == {
+        remaining.credential_ref
+    }
+
+
+@pytest.mark.integration
 def test_commit_and_rollback_errors_keep_credentials_when_verification_is_unavailable(
     tmp_path, import_context, monkeypatch
 ):

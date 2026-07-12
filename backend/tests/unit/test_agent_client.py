@@ -122,6 +122,32 @@ async def test_agent_client_uses_injected_legacy_credential_loader(tmp_path, mon
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_managed_agent_without_loader_fails_before_transport_dispatch(tmp_path):
+    dispatched = False
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal dispatched
+        dispatched = True
+        return httpx.Response(200, json={"ok": True})
+
+    agent = AgentConfig(
+        id="lab-01",
+        name="Lab 01",
+        base_url="https://lab-01.example",
+        managed_credential=True,
+    )
+    client = AgentHttpClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(AgentClientError) as exc:
+        await client.request(agent, "GET", "/api/capabilities")
+    await client.aclose()
+
+    assert exc.value.category == "agent_auth_error"
+    assert exc.value.dispatch_state == "not_dispatched"
+    assert dispatched is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_agent_client_rejects_redirects_as_protocol_errors(tmp_path):
     async def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(302, headers={"Location": "https://other.example"})

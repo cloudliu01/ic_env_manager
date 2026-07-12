@@ -85,8 +85,8 @@ def test_agent_audit_route_forwards_filters_and_stamps_agent_id(tmp_path):
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
 
@@ -104,9 +104,7 @@ def test_agent_audit_route_forwards_filters_and_stamps_agent_id(tmp_path):
         )
 
     assert response.status_code == 200
-    assert seen == [
-        ("/api/audit", {"limit": "2", "target_type": "service", "result": "success"})
-    ]
+    assert seen == [("/api/audit", {"limit": "2", "target_type": "service", "result": "success"})]
     assert response.json()["events"] == [
         {**_audit_event("service.start", "demo"), "agent_id": "lab-01"}
     ]
@@ -129,8 +127,8 @@ def test_agent_audit_route_keeps_agent_results_isolated(tmp_path):
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
 
@@ -154,8 +152,8 @@ def test_agent_audit_upstream_error_body_includes_agent_and_correlation(tmp_path
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
 
@@ -182,8 +180,8 @@ def test_agent_audit_route_rejects_unknown_and_disabled_before_dispatch(tmp_path
         return httpx.Response(200, json={"events": []})
 
     app = create_app(config=_config(tmp_path))
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
 
     with TestClient(app) as client:
@@ -222,13 +220,11 @@ def test_agent_audit_route_rejects_missing_capability_before_dispatch(tmp_path):
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     availability = AgentAvailabilityService(AgentRegistry(config.agents), AgentHttpClient())
-    availability.record_ready_for_test(
-        "lab-01", datetime.now(UTC), capabilities=("services.v1",)
-    )
+    availability.record_ready_for_test("lab-01", datetime.now(UTC), capabilities=("services.v1",))
     app.dependency_overrides[get_agent_availability] = lambda: availability
 
     with TestClient(app) as client:

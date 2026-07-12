@@ -47,7 +47,7 @@ def _config(tmp_path):
                 name="Disabled",
                 base_url="https://disabled.example",
                 enabled=False,
-            )
+            ),
         ],
     )
 
@@ -99,8 +99,8 @@ def test_agent_terminal_http_routes_dispatch_to_selected_agent(tmp_path):
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
 
@@ -109,14 +109,20 @@ def test_agent_terminal_http_routes_dispatch_to_selected_agent(tmp_path):
         list_response = client.get("/api/agents/lab-01/terminals", headers=headers)
         create_response = client.post("/api/agents/lab-01/terminals", headers=headers, json={})
         detail_response = client.get("/api/agents/lab-01/terminals/term-1", headers=headers)
-        assert client.get(
-            "/api/agents/lab-01/terminals/term-1/history?cursor=0", headers=headers
-        ).status_code == 200
-        assert client.post(
-            "/api/agents/lab-01/terminals/term-1/resize",
-            headers=headers,
-            json={"rows": 30, "cols": 100},
-        ).status_code == 204
+        assert (
+            client.get(
+                "/api/agents/lab-01/terminals/term-1/history?cursor=0", headers=headers
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                "/api/agents/lab-01/terminals/term-1/resize",
+                headers=headers,
+                json={"rows": 30, "cols": 100},
+            ).status_code
+            == 204
+        )
         close_response = client.delete("/api/agents/lab-01/terminals/term-1", headers=headers)
 
     assert list_response.status_code == 200
@@ -144,19 +150,15 @@ def test_gateway_connect_token_capacity_fails_before_upstream_dispatch(tmp_path)
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
 
     with TestClient(app) as client:
         headers = {"Authorization": "Bearer secret-token"}
-        first = client.post(
-            "/api/agents/lab-01/terminals/term-1/connect-token", headers=headers
-        )
-        second = client.post(
-            "/api/agents/lab-01/terminals/term-2/connect-token", headers=headers
-        )
+        first = client.post("/api/agents/lab-01/terminals/term-1/connect-token", headers=headers)
+        second = client.post("/api/agents/lab-01/terminals/term-2/connect-token", headers=headers)
 
     assert first.status_code == 201
     assert first.json()["ticket"] != "upstream-ticket"
@@ -179,19 +181,15 @@ def test_gateway_connect_token_preserves_upstream_error_and_releases_capacity(tm
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
 
     with TestClient(app) as client:
         headers = {"Authorization": "Bearer secret-token"}
-        failed = client.post(
-            "/api/agents/lab-01/terminals/missing/connect-token", headers=headers
-        )
-        retry = client.post(
-            "/api/agents/lab-01/terminals/term-1/connect-token", headers=headers
-        )
+        failed = client.post("/api/agents/lab-01/terminals/missing/connect-token", headers=headers)
+        retry = client.post("/api/agents/lab-01/terminals/term-1/connect-token", headers=headers)
 
     assert failed.status_code == 404
     assert failed.json()["error"] == "terminal_not_found"
@@ -214,19 +212,15 @@ def test_gateway_connect_token_rejects_malformed_upstream_payload_and_audits(tmp
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
 
     with TestClient(app) as client:
         headers = {"Authorization": "Bearer secret-token"}
-        response = client.post(
-            "/api/agents/lab-01/terminals/term-1/connect-token", headers=headers
-        )
-        retry = client.post(
-            "/api/agents/lab-01/terminals/term-1/connect-token", headers=headers
-        )
+        response = client.post("/api/agents/lab-01/terminals/term-1/connect-token", headers=headers)
+        retry = client.post("/api/agents/lab-01/terminals/term-1/connect-token", headers=headers)
         audit = client.get(
             "/api/control-plane/audit",
             headers=headers,
@@ -252,8 +246,8 @@ def test_agent_terminal_upstream_error_body_includes_agent_and_correlation(tmp_p
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
 
@@ -290,28 +284,32 @@ def test_agent_terminal_mutations_record_gateway_audit(tmp_path):
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
 
     with TestClient(app) as client:
         headers = {"Authorization": "Bearer secret-token"}
         assert (
-            client.post("/api/agents/lab-01/terminals", headers=headers, json={}).status_code
+            client.post("/api/agents/lab-01/terminals", headers=headers, json={}).status_code == 201
+        )
+        assert (
+            client.post(
+                "/api/agents/lab-01/terminals/term-1/resize",
+                headers=headers,
+                json={"rows": 30, "cols": 100},
+            ).status_code
+            == 204
+        )
+        assert (
+            client.post(
+                "/api/agents/lab-01/terminals/term-1/connect-token", headers=headers
+            ).status_code
             == 201
         )
-        assert client.post(
-            "/api/agents/lab-01/terminals/term-1/resize",
-            headers=headers,
-            json={"rows": 30, "cols": 100},
-        ).status_code == 204
-        assert client.post(
-            "/api/agents/lab-01/terminals/term-1/connect-token", headers=headers
-        ).status_code == 201
         assert (
-            client.delete("/api/agents/lab-01/terminals/term-1", headers=headers).status_code
-            == 202
+            client.delete("/api/agents/lab-01/terminals/term-1", headers=headers).status_code == 202
         )
 
         audit = client.get(
@@ -341,8 +339,8 @@ def test_agent_terminal_pre_dispatch_failures_are_audited(tmp_path):
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
 
@@ -380,13 +378,11 @@ def test_agent_terminal_route_rejects_missing_capability_before_dispatch(tmp_pat
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     availability = AgentAvailabilityService(AgentRegistry(config.agents), AgentHttpClient())
-    availability.record_ready_for_test(
-        "lab-01", datetime.now(UTC), capabilities=("services.v1",)
-    )
+    availability.record_ready_for_test("lab-01", datetime.now(UTC), capabilities=("services.v1",))
     app.dependency_overrides[get_agent_availability] = lambda: availability
 
     with TestClient(app) as client:

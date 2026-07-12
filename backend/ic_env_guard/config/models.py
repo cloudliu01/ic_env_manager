@@ -194,6 +194,7 @@ class AgentConfig(BaseModel):
     connect_timeout_seconds: int = Field(default=3, ge=1)
     request_timeout_seconds: int = Field(default=10, ge=1)
     enabled: bool = True
+    managed_credential: bool = Field(default=False, exclude=True, repr=False)
 
     @field_validator("base_url")
     @classmethod
@@ -209,6 +210,10 @@ class AgentConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_credentials(self) -> "AgentConfig":
+        if self.managed_credential:
+            if self.token_file is not None:
+                raise ValueError("managed Agent credentials must not expose a token_file")
+            return self
         if not self.enabled:
             return self
         if self.token_file is None:
@@ -381,6 +386,8 @@ class AppConfig(BaseModel):
             if not self.auth.token_file:
                 raise ValueError("remote bind requires valid authentication settings")
         agent_ids = [agent.id for agent in self.agents]
+        if any(agent.managed_credential for agent in self.agents):
+            raise ValueError("managed Agent credentials are internal-only")
         if len(agent_ids) != len(set(agent_ids)):
             raise ValueError("agent IDs must be unique")
         for agent in self.agents:

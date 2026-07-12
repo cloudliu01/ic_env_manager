@@ -159,7 +159,7 @@ async def _dispatch(
         audit_repo.finalize(
             audit.id,
             result="failed",
-            dispatch_state="unknown",
+            dispatch_state=exc.dispatch_state,
             failure_category=failure_category,
         )
         commit_audit_outcome(audit_repo, audit_health)

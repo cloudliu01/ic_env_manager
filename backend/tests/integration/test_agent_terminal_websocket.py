@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from ic_env_guard.agents.availability import AgentAvailabilityService
-from ic_env_guard.agents.client import AgentHttpClient
+from ic_env_guard.agents.client import AgentCredentialError, AgentHttpClient
 from ic_env_guard.agents.registry import AgentRegistry
 from ic_env_guard.agents.terminal_proxy import GatewayTicketStore
 from ic_env_guard.api.agent_http import get_agent_http_client
@@ -47,12 +47,8 @@ def test_websocket_connector_uses_injected_credential_loader(tmp_path, monkeypat
         "ic_env_guard.api.agent_terminal_ws.load_bearer_token",
         lambda _path: (_ for _ in ()).throw(AssertionError("raw path read")),
     )
-    monkeypatch.setattr(
-        "ic_env_guard.api.agent_terminal_ws.websockets.connect", fake_connect
-    )
-    connector = AgentWebSocketConnector(
-        legacy_credential_loader=lambda _agent: "stored-secret"
-    )
+    monkeypatch.setattr("ic_env_guard.api.agent_terminal_ws.websockets.connect", fake_connect)
+    connector = AgentWebSocketConnector(legacy_credential_loader=lambda _agent: "stored-secret")
     agent = AgentConfig(
         id="lab-01",
         name="Lab 01",
@@ -69,7 +65,7 @@ def test_websocket_connector_uses_injected_credential_loader(tmp_path, monkeypat
             RuntimeError("credential unavailable")
         )
     )
-    with pytest.raises(OSError, match="credential unavailable"):
+    with pytest.raises(AgentCredentialError, match="credential unavailable"):
         failing.connect(agent, "term-1", "ticket", 0, "corr-1")
 
 
@@ -162,6 +158,11 @@ class FakeConnector:
         return FakeConnectContext(self.upstream)
 
 
+class MissingCredentialConnector:
+    def connect(self, *_args, **_kwargs):
+        raise AgentCredentialError("credential unavailable")
+
+
 def _ws_headers() -> dict[str, str]:
     return {"Sec-WebSocket-Protocol": "bearer.c2VjcmV0LXRva2Vu"}
 
@@ -183,8 +184,8 @@ def test_agent_terminal_websocket_proxies_frames_and_audits_attach(tmp_path):
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _availability(
         config, tuple(CAPABILITIES["capabilities"])
@@ -230,8 +231,8 @@ def test_agent_terminal_websocket_rejects_oversized_browser_frames_and_audits(tm
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _availability(
         config, tuple(CAPABILITIES["capabilities"])
@@ -291,6 +292,47 @@ def test_agent_terminal_websocket_rejects_proxy_capacity_with_audit(tmp_path):
     assert event["dispatch_state"] == "not_dispatched"
     assert event["failure_category"] == "gateway_capacity_exceeded"
     assert event["correlation_id"]
+
+
+@pytest.mark.integration
+def test_agent_terminal_websocket_audits_missing_credential_before_dispatch(tmp_path):
+    config = _config(tmp_path)
+    app = create_app(config=config)
+    app.dependency_overrides[get_agent_availability] = lambda: _availability(
+        config, tuple(CAPABILITIES["capabilities"])
+    )
+    tickets = GatewayTicketStore()
+    reservation = tickets.reserve()
+    gateway_ticket = tickets.commit(
+        reservation,
+        actor_id="local-admin",
+        agent_id="lab-01",
+        terminal_id="term-1",
+        intended_ws_path="/ws/agents/lab-01/terminals/term-1",
+        upstream_ticket="upstream-ticket",
+        expires_at=datetime.now(UTC) + timedelta(seconds=60),
+    )
+    app.dependency_overrides[get_gateway_ticket_store] = lambda: tickets
+    app.dependency_overrides[get_agent_ws_connector] = lambda: MissingCredentialConnector()
+
+    with TestClient(app) as client:
+        headers = {"Authorization": "Bearer secret-token"}
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with client.websocket_connect(
+                f"/ws/agents/lab-01/terminals/term-1?ticket={gateway_ticket.ticket}&cursor=0",
+                headers=_ws_headers(),
+            ):
+                pass
+        audit = client.get(
+            "/api/control-plane/audit",
+            headers=headers,
+            params={"agent_id": "lab-01", "operation": "terminals.attach"},
+        ).json()["events"][0]
+
+    assert exc.value.code == 4503
+    assert audit["result"] == "failed"
+    assert audit["dispatch_state"] == "not_dispatched"
+    assert audit["failure_category"] == "agent_auth_error"
 
 
 @pytest.mark.integration
@@ -372,8 +414,8 @@ def test_agent_terminal_websocket_rejects_missing_capability_before_ticket_use(t
 
     config = _config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _availability(
         config, tuple(CAPABILITIES["capabilities"])
@@ -463,8 +505,8 @@ def test_agent_terminal_ticket_is_agent_bound_and_single_use(tmp_path):
 
     config = _config(tmp_path, include_lab_02=True)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _availability(
         config, tuple(CAPABILITIES["capabilities"])

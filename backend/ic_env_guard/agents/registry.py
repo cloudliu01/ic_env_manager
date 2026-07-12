@@ -51,9 +51,6 @@ class AgentRegistry:
 
     def set_enabled(self, agent_id: str, enabled: bool) -> AgentConfig:
         if self._fleet is not None:
-            current = self.get(agent_id)
-            if enabled and current.token_file is None:
-                raise AgentInvalidConfigurationError("enabled agents require a token_file")
             try:
                 agent = self._fleet.set_enabled(agent_id, enabled)
             except (FleetRegistryConfigurationError, FleetRegistryConflict) as exc:

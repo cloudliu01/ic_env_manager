@@ -101,7 +101,7 @@ async def _proxy_agent_status(
         audit_repo.finalize(
             audit.id,
             result="failed",
-            dispatch_state="unknown",
+            dispatch_state=exc.dispatch_state,
             failure_category=exc.category,
         )
         commit_audit_outcome(audit_repo, audit_health)

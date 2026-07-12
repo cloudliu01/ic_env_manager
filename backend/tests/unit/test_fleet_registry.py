@@ -2,7 +2,9 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
+from pydantic import ValidationError
 
+from ic_env_guard.config.models import AgentConfig
 from ic_env_guard.enrollment.credential_store import CredentialStore
 from ic_env_guard.fleet.models import (
     AgentPage,
@@ -120,8 +122,10 @@ def test_invalid_stored_profile_is_runtime_disabled_and_rejected_before_update(
     )
 
     projected = registry.get("lab-01")
-    assert projected.enabled is False
+    assert projected.enabled is repository.records["lab-01"].enabled
     assert projected.token_file is None
+    assert projected.managed_credential is True
+    assert "managed_credential" not in projected.model_dump()
     with pytest.raises(FleetRegistryConfigurationError):
         registry.set_enabled("lab-01", True)
     assert repository.update_calls == 0
@@ -173,5 +177,47 @@ def test_registry_credential_loader_reads_store_not_projection_path(tmp_path):
     )
 
     agent = registry.get("lab-01")
-    assert agent.token_file.exists()
+    assert agent.token_file is None
+    assert agent.enabled is True
+    assert agent.managed_credential is True
     assert registry.load_credential(agent) == "agent-secret"
+
+
+@pytest.mark.unit
+def test_missing_managed_credential_keeps_inventory_truth_and_allows_disable(tmp_path):
+    store = CredentialStore(tmp_path / "credentials")
+    reference = store.put(b"agent-secret")
+    repository = _Repository([_record("lab-01", reference)])
+    registry = FleetRegistry(
+        repository, store, (VerifiedTlsProfile(id="system-tls"),)
+    )
+    store.delete(reference)
+
+    projected = registry.get("lab-01")
+    assert projected.enabled is True
+    assert projected.token_file is None
+    disabled = registry.set_enabled("lab-01", False)
+    assert disabled.enabled is False
+    assert repository.records["lab-01"].enabled is False
+    with pytest.raises(FleetRegistryConfigurationError):
+        registry.set_enabled("lab-01", True)
+
+
+@pytest.mark.unit
+def test_static_enabled_agent_still_requires_token_and_managed_flag_is_not_public(tmp_path):
+    with pytest.raises(ValidationError):
+        AgentConfig(
+            id="lab-01",
+            name="Lab 01",
+            base_url="https://lab-01.example",
+            enabled=True,
+        )
+
+    managed = AgentConfig(
+        id="lab-01",
+        name="Lab 01",
+        base_url="https://lab-01.example",
+        enabled=True,
+        managed_credential=True,
+    )
+    assert "managed_credential" not in managed.model_dump()

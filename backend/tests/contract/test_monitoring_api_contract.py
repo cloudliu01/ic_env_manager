@@ -124,9 +124,7 @@ def test_local_monitoring_snapshot_contract(client, auth_headers):
 
 
 @pytest.mark.contract
-def test_local_monitoring_snapshot_survives_swap_memory_oserror(
-    client, auth_headers, monkeypatch
-):
+def test_local_monitoring_snapshot_survives_swap_memory_oserror(client, auth_headers, monkeypatch):
     def unavailable_swap_memory():
         raise OSError
 
@@ -206,8 +204,8 @@ def test_agent_monitoring_snapshot_dispatches_to_selected_agent(tmp_path):
 
     config = _control_plane_config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
 
@@ -241,8 +239,10 @@ def test_agent_monitoring_snapshot_preserves_upstream_status(tmp_path):
 
     config = _control_plane_config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(capability_handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(
+            httpx.MockTransport(capability_handler)
+        )
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
 
@@ -268,8 +268,8 @@ def test_agent_monitoring_snapshot_rejects_before_dispatch(tmp_path):
         return httpx.Response(200, json=_snapshot())
 
     app = create_app(config=_control_plane_config(tmp_path))
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
 
     with TestClient(app) as client:
@@ -295,13 +295,11 @@ def test_agent_monitoring_snapshot_rejects_missing_capability_before_dispatch(tm
 
     config = _control_plane_config(tmp_path)
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     availability = AgentAvailabilityService(AgentRegistry(config.agents), AgentHttpClient())
-    availability.record_ready_for_test(
-        "lab-01", datetime.now(UTC), capabilities=("services.v1",)
-    )
+    availability.record_ready_for_test("lab-01", datetime.now(UTC), capabilities=("services.v1",))
     app.dependency_overrides[get_agent_availability] = lambda: availability
 
     with TestClient(app) as client:

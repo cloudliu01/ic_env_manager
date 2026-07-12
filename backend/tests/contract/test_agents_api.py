@@ -2,7 +2,6 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from ic_env_guard.agents.client import AgentHttpClient
 from ic_env_guard.api.agent_http import get_agent_http_client
 from ic_env_guard.config.models import AgentConfig, AppConfig, AuthConfig, ControlPlaneConfig
 from ic_env_guard.main import create_app
@@ -30,9 +29,7 @@ def test_agent_mode_exposes_local_capabilities(tmp_path):
     app = create_app(token_file=_token_file(tmp_path))
 
     with TestClient(app) as client:
-        response = client.get(
-            "/api/capabilities", headers={"Authorization": "Bearer secret-token"}
-        )
+        response = client.get("/api/capabilities", headers={"Authorization": "Bearer secret-token"})
 
     assert response.status_code == 200
     assert response.json()["api_version"] == "1"
@@ -184,8 +181,8 @@ def test_control_plane_agent_health_and_ready_proxy_selected_agent(tmp_path):
         agents=[_agent(tmp_path, "lab-01")],
     )
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
 
     with TestClient(app) as client:
@@ -226,8 +223,8 @@ def test_control_plane_agent_health_error_body_includes_agent_and_correlation(tm
         agents=[_agent(tmp_path, "lab-01")],
     )
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
 
     with TestClient(app) as client:
@@ -259,8 +256,8 @@ def test_control_plane_agent_health_rejects_missing_and_disabled_before_dispatch
         agents=[_agent(tmp_path, "lab-01"), _agent(tmp_path, "disabled", enabled=False)],
     )
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
 
     with TestClient(app) as client:
@@ -333,9 +330,7 @@ def test_agent_enabled_switch_reenables_runtime_routing(tmp_path):
     with TestClient(create_app(config=config)) as client:
         headers = {"Authorization": "Bearer secret-token"}
         client.post("/api/agents/lab-01/enabled", headers=headers, json={"enabled": False})
-        enabled = client.post(
-            "/api/agents/lab-01/enabled", headers=headers, json={"enabled": True}
-        )
+        enabled = client.post("/api/agents/lab-01/enabled", headers=headers, json={"enabled": True})
         detail = client.get("/api/agents/lab-01", headers=headers)
 
     assert enabled.status_code == 200

@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 from websockets.exceptions import WebSocketException
 
 from ic_env_guard.agents.availability import AgentAvailabilityService
+from ic_env_guard.agents.client import AgentCredentialError
 from ic_env_guard.agents.registry import AgentNotFoundError, AgentRegistry
 from ic_env_guard.agents.terminal_proxy import (
     MAX_TERMINAL_FRAME_BYTES,
@@ -56,8 +57,14 @@ class AgentWebSocketConnector:
         self._legacy_credential_loader = (
             legacy_credential_loader
             if legacy_credential_loader is not None
-            else lambda agent: load_bearer_token(agent.token_file)
+            else self._load_file_credential
         )
+
+    @staticmethod
+    def _load_file_credential(agent: AgentConfig) -> str:
+        if agent.managed_credential:
+            raise AgentCredentialError("managed Agent requires a credential loader")
+        return load_bearer_token(agent.token_file)
 
     def connect(
         self,
@@ -75,7 +82,7 @@ class AgentWebSocketConnector:
         try:
             token = self._legacy_credential_loader(agent)
         except Exception as exc:
-            raise OSError("credential unavailable") from exc
+            raise AgentCredentialError("credential unavailable") from exc
         headers = {
             "Authorization": f"Bearer {token}",
             "X-Correlation-ID": correlation_id,
@@ -418,6 +425,16 @@ async def agent_terminal_websocket(
                 failure_category=exc.category,
             )
             commit_audit_outcome(audit_repo, audit_health)
+            return
+        except AgentCredentialError:
+            audit_repo.finalize(
+                audit.id,
+                result="failed",
+                dispatch_state="not_dispatched",
+                failure_category="agent_auth_error",
+            )
+            commit_audit_outcome(audit_repo, audit_health)
+            await websocket.close(code=4503)
             return
         except TimeoutError:
             audit_repo.finalize(

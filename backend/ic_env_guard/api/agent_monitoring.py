@@ -102,7 +102,7 @@ async def get_agent_monitoring_snapshot(
         audit_repo.finalize(
             audit.id,
             result="failed",
-            dispatch_state="unknown",
+            dispatch_state=exc.dispatch_state,
             failure_category=exc.category,
         )
         commit_audit_outcome(audit_repo, audit_health)

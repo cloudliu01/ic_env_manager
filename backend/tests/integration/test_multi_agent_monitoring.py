@@ -72,8 +72,8 @@ def test_overlapping_service_ids_stay_scoped_by_agent(tmp_path):
         agents=[_agent(tmp_path, "lab-01"), _agent(tmp_path, "lab-02")],
     )
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = lambda: AgentHttpClient(
-        transport=httpx.MockTransport(handler)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
 

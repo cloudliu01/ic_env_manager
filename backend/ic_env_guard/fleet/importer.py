@@ -27,6 +27,21 @@ class _ConcurrentImportComplete(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class _CommitVerification:
+    marker_complete: bool
+    own_references: frozenset[str]
+    referenced_references: frozenset[str]
+    unreferenced_references: frozenset[str]
+
+
+class _VerifiedCommitMismatch(Exception):
+    def __init__(self, verification: _CommitVerification, cause: Exception) -> None:
+        super().__init__("verified YAML import commit mismatch")
+        self.verification = verification
+        self.cause = cause
+
+
 _AGENT_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _IMPORT_MARKER_KEY = "yaml_agents_imported_v1"
 _IMPORT_MARKER_VALUE = "complete"
@@ -61,18 +76,46 @@ def import_yaml_agents_once(
         raise AgentConfigImportError("YAML Agent validation failed") from exc
 
     new_references: list[str] = []
+    expected: dict[str, str] = {}
     try:
         with credential_store.lifecycle_lease():
             for item in prepared:
                 new_references.append(credential_store.put(item.token))
+            expected = {
+                item.config.id: reference
+                for item, reference in zip(prepared, new_references, strict=True)
+            }
             _commit_import(engine, prepared, new_references)
     except _ConcurrentImportComplete as exc:
-        cleanup_errors = _delete_new_credentials(credential_store, new_references)
+        try:
+            verification = _verify_committed_import(engine, expected)
+        except Exception as verification_error:
+            raise AgentConfigImportOutcomeUncertain(
+                "concurrent YAML import outcome is uncertain; credentials were retained"
+            ) from verification_error
+        cleanup_errors = _delete_new_credentials(
+            credential_store, list(verification.unreferenced_references)
+        )
         if cleanup_errors:
             raise AgentConfigImportError(
                 "concurrent YAML import completed but credential cleanup failed"
             ) from exc
         return False
+    except _VerifiedCommitMismatch as exc:
+        cleanup_errors = _delete_new_credentials(
+            credential_store, list(exc.verification.unreferenced_references)
+        )
+        if cleanup_errors:
+            raise AgentConfigImportError(
+                "verified YAML import credential cleanup failed"
+            ) from exc
+        if exc.verification.marker_complete:
+            return False
+        if exc.verification.referenced_references:
+            raise AgentConfigImportOutcomeUncertain(
+                "YAML Agent commit is incomplete; referenced credentials were retained"
+            ) from exc.cause
+        raise AgentConfigImportError("YAML Agent import commit failed") from exc.cause
     except AgentConfigImportOutcomeUncertain:
         # The only safe recovery is to retain every new reference for operator audit.
         raise
@@ -258,12 +301,16 @@ def _commit_import(
                 connection, item.config.id, item.config.enabled, now
             )
         _insert_marker(connection)
-    except Exception:
+    except Exception as operation_error:
         try:
             _rollback_transaction(connection)
-        finally:
+        except Exception as rollback_error:
             raw.close()
-        raise
+            raise AgentConfigImportOutcomeUncertain(
+                "YAML Agent rollback outcome is uncertain; credentials were retained"
+            ) from rollback_error
+        raw.close()
+        raise operation_error
     try:
         _commit_transaction(connection)
     except Exception as commit_error:
@@ -277,16 +324,17 @@ def _commit_import(
             for item, reference in zip(prepared, references, strict=True)
         }
         try:
-            outcome = _verify_committed_import(engine, expected)
+            verification = _verify_committed_import(engine, expected)
         except Exception as verification_error:
             raise AgentConfigImportOutcomeUncertain(
                 "YAML Agent commit outcome is uncertain; credentials were retained"
             ) from verification_error
-        if outcome == "own":
+        if (
+            verification.marker_complete
+            and verification.own_references == frozenset(expected.values())
+        ):
             return
-        if outcome == "other":
-            raise _ConcurrentImportComplete from commit_error
-        raise commit_error
+        raise _VerifiedCommitMismatch(verification, commit_error) from commit_error
     else:
         raw.close()
 
@@ -339,20 +387,41 @@ def _insert_marker(connection: sqlite3.Connection) -> None:
     )
 
 
-def _verify_committed_import(engine: Engine, expected: dict[str, str]) -> str:
+def _verify_committed_import(
+    engine: Engine, expected: dict[str, str]
+) -> _CommitVerification:
+    new_references = frozenset(expected.values())
+    own_references: set[str] = set()
     with engine.connect() as connection:
         marker = connection.exec_driver_sql(
             "SELECT value FROM manager_metadata WHERE key = ?", (_IMPORT_MARKER_KEY,)
         ).first()
-        if marker is None or marker[0] != _IMPORT_MARKER_VALUE:
-            return "absent"
+        marker_complete = marker is not None and marker[0] == _IMPORT_MARKER_VALUE
         for agent_id, reference in expected.items():
             row = connection.exec_driver_sql(
                 "SELECT credential_ref, source FROM agents WHERE agent_id = ?", (agent_id,)
             ).first()
-            if row is None or row[0] != reference or row[1] != "config_import":
-                return "other"
-    return "own"
+            if row is not None and row[0] == reference and row[1] == "config_import":
+                own_references.add(reference)
+        agent_rows = connection.exec_driver_sql(
+            "SELECT credential_ref FROM agents"
+        ).fetchall()
+        journal_rows = connection.exec_driver_sql(
+            "SELECT credential_temp_ref, old_credential_ref "
+            "FROM agent_enrollment_jobs"
+        ).fetchall()
+    referenced = {row[0] for row in agent_rows if row[0] in new_references}
+    for temporary_ref, old_ref in journal_rows:
+        if temporary_ref in new_references:
+            referenced.add(temporary_ref)
+        if old_ref in new_references:
+            referenced.add(old_ref)
+    return _CommitVerification(
+        marker_complete=marker_complete,
+        own_references=frozenset(own_references),
+        referenced_references=frozenset(referenced),
+        unreferenced_references=new_references - referenced,
+    )
 
 
 def _insert_initial_status(

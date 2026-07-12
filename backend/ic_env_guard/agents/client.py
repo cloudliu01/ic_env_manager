@@ -21,10 +21,27 @@ PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
 
 
 class AgentClientError(Exception):
-    def __init__(self, category: str, message: str) -> None:
+    def __init__(
+        self,
+        category: str,
+        message: str,
+        *,
+        dispatch_state: str = "unknown",
+    ) -> None:
         super().__init__(f"{category}: {message}")
         self.category = category
         self.message = message
+        self.dispatch_state = dispatch_state
+
+
+class AgentCredentialError(Exception):
+    pass
+
+
+def _load_legacy_file_credential(agent: AgentConfig) -> str:
+    if agent.managed_credential:
+        raise AgentCredentialError("managed Agent requires a credential loader")
+    return load_bearer_token(agent.token_file)
 
 
 class AgentHttpClient:
@@ -42,7 +59,7 @@ class AgentHttpClient:
         self._legacy_credential_loader = (
             legacy_credential_loader
             if legacy_credential_loader is not None
-            else lambda agent: load_bearer_token(agent.token_file)
+            else _load_legacy_file_credential
         )
         if transport is not None:
             self._client = httpx.AsyncClient(
@@ -52,6 +69,15 @@ class AgentHttpClient:
     async def aclose(self) -> None:
         if self._client is not None:
             await self._client.aclose()
+
+    def clone_with_transport(self, transport: httpx.AsyncBaseTransport) -> "AgentHttpClient":
+        """Create a test/adapter client while preserving the configured credential loader."""
+        return AgentHttpClient(
+            transport=transport,
+            connect_timeout_seconds=self._connect_timeout_seconds,
+            request_timeout_seconds=self._request_timeout_seconds,
+            legacy_credential_loader=self._legacy_credential_loader,
+        )
 
     @overload
     async def request(
@@ -236,7 +262,9 @@ class AgentHttpClient:
             token = self._legacy_credential_loader(agent)
         except Exception as exc:
             raise AgentClientError(
-                "agent_auth_error", "Agent credential is unavailable"
+                "agent_auth_error",
+                "Agent credential is unavailable",
+                dispatch_state="not_dispatched",
             ) from exc
         headers = self._headers(token, incoming_headers or {}, correlation_id)
         _validate_upstream_path(path)

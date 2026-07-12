@@ -57,10 +57,12 @@ class FleetRegistry:
             record = self._repository.get(agent_id)
             if record is None:
                 return None
-            if not self._configuration_valid(record):
+            if enabled and not self._configuration_valid(record):
                 raise FleetRegistryConfigurationError(
                     "Agent transport profile is invalid"
                 )
+            if enabled:
+                self._read_credential(record)
             if record.enabled == enabled:
                 return self._project(record)
             try:
@@ -82,6 +84,9 @@ class FleetRegistry:
         record = self._repository.get(agent.id)
         if record is None or not self._configuration_valid(record):
             raise FleetRegistryConfigurationError("Agent credential is unavailable")
+        return self._read_credential(record)
+
+    def _read_credential(self, record: AgentRecord) -> str:
         try:
             token = self._credential_store.read(record.credential_ref).decode("utf-8").strip()
         except (CredentialStoreError, OSError, UnicodeError, ValueError) as exc:
@@ -92,7 +97,6 @@ class FleetRegistry:
 
     def _project(self, record: AgentRecord) -> AgentConfig:
         profile = self._profiles.get(record.transport_profile_id)
-        valid = self._configuration_valid(record)
         tls = AgentTlsConfig()
         if isinstance(profile, VerifiedTlsProfile):
             tls = AgentTlsConfig(verify=True, ca_bundle=profile.ca_bundle)
@@ -102,13 +106,10 @@ class FleetRegistry:
             id=record.agent_id,
             name=record.display_name,
             base_url=record.normalized_endpoint,
-            token_file=(
-                self._credential_store.resolve_for_test(record.credential_ref)
-                if valid
-                else None
-            ),
+            token_file=None,
             tls=tls,
-            enabled=record.enabled and valid,
+            enabled=record.enabled,
+            managed_credential=True,
         )
 
     def _configuration_valid(self, record: AgentRecord) -> bool:
