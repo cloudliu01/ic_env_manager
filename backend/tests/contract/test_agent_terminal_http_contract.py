@@ -268,6 +268,53 @@ def test_gateway_connect_token_rejects_rotation_between_snapshot_and_dispatch(tm
 
 
 @pytest.mark.contract
+def test_gateway_connect_token_rejects_missing_snapshot_before_concurrent_add(tmp_path):
+    dispatched = False
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal dispatched
+        dispatched = True
+        return httpx.Response(201, json={"ticket": "upstream", "expires_in_seconds": 60})
+
+    config = _config(tmp_path)
+    app = create_app(config=config)
+    repository = app.state.container.registry_repository
+    original = repository.get("lab-01")
+    repository.delete("lab-01")
+    limiter = GatewayProxyLimiter(1)
+
+    class AddAfterMissingSnapshot:
+        def record(self, _agent_id):
+            with app.state.container.credential_store.lifecycle_lease():
+                replacement_ref = app.state.container.credential_store.put(
+                    b"replacement-secret"
+                )
+                repository.create(replace(original, credential_ref=replacement_ref))
+            return None
+
+    app.dependency_overrides[get_agent_registry] = lambda: AddAfterMissingSnapshot()
+    app.dependency_overrides[get_gateway_proxy_limiter] = lambda: limiter
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
+    )
+    app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agents/lab-01/terminals/term-1/connect-token",
+            headers={"Authorization": "Bearer secret-token"},
+        )
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "agent_not_found"
+    assert dispatched is False
+    assert not app.state.container.gateway_ticket_store.has_usage("lab-01")
+    replacement = limiter.reserve()
+    assert replacement is not None
+    replacement.release()
+
+
+@pytest.mark.contract
 def test_gateway_connect_token_preserves_upstream_error_and_releases_capacity(tmp_path):
     dispatched_paths: list[str] = []
 

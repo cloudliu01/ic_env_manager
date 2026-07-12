@@ -373,22 +373,31 @@ async def create_agent_terminal_connect_token(
     committed = False
     try:
         record = registry.record(agent_id)
-        route_capture = (
-            AgentRouteCapture(
-                revision=record.revision,
-                credential_ref=record.credential_ref,
-                transport_profile_id=record.transport_profile_id,
-                normalized_endpoint=record.normalized_endpoint,
+        if record is None:
+            _record_pre_dispatch_failure(
+                audit_repo=audit_repo,
+                audit_health=audit_health,
+                actor=actor,
+                agent_id=agent_id,
+                operation="terminals.connect-token",
+                target=f"terminal:{terminal_id}",
+                correlation_id=getattr(request.state, "correlation_id", None),
+                source_addr=request.client.host if request.client else None,
+                failure_category="agent_not_found",
             )
-            if record is not None
-            else None
+            raise ApiError(404, "agent_not_found", "agent not found")
+        route_capture = AgentRouteCapture(
+            revision=record.revision,
+            credential_ref=record.credential_ref,
+            transport_profile_id=record.transport_profile_id,
+            normalized_endpoint=record.normalized_endpoint,
         )
         reservation = tickets.reserve(
             agent_id,
-            revision=record.revision if record else None,
-            credential_ref=record.credential_ref if record else None,
-            transport_profile_id=record.transport_profile_id if record else None,
-            normalized_endpoint=record.normalized_endpoint if record else None,
+            revision=record.revision,
+            credential_ref=record.credential_ref,
+            transport_profile_id=record.transport_profile_id,
+            normalized_endpoint=record.normalized_endpoint,
             slot=slot,
         )
         if reservation is None:
