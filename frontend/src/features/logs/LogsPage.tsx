@@ -4,6 +4,10 @@ import { useLogs, useLogTail } from './queries';
 import { LogsTarget } from './types';
 
 export function LogsPage({ target }: { target: LogsTarget }) {
+  return <LogsPageTarget key={target.agentId} target={target} />;
+}
+
+function LogsPageTarget({ target }: { target: LogsTarget }) {
   const logs = useLogs(target.agentId, target.capabilities.includes('logs.v2'));
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const tail = useLogTail(target.agentId, selectedId);

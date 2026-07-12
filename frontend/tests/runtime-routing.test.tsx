@@ -1,5 +1,6 @@
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { useEffect } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '../src/app/App';
 import { ApiClient, ApiClientError } from '../src/shared/api/client';
@@ -14,7 +15,7 @@ vi.mock('../src/pages/LoginPage', () => ({
 
 vi.mock('../src/features/terminal/TerminalPage', () => ({
   TerminalPage: ({ visible }: { visible?: boolean }) => {
-    terminalMounts();
+    useEffect(() => { terminalMounts(); }, []);
     return <div aria-label="Terminal page">Terminal visible: {String(visible)}</div>;
   },
 }));
@@ -87,6 +88,26 @@ describe('runtime routing', () => {
     expect(await screen.findByLabelText('Terminal page')).toBeTruthy();
     expect(screen.queryByLabelText('Active agent')).toBeNull();
     expect(window.location.pathname).toBe('/terminal');
+  });
+
+  it('keeps the terminal mounted and updates its hidden visibility across sibling routes', async () => {
+    mockAgentFetch(['runtime.v2', 'terminals.v1', 'services.v1']);
+    const user = userEvent.setup();
+    const { container } = render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Sign in' }));
+    await screen.findByLabelText('Terminal page');
+    expect(terminalMounts).toHaveBeenCalledTimes(1);
+
+    window.history.pushState({}, '', '/services');
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    await screen.findByRole('heading', { name: 'Services' });
+    expect(terminalMounts).toHaveBeenCalledTimes(1);
+    expect(container.querySelector('[aria-label="Terminal page"]')?.textContent).toContain('false');
+
+    window.history.pushState({}, '', '/terminal');
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    await waitFor(() => expect(container.querySelector('[aria-label="Terminal page"]')?.textContent).toContain('true'));
+    expect(terminalMounts).toHaveBeenCalledTimes(1);
   });
 
   it('treats login as an explicit route and replaces it with terminal after authentication', async () => {

@@ -11,6 +11,10 @@ function Status({ item }: { item: Observation }) {
 }
 
 export function ObservationsPage({ target }: { target: ObservationsTarget }) {
+  return <ObservationsPageTarget key={target.agentId} target={target} />;
+}
+
+function ObservationsPageTarget({ target }: { target: ObservationsTarget }) {
   const [searchParams, setSearchParams] = useSearchParams();
   const status = searchParams.get('status') || undefined;
   const query = useObservations(target.agentId, status, target.capabilities.includes('observations.v2'));

@@ -7,6 +7,10 @@ function AuditTable({ events }: { events: AuditEvent[] }) {
 }
 
 export function AuditPage({ target }: { target: AuditTarget }) {
+  return <AuditPageTarget key={target.agentId} target={target} />;
+}
+
+function AuditPageTarget({ target }: { target: AuditTarget }) {
   const [operation, setOperation] = useState('');
   const [result, setResult] = useState('');
   const [cursor, setCursor] = useState<string | undefined>();
