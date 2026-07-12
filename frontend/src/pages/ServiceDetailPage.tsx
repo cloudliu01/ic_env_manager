@@ -1,1 +1,1 @@
-export { ServiceListPage as ServiceDetailPage } from './ServiceListPage';
+export { ServicesPage as ServiceDetailPage } from '../features/services/ServicesPage';

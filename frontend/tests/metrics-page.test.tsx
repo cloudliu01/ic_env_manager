@@ -1,15 +1,11 @@
 import { cleanup, render, screen } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { MetricsPage } from '../src/pages/MetricsPage';
+import { MetricsPage } from '../src/features/metrics/MetricsPage';
 
 const getAgentMonitoringSnapshot = vi.hoisted(() => vi.fn());
 
-vi.mock('../src/agents/StandaloneAgentContext', () => ({
-  useStandaloneAgent: () => ({ agentId: 'local', name: 'Build node', capabilities: ['monitoring.snapshot.v1'] }),
-  supportsCapability: (capabilities: string[], capability: string) => capabilities.includes(capability),
-}));
-
-vi.mock('../src/api/monitoring', () => ({ getAgentMonitoringSnapshot }));
+vi.mock('../src/features/metrics/api', () => ({ getMonitoringSnapshot: getAgentMonitoringSnapshot }));
 
 describe('MetricsPage', () => {
   beforeEach(() => {
@@ -24,10 +20,11 @@ describe('MetricsPage', () => {
   afterEach(() => cleanup());
 
   it('loads telemetry for the standalone Agent identity', async () => {
-    render(<MetricsPage />);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(<QueryClientProvider client={client}><MetricsPage target={{ agentId: 'agent-b', name: 'Beta', capabilities: ['monitoring.snapshot.v1'] }} /></QueryClientProvider>);
 
     expect(await screen.findByText('Machine telemetry')).toBeTruthy();
     expect(await screen.findByText('Build node')).toBeTruthy();
-    expect(getAgentMonitoringSnapshot).toHaveBeenCalledWith('local', expect.anything());
+    expect(getAgentMonitoringSnapshot).toHaveBeenCalledWith('agent-b', expect.anything());
   });
 });

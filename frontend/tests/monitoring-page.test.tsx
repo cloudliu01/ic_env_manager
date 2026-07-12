@@ -1,20 +1,14 @@
 import { cleanup, render, screen } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { MetricsPage } from '../src/pages/MetricsPage';
+import { MetricsPage } from '../src/features/metrics/MetricsPage';
 import { App } from '../src/app/App';
 
 const getAgentMonitoringSnapshot = vi.hoisted(() => vi.fn());
 const apiRequest = vi.hoisted(() => vi.fn());
 const CAPABILITIES = ['services.v1', 'terminals.v1', 'audit.v1', 'monitoring.snapshot.v1'];
 
-vi.mock('../src/agents/StandaloneAgentContext', () => ({
-  useStandaloneAgent: () => ({ agentId: 'local', name: 'Build node', capabilities: CAPABILITIES }),
-  supportsCapability: (capabilities: string[], capability: string) => capabilities.includes(capability),
-}));
-
-vi.mock('../src/api/monitoring', () => ({
-  getAgentMonitoringSnapshot,
-}));
+vi.mock('../src/features/metrics/api', () => ({ getMonitoringSnapshot: getAgentMonitoringSnapshot }));
 
 vi.mock('../src/shared/api/client', () => ({ apiClient: { request: apiRequest } }));
 
@@ -42,13 +36,15 @@ afterEach(() => {
 });
 
 describe('MetricsPage', () => {
-  it('renders local monitoring metric cards', async () => {
-    render(<MetricsPage />);
+  it('renders metric cards for its explicit manager target', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(<QueryClientProvider client={client}><MetricsPage target={{ agentId: 'agent-b', name: 'Beta', capabilities: CAPABILITIES }} /></QueryClientProvider>);
 
     expect(await screen.findByText('Machine telemetry')).toBeTruthy();
     expect(await screen.findByText('12.5%')).toBeTruthy();
     expect(screen.getByText('25.0%')).toBeTruthy();
     expect(screen.getByText('Disk usage')).toBeTruthy();
+    expect(getAgentMonitoringSnapshot).toHaveBeenCalledWith('agent-b', expect.anything());
   });
 });
 

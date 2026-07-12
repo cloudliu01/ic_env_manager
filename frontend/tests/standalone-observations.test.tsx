@@ -1,4 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { BrowserRouter } from 'react-router-dom';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -19,7 +20,7 @@ it('renders dense observation columns and expands details outside the table', as
   }), { status: 200, headers: { 'Content-Type': 'application/json' } })));
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const user = userEvent.setup();
-  render(<QueryClientProvider client={queryClient}><ObservationsPage /></QueryClientProvider>);
+  render(<BrowserRouter><QueryClientProvider client={queryClient}><ObservationsPage target={{ agentId: 'local', name: 'Build node', capabilities: ['observations.v2'] }} /></QueryClientProvider></BrowserRouter>);
 
   expect(await screen.findByText('eda / license-daemon')).toBeTruthy();
   expect(screen.getByText('Warning')).toBeTruthy();

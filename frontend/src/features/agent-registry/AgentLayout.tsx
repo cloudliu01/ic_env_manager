@@ -1,6 +1,7 @@
-import { Link, NavLink, Outlet, useOutletContext, useParams } from 'react-router-dom';
+import { Link, NavLink, Outlet, useLocation, useOutletContext, useParams } from 'react-router-dom';
 import { Agent } from './types';
 import { useAgent } from './queries';
+import { TerminalPage } from '../terminal/TerminalPage';
 
 const detailTabs = [
   { path: 'overview', label: 'Overview' },
@@ -25,9 +26,12 @@ export function useRouteAgent() {
 
 export function AgentLayout() {
   const { agentId = '' } = useParams();
+  const location = useLocation();
   const agent = useAgent(agentId);
   if (agent.isPending) return <p role="status" aria-live="polite">Loading Agent…</p>;
   if (agent.isError || !agent.data) return <p role="alert">The requested Agent could not be loaded.</p>;
+  const terminalVisible = location.pathname === `/agents/${encodeURIComponent(agentId)}/terminal`;
+  const context = { agent: agent.data, agentId };
   return <section className="feature-page agent-layout">
     <header className="agent-header"><p><Link to="/fleet">Fleet</Link> / {agent.data.display_name}</p>
       <div className="agent-status-summary"><span>Connection <span className={`status status-${agent.data.connection_status}`}>{statusLabel(agent.data.connection_status)}</span></span><span>Workload <span className={`status status-${agent.data.workload_status}`}>{statusLabel(agent.data.workload_status)}</span></span></div>
@@ -41,6 +45,10 @@ export function AgentLayout() {
         return available ? <NavLink key={tab.path} to={to}>{tab.label}</NavLink> : <a key={tab.path} href={to} aria-disabled="true" title={reason} onClick={(event) => event.preventDefault()}>{tab.label}<span className="sr-only"> — {reason}</span></a>;
       })}
     </nav>
-    <Outlet context={{ agent: agent.data, agentId }} />
+    <div hidden={!terminalVisible} className="persistent-agent-terminal">
+      {agent.data.capabilities.includes('terminals.v1') ? <><h1 tabIndex={-1} className="sr-only">Terminal</h1>
+        <TerminalPage target={{ agentId, name: agent.data.display_name, capabilities: agent.data.capabilities }} visible={terminalVisible} /></> : <section><h1 tabIndex={-1}>Feature unavailable</h1><p role="alert">This Agent does not advertise <code>terminals.v1</code>.</p></section>}
+    </div>
+    {terminalVisible ? null : <Outlet context={context} />}
   </section>;
 }

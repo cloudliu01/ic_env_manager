@@ -1,16 +1,12 @@
 import { AlertTriangle, FileText } from 'lucide-react';
-import { useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
-import { listLogs, tailLog } from './api';
+import { useLogs, useLogTail } from './queries';
+import { LogsTarget } from './types';
 
-export function LogsPage() {
-  const logs = useQuery({ queryKey: ['agent', 'local', 'logs'], queryFn: ({ signal }) => listLogs(signal) });
+export function LogsPage({ target }: { target: LogsTarget }) {
+  const logs = useLogs(target.agentId, target.capabilities.includes('logs.v2'));
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const tail = useQuery({
-    queryKey: ['agent', 'local', 'logs', selectedId, 'tail', 100],
-    queryFn: ({ signal }) => tailLog(selectedId ?? '', signal),
-    enabled: Boolean(selectedId),
-  });
+  const tail = useLogTail(target.agentId, selectedId);
 
   return (
     <section className="feature-page">

@@ -6,10 +6,10 @@ import { apiClient } from '../shared/api/client';
 import { LoginPage } from '../pages/LoginPage';
 import { AppShell } from './shell/AppShell';
 
-const TerminalPage = lazy(() => import('../pages/TerminalPage').then((module) => ({ default: module.TerminalPage })));
-const ServicesPage = lazy(() => import('../pages/ServiceListPage').then((module) => ({ default: module.ServiceListPage })));
-const MetricsPage = lazy(() => import('../pages/MetricsPage').then((module) => ({ default: module.MetricsPage })));
-const AuditPage = lazy(() => import('../pages/AuditStatusPage').then((module) => ({ default: module.AuditStatusPage })));
+const TerminalPage = lazy(() => import('../features/terminal/TerminalPage').then((module) => ({ default: module.TerminalPage })));
+const ServicesPage = lazy(() => import('../features/services/ServicesPage').then((module) => ({ default: module.ServicesPage })));
+const MetricsPage = lazy(() => import('../features/metrics/MetricsPage').then((module) => ({ default: module.MetricsPage })));
+const AuditPage = lazy(() => import('../features/audit/AuditPage').then((module) => ({ default: module.AuditPage })));
 const ObservationsPage = lazy(() => import('../features/observations/ObservationsPage').then((module) => ({ default: module.ObservationsPage })));
 const LogsPage = lazy(() => import('../features/logs/LogsPage').then((module) => ({ default: module.LogsPage })));
 const ManagerAccessPage = lazy(() => import('../features/agent-settings/ManagerAccessPage').then((module) => ({ default: module.ManagerAccessPage })));
@@ -67,19 +67,20 @@ export default function AgentEntry() {
   }
 
   const terminalVisible = location.pathname === '/terminal';
+  const target = { agentId: 'local', name: identity.data.name, capabilities: identity.data.capabilities };
   return (
     <StandaloneAgentProvider name={identity.data.name} capabilities={identity.data.capabilities}>
-      <AppShell identity={identity.data} terminal={<Suspense fallback={<p role="status">Loading Terminal…</p>}><TerminalPage visible={terminalVisible} /></Suspense>}>
+      <AppShell identity={identity.data} terminal={<Suspense fallback={<p role="status">Loading Terminal…</p>}><TerminalPage target={target} visible={terminalVisible} /></Suspense>}>
         <Suspense fallback={<p role="status">Loading page…</p>}>
           <Routes>
             <Route path="/" element={<Navigate to="/terminal" replace />} />
             <Route path="/login" element={<Navigate to="/terminal" replace />} />
             <Route path="/terminal" element={null} />
-            <Route path="/services" element={<CapabilityRoute identity={identity.data} capability="services.v1"><ServicesPage /></CapabilityRoute>} />
-            <Route path="/observations" element={<CapabilityRoute identity={identity.data} capability="observations.v2"><ObservationsPage /></CapabilityRoute>} />
-            <Route path="/logs" element={<CapabilityRoute identity={identity.data} capability="logs.v2"><LogsPage /></CapabilityRoute>} />
-            <Route path="/metrics" element={<CapabilityRoute identity={identity.data} capability="monitoring.snapshot.v1"><MetricsPage /></CapabilityRoute>} />
-            <Route path="/audit" element={<CapabilityRoute identity={identity.data} capability="audit.v1"><AuditPage /></CapabilityRoute>} />
+            <Route path="/services" element={<CapabilityRoute identity={identity.data} capability="services.v1"><ServicesPage target={target} /></CapabilityRoute>} />
+            <Route path="/observations" element={<CapabilityRoute identity={identity.data} capability="observations.v2"><ObservationsPage target={target} /></CapabilityRoute>} />
+            <Route path="/logs" element={<CapabilityRoute identity={identity.data} capability="logs.v2"><LogsPage target={target} /></CapabilityRoute>} />
+            <Route path="/metrics" element={<CapabilityRoute identity={identity.data} capability="monitoring.snapshot.v1"><MetricsPage target={target} /></CapabilityRoute>} />
+            <Route path="/audit" element={<CapabilityRoute identity={identity.data} capability="audit.v1"><AuditPage target={target} /></CapabilityRoute>} />
             <Route path="/settings/manager-access" element={<CapabilityRoute identity={identity.data} capability="runtime.v2"><ManagerAccessPage /></CapabilityRoute>} />
             <Route path="*" element={<section className="feature-page"><h1 tabIndex={-1}>Page not found</h1><a href="/terminal">Return to Terminal</a></section>} />
           </Routes>

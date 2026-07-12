@@ -24,7 +24,7 @@ it('requests a stable log ID with 100 lines and explicitly reports truncation', 
   vi.stubGlobal('fetch', fetchMock);
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const user = userEvent.setup();
-  render(<QueryClientProvider client={queryClient}><LogsPage /></QueryClientProvider>);
+  render(<QueryClientProvider client={queryClient}><LogsPage target={{ agentId: 'local', name: 'Build node', capabilities: ['logs.v2'] }} /></QueryClientProvider>);
 
   await user.click(await screen.findByRole('button', { name: 'Tail scheduler-log' }));
   expect(await screen.findByText('Output truncated to the latest 100 lines.')).toBeTruthy();

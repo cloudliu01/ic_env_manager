@@ -1,4 +1,4 @@
-import { DiskSnapshot } from '../../api/monitoring';
+import { DiskSnapshot } from '../../features/metrics/types';
 import { formatBytes, formatPercent } from './format';
 
 export function DiskTable({ disks }: { disks: DiskSnapshot[] }) {

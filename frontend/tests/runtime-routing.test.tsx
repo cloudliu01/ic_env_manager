@@ -12,15 +12,11 @@ vi.mock('../src/pages/LoginPage', () => ({
   ),
 }));
 
-vi.mock('../src/pages/TerminalPage', () => ({
+vi.mock('../src/features/terminal/TerminalPage', () => ({
   TerminalPage: ({ visible }: { visible?: boolean }) => {
     terminalMounts();
     return <div aria-label="Terminal page">Terminal visible: {String(visible)}</div>;
   },
-}));
-
-vi.mock('../src/pages/AppRoutes', () => ({
-  AppRoutes: () => <div>Legacy fleet application</div>,
 }));
 
 function response(body: unknown, status = 200) {

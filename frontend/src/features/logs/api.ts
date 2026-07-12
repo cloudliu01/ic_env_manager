@@ -1,31 +1,14 @@
 import { apiClient } from '../../shared/api/client';
+import { LogSource, LogTail } from './types';
 
-export type LogSource = {
-  id: string;
-  path: string;
-  last_updated: string;
-  observed_at: string;
-  ttl_seconds: number;
-  received_at: string;
-  expires_at: string;
-  producer_id: string;
-  updated_at: string;
-  stale: boolean;
-};
-
-export type LogTail = {
-  id: string;
-  path: string;
-  lines: string[];
-  line_count: number;
-  truncated: boolean;
-  last_updated: string;
-};
-
-export async function listLogs(signal?: AbortSignal): Promise<LogSource[]> {
-  return (await apiClient.request<{ items: LogSource[] }>('/api/v2/logs', { signal })).items;
+function path(agentId: string, suffix = '') {
+  return agentId === 'local' ? `/api/v2/logs${suffix}` : `/api/v2/agents/${encodeURIComponent(agentId)}/logs${suffix}`;
 }
 
-export function tailLog(logId: string, signal?: AbortSignal): Promise<LogTail> {
-  return apiClient.request<LogTail>(`/api/v2/logs/${encodeURIComponent(logId)}/tail?lines=100`, { signal });
+export async function listLogs(agentId: string, signal?: AbortSignal): Promise<LogSource[]> {
+  return (await apiClient.request<{ items: LogSource[] }>(path(agentId), { signal })).items;
+}
+
+export function tailLog(agentId: string, logId: string, signal?: AbortSignal): Promise<LogTail> {
+  return apiClient.request<LogTail>(`${path(agentId, `/${encodeURIComponent(logId)}/tail`)}?lines=100`, { signal });
 }

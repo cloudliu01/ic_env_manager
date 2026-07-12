@@ -1,8 +1,8 @@
 import { act, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { TerminalPane } from '../src/terminal/TerminalPane';
-import { apiClient } from '../src/api/client';
-import { createConnectToken, resizeTerminal } from '../src/api/terminals';
+import { TerminalPane } from '../src/features/terminal/TerminalPane';
+import { apiClient } from '../src/shared/api/client';
+import { createConnectToken, resizeTerminal } from '../src/features/terminal/api';
 
 const terminalWrites: string[] = [];
 const terminalOpenElements: Element[] = [];
@@ -48,7 +48,7 @@ class MockWebSocket {
   }
 }
 
-vi.mock('../src/api/terminals', () => ({
+vi.mock('../src/features/terminal/api', () => ({
   createConnectToken: vi.fn(async () => ({ ticket: 'ticket-1', expires_in_seconds: 60 })),
   resizeTerminal: vi.fn(async () => undefined),
 }));
@@ -201,6 +201,22 @@ describe('TerminalPane', () => {
 
     expect(socket.closed).toBe(true);
     expect(terminalWrites).toEqual([]);
+  });
+
+  it('closes the old Agent socket and ignores its output when the Agent target changes', async () => {
+    const { rerender } = render(<TerminalPane agentId="agent-a" terminalId="term-1" status="running" />);
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    const oldSocket = MockWebSocket.instances[0];
+
+    rerender(<TerminalPane agentId="agent-b" terminalId="term-1" status="running" />);
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2));
+    const newSocket = MockWebSocket.instances[1];
+
+    expect(oldSocket.closed).toBe(true);
+    act(() => oldSocket.emit('message', 'alpha output'));
+    act(() => newSocket.emit('message', 'beta output'));
+    await act(async () => { await Promise.resolve(); });
+    expect(terminalWrites).toEqual(['beta output']);
   });
 
   it('deduplicates terminal resize updates', async () => {

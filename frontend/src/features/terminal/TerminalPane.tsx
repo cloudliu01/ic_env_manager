@@ -2,9 +2,9 @@ import { useEffect, useRef, useState } from 'react';
 import { Terminal } from 'xterm';
 import 'xterm/css/xterm.css';
 import { FitAddon } from '@xterm/addon-fit';
-import { createConnectToken, resizeTerminal } from '../api/terminals';
-import { apiClient } from '../api/client';
-import { terminalWriter } from './terminalWriter';
+import { createConnectToken, resizeTerminal } from './api';
+import { apiClient } from '../../shared/api/client';
+import { terminalWriter } from '../../terminal/terminalWriter';
 
 export type TerminalPaneProps = {
   agentId: string;

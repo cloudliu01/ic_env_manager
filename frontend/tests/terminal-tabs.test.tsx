@@ -1,10 +1,12 @@
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
-import { TerminalPage } from '../src/pages/TerminalPage';
+import { TerminalPage } from '../src/features/terminal/TerminalPage';
 
-vi.mock('../src/api/terminals', () => ({
-  listTerminals: vi.fn(async () => []),
+const listTerminals = vi.hoisted(() => vi.fn(async () => []));
+
+vi.mock('../src/features/terminal/api', () => ({
+  listTerminals,
   createTerminal: vi.fn(async (_agentId: string) => ({
     id: 'term-1',
     owner: 'local-admin',
@@ -41,12 +43,7 @@ vi.mock('../src/api/terminals', () => ({
   })),
 }));
 
-vi.mock('../src/agents/StandaloneAgentContext', () => ({
-  supportsCapability: () => true,
-  useStandaloneAgent: () => ({ agentId: 'local', name: 'Build node', capabilities: ['terminals.v1'] }),
-}));
-
-vi.mock('../src/terminal/TerminalPane', () => ({
+vi.mock('../src/features/terminal/TerminalPane', () => ({
   TerminalPane: ({ agentId, terminalId, initialCursor }: { agentId: string; terminalId: string; initialCursor?: number }) => (
     <div aria-label="Terminal">terminal pane for {agentId} {terminalId} cursor {initialCursor}</div>
   ),
@@ -55,12 +52,13 @@ vi.mock('../src/terminal/TerminalPane', () => ({
 describe('TerminalPage', () => {
   it('creates and switches to a terminal tab', async () => {
     const user = userEvent.setup();
-    render(<TerminalPage />);
+    render(<TerminalPage target={{ agentId: 'agent-b', name: 'Beta', capabilities: ['terminals.v1'] }} />);
 
     await user.click(screen.getByRole('button', { name: /new terminal/i }));
 
     expect(await screen.findByRole('tab', { name: /terminal 1/i })).toBeTruthy();
     expect(screen.getByLabelText('Terminal')).toBeTruthy();
-    expect(screen.getByText(/terminal pane for local term-1 cursor 1234/i)).toBeTruthy();
+    expect(screen.getByText(/terminal pane for agent-b term-1 cursor 1234/i)).toBeTruthy();
+    expect(listTerminals).toHaveBeenCalledWith('agent-b', expect.anything());
   });
 });

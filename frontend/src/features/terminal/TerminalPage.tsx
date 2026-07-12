@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
-import { supportsCapability, useStandaloneAgent } from '../agents/StandaloneAgentContext';
-import { closeTerminal, createTerminal, listTerminals, TerminalSession } from '../api/terminals';
-import { TerminalPane } from '../terminal/TerminalPane';
+import { closeTerminal, createTerminal, listTerminals } from './api';
+import { TerminalPane } from './TerminalPane';
+import { AgentTarget, TerminalSession } from './types';
 
 type TerminalPageProps = {
+  target: AgentTarget;
   visible?: boolean;
 };
 
@@ -15,9 +16,9 @@ type TerminalAgentState = {
 
 const emptyAgentState: TerminalAgentState = { terminals: [], activeId: null, error: null };
 
-export function TerminalPage({ visible = true }: TerminalPageProps) {
-  const { agentId, capabilities } = useStandaloneAgent();
-  const supportsTerminals = supportsCapability(capabilities, 'terminals.v1');
+export function TerminalPage({ target, visible = true }: TerminalPageProps) {
+  const { agentId, capabilities } = target;
+  const supportsTerminals = capabilities.includes('terminals.v1');
   const [terminalStateByAgent, setTerminalStateByAgent] = useState<Record<string, TerminalAgentState>>({});
   const requestGeneration = useRef(0);
   const activeState = terminalStateByAgent[agentId] ?? emptyAgentState;
@@ -59,6 +60,8 @@ export function TerminalPage({ visible = true }: TerminalPageProps) {
     const controller = new AbortController();
     void refresh(controller.signal);
     return () => controller.abort();
+    // refresh intentionally reads the current agent target for this effect.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId, supportsTerminals]);
 
   async function openTerminal() {
