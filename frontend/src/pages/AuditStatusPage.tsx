@@ -33,7 +33,7 @@ function AuditTable({ events }: { events: AuditEvent[] }) {
   );
 }
 
-export function AuditStatusPage() {
+export function AuditStatusPage({ mode = 'manager' }: { mode?: 'standalone' | 'manager' }) {
   const { activeAgent, activeAgentId } = useActiveAgent();
   const supportsAudit = agentSupports(activeAgent, 'audit.v1');
   const [gatewayEvents, setGatewayEvents] = useState<AuditEvent[]>([]);
@@ -41,10 +41,17 @@ export function AuditStatusPage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    listGatewayAuditEvents(AUDIT_LIMIT)
-      .then((response) => setGatewayEvents(response.events))
-      .catch((err: Error) => setError(err.message));
-  }, []);
+    if (mode !== 'manager') {
+      setGatewayEvents([]);
+      return;
+    }
+    const controller = new AbortController();
+    let active = true;
+    listGatewayAuditEvents(AUDIT_LIMIT, controller.signal)
+      .then((response) => { if (active) setGatewayEvents(response.events); })
+      .catch((err: Error) => { if (active && err.name !== 'AbortError') setError(err.message); });
+    return () => { active = false; controller.abort(); };
+  }, [mode]);
 
   useEffect(() => {
     if (!activeAgentId || !supportsAudit) {
@@ -52,20 +59,23 @@ export function AuditStatusPage() {
       return;
     }
 
-    listAgentAuditEvents(activeAgentId, AUDIT_LIMIT)
-      .then((response) => setAgentEvents(response.events))
-      .catch((err: Error) => setError(err.message));
+    const controller = new AbortController();
+    let active = true;
+    listAgentAuditEvents(activeAgentId, AUDIT_LIMIT, controller.signal)
+      .then((response) => { if (active) setAgentEvents(response.events); })
+      .catch((err: Error) => { if (active && err.name !== 'AbortError') setError(err.message); });
+    return () => { active = false; controller.abort(); };
   }, [activeAgentId, supportsAudit]);
 
   return (
     <section>
-      <h2>Audit Status</h2>
+      <h1 tabIndex={-1}>Audit Status</h1>
       {error ? <p role="alert">{error}</p> : null}
 
-      <article>
+      {mode === 'manager' ? <article>
         <h3>Gateway audit</h3>
         <AuditTable events={gatewayEvents} />
-      </article>
+      </article> : null}
 
       <article>
         <h3>Agent audit</h3>

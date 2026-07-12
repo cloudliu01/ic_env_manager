@@ -68,8 +68,8 @@ describe('AuditStatusPage', () => {
     expect(screen.getAllByText('service').length).toBeGreaterThanOrEqual(2);
     expect(screen.getByText('Alpha agent')).toBeTruthy();
     expect(screen.queryByText(/token|password|private_key/i)).toBeNull();
-    expect(listGatewayAuditEvents).toHaveBeenCalledWith(100);
-    expect(listAgentAuditEvents).toHaveBeenCalledWith('agent-a', 100);
+    expect(listGatewayAuditEvents).toHaveBeenCalledWith(100, expect.any(AbortSignal));
+    expect(listAgentAuditEvents).toHaveBeenCalledWith('agent-a', 100, expect.any(AbortSignal));
   });
 
   it('does not request agent audit when no active agent is selected', async () => {
@@ -78,7 +78,17 @@ describe('AuditStatusPage', () => {
     render(<AuditStatusPage />);
 
     expect(await screen.findByText('No active agent selected.')).toBeTruthy();
-    await waitFor(() => expect(listGatewayAuditEvents).toHaveBeenCalledWith(100));
+    await waitFor(() => expect(listGatewayAuditEvents).toHaveBeenCalledWith(100, expect.any(AbortSignal)));
     expect(listAgentAuditEvents).not.toHaveBeenCalled();
+  });
+
+  it('uses only the abortable local Agent audit endpoint in standalone mode', async () => {
+    activeAgent.id = 'local';
+    render(<AuditStatusPage mode="standalone" />);
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Audit Status' })).toBeTruthy();
+    expect(screen.queryByText('Gateway audit')).toBeNull();
+    expect(listGatewayAuditEvents).not.toHaveBeenCalled();
+    await waitFor(() => expect(listAgentAuditEvents).toHaveBeenCalledWith('local', 100, expect.any(AbortSignal)));
   });
 });

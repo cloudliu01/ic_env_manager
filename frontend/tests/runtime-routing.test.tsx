@@ -30,7 +30,7 @@ function response(body: unknown, status = 200) {
   });
 }
 
-function mockAgentFetch(capabilities = ['runtime.v2', 'terminals.v1', 'observations.v2', 'logs.v2']) {
+function mockAgentFetch(capabilities = ['runtime.v2', 'terminals.v1', 'observations.v2', 'logs.v2'], unauthorizedPath?: string) {
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
     const path = String(input);
     if (path.endsWith('/api/v2/runtime')) {
@@ -43,6 +43,23 @@ function mockAgentFetch(capabilities = ['runtime.v2', 'terminals.v1', 'observati
         api_version: '2',
         agent_version: '0.2.0',
         capabilities,
+      });
+    }
+    if (unauthorizedPath && path.endsWith(unauthorizedPath)) {
+      return response({ error: { code: 'unauthorized', message: 'expired', correlation_id: 'expired-id' } }, 401);
+    }
+    if (path.endsWith('/api/services')) {
+      return response({ services: [] });
+    }
+    if (path.includes('/api/audit?')) {
+      return response({ events: [] });
+    }
+    if (path.endsWith('/api/monitoring/local')) {
+      return response({
+        host_id: 'local', name: 'build-node-01', address: '127.0.0.1', status: 'online', sampled_at: '2026-07-11T10:00:00Z',
+        cpu: { percent: 1, cores_logical: 4, cores_physical: 2, load_average: [] },
+        memory: { used_bytes: 1, total_bytes: 2, percent: 50 }, swap: { used_bytes: 0, total_bytes: 1, percent: 0 },
+        disks: [], network: [], uptime_seconds: 10,
       });
     }
     return response({ items: [], credentials: [] });
@@ -71,9 +88,48 @@ describe('runtime routing', () => {
     expect(await screen.findByText('Standalone Agent')).toBeTruthy();
     expect(screen.getByText('build-node-01')).toBeTruthy();
     expect(screen.getByText('d7d607bd-9d59-4351-8ef4-221e9d963fb7')).toBeTruthy();
-    expect(screen.getByLabelText('Terminal page')).toBeTruthy();
+    expect(await screen.findByLabelText('Terminal page')).toBeTruthy();
     expect(screen.queryByLabelText('Active agent')).toBeNull();
     expect(window.location.pathname).toBe('/terminal');
+  });
+
+  it('treats login as an explicit route and replaces it with terminal after authentication', async () => {
+    window.history.replaceState({}, '', '/login');
+    mockAgentFetch();
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', { name: 'Sign in' }));
+
+    expect(await screen.findByLabelText('Terminal page')).toBeTruthy();
+    expect(window.location.pathname).toBe('/terminal');
+    expect(screen.queryByRole('heading', { name: 'Page not found' })).toBeNull();
+  });
+
+  it('redirects an authenticated visit to login back to terminal', async () => {
+    mockAgentFetch();
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Sign in' }));
+    await screen.findByLabelText('Terminal page');
+
+    window.history.pushState({}, '', '/login');
+    window.dispatchEvent(new PopStateEvent('popstate'));
+
+    await waitFor(() => expect(window.location.pathname).toBe('/terminal'));
+    expect(screen.queryByRole('heading', { name: 'Page not found' })).toBeNull();
+  });
+
+  it('returns a 401-expired deep link to login without rendering a not-found page', async () => {
+    window.history.replaceState({}, '', '/logs');
+    mockAgentFetch(undefined, '/api/v2/logs');
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Sign in' }));
+
+    expect(await screen.findByRole('button', { name: 'Sign in' })).toBeTruthy();
+    expect(window.location.pathname).toBe('/logs');
+    expect(screen.queryByRole('heading', { name: 'Page not found' })).toBeNull();
   });
 
   it('keeps unavailable destinations visible, disabled, and explained', async () => {
@@ -95,6 +151,22 @@ describe('runtime routing', () => {
     await user.click(await screen.findByRole('button', { name: 'Sign in' }));
 
     const heading = await screen.findByRole('heading', { name: 'Logs' });
+    await waitFor(() => expect(document.activeElement).toBe(heading));
+  });
+
+  it.each([
+    ['/services', 'Services'],
+    ['/metrics', 'Machine telemetry'],
+    ['/audit', 'Audit Status'],
+  ])('focuses the %s top-level h1 after route load', async (path, title) => {
+    window.history.replaceState({}, '', path);
+    mockAgentFetch(['runtime.v2', 'terminals.v1', 'services.v1', 'monitoring.snapshot.v1', 'audit.v1']);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Sign in' }));
+
+    const heading = await screen.findByRole('heading', { level: 1, name: title });
+    expect(heading.getAttribute('tabindex')).toBe('-1');
     await waitFor(() => expect(document.activeElement).toBe(heading));
   });
 

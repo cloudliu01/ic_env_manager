@@ -52,7 +52,7 @@ export function ServiceListPage() {
 
   return (
     <section>
-      <h2>Services</h2>
+      <h1 tabIndex={-1}>Services</h1>
       {!activeAgentId ? <p>No active agent selected.</p> : null}
       {activeAgentId && !supportsServices ? <p>Selected agent does not support services.</p> : null}
       {services.map((service) => (

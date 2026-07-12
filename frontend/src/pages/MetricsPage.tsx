@@ -63,7 +63,7 @@ export function MetricsPage() {
       <header className="monitoring-hero">
         <div>
           <p className="eyebrow">Host monitoring</p>
-          <h2>Machine telemetry</h2>
+          <h1 tabIndex={-1}>Machine telemetry</h1>
           <p>Track CPU, memory, disk, uptime, and network activity for the selected agent.</p>
         </div>
         <div className="monitoring-actions">
