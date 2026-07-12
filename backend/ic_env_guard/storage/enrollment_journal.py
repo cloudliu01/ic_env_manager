@@ -393,8 +393,20 @@ class EnrollmentJournalRepository(_SQLiteRepository):
             raise RegistryInvariantError("rotation requires a replacement Agent")
         terminal = tuple(state.value for state in EnrollmentState if state.terminal)
         terminal_placeholders = ",".join("?" for _ in terminal)
+        expirable = tuple(state.value for state in _EXPIRABLE_STATES)
+        expirable_placeholders = ",".join("?" for _ in expirable)
         try:
             with self._write() as connection:
+                connection.execute(
+                    f"UPDATE agent_enrollment_jobs SET state=?, updated_at=? "
+                    f"WHERE state IN ({expirable_placeholders}) AND expires_at<=?",
+                    (
+                        EnrollmentState.EXPIRED.value,
+                        _format_time(now),
+                        *expirable,
+                        _format_time(now),
+                    ),
+                )
                 row = connection.execute(
                     f"SELECT {_AGENT_COLUMNS} FROM agents WHERE agent_id=?",
                     (job.replace_agent_id,),
@@ -403,6 +415,14 @@ class EnrollmentJournalRepository(_SQLiteRepository):
                     raise RegistryConflict("agent_not_found")
                 old = _agent(row)
                 assert_agent_mutation_allowed(connection, old.agent_id)
+                blocker = connection.execute(
+                    f"SELECT enrollment_id FROM agent_enrollment_jobs "
+                    f"WHERE replace_agent_id=? AND state NOT IN "
+                    f"({terminal_placeholders}) LIMIT 1",
+                    (old.agent_id, *terminal),
+                ).fetchone()
+                if blocker is not None:
+                    raise RegistryConflict("agent_mutation_in_progress")
                 captured = replace(
                     job,
                     normalized_endpoint=old.normalized_endpoint,
@@ -945,6 +965,38 @@ class EnrollmentJournalRepository(_SQLiteRepository):
                         enrollment_id,
                         owner,
                         expected_revision,
+                    ),
+                )
+            return cursor.rowcount == 1
+        except (SQLAlchemyError, sqlite3.Error) as exc:
+            raise RegistryError("enrollment journal storage is unavailable") from exc
+
+    def mark_recovery_claim_error(
+        self,
+        enrollment_id: str,
+        *,
+        owner: str,
+        expected_revision: int,
+        error_code: str,
+        now: datetime,
+    ) -> bool:
+        """Persist a compensation marker without releasing the active lease."""
+        if not _ERROR_CODE.fullmatch(error_code):
+            raise RegistryInvariantError("enrollment error code is invalid")
+        try:
+            with self._write() as connection:
+                cursor = connection.execute(
+                    "UPDATE agent_enrollment_jobs SET last_error_code=?, "
+                    "recovery_revision=recovery_revision+1, updated_at=? "
+                    "WHERE enrollment_id=? AND recovery_owner=? AND recovery_revision=? "
+                    "AND recovery_lease_until>? AND state='activated'",
+                    (
+                        error_code,
+                        _format_time(now),
+                        enrollment_id,
+                        owner,
+                        expected_revision,
+                        _format_time(now),
                     ),
                 )
             return cursor.rowcount == 1

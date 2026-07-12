@@ -1528,6 +1528,30 @@ class EnrollmentOrchestrator:
     ) -> None:
         self._mutation_failures[job.enrollment_id] = (code, dispatch_state)
 
+    def _mark_claim_error(
+        self, job: EnrollmentJob, code: str
+    ) -> EnrollmentJob | None:
+        now = self._clock()
+        try:
+            marked = self.journal.mark_recovery_claim_error(
+                job.enrollment_id,
+                owner=self._recovery_owner,
+                expected_revision=job.recovery_revision,
+                error_code=code,
+                now=now,
+            )
+        except RegistryError:
+            return None
+        if not marked:
+            self._reload_after_fence_loss(job.enrollment_id)
+            return None
+        return replace(
+            job,
+            last_error_code=code,
+            recovery_revision=job.recovery_revision + 1,
+            updated_at=now,
+        )
+
     def _reload_after_fence_loss(self, enrollment_id: str) -> None:
         try:
             self.journal.get(enrollment_id)
@@ -1777,8 +1801,10 @@ class EnrollmentOrchestrator:
         ):
             try:
                 registered = self.registry.swap_rotation(current, now=self._clock())
-            except RevisionConflict:
-                self._residual_claim(current, "agent_changed")
+            except (RegistryConflict, RevisionConflict):
+                await self._compensate_rotation_registry_mismatch(
+                    current, target, token
+                )
                 return
             except RegistryError:
                 self._residual_claim(current, "agent_registry_unavailable")
@@ -1838,6 +1864,10 @@ class EnrollmentOrchestrator:
         self, job: EnrollmentJob, target: Any, token: bytes
     ) -> None:
         """Revoke only the newly activated credential after a lost Registry CAS."""
+        marked = self._mark_claim_error(job, "agent_changed")
+        if marked is None:
+            return
+        job = marked
         outcome = await self._run_with_recovery_lease(
             job,
             self.agent_client.revoke(
@@ -1861,7 +1891,7 @@ class EnrollmentOrchestrator:
                 else "unknown"
             )
             self._record_mutation_failure(current, code, dispatch_state)
-            self._residual_claim(current, code)
+            self._residual_claim(current, "agent_changed")
             return
 
         new_reference = current.credential_temp_ref

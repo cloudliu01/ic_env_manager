@@ -76,4 +76,14 @@ class EnrollmentJournalRepository(Protocol):
         now: datetime,
     ) -> EnrollmentJob: ...
 
+    def mark_recovery_claim_error(
+        self,
+        enrollment_id: str,
+        *,
+        owner: str,
+        expected_revision: int,
+        error_code: str,
+        now: datetime,
+    ) -> bool: ...
+
     def recovery_credential_references(self) -> set[str]: ...

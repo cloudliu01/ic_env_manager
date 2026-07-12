@@ -145,6 +145,99 @@ def test_rotation_uses_explicit_start_or_consume_action(tmp_path):
 
 
 @pytest.mark.contract
+@pytest.mark.parametrize(
+    "state",
+    [
+        "pending",
+        "running",
+        "awaiting_cli",
+        "credential_issued",
+        "verifying",
+        "verified",
+        "activation_requested",
+        "activated",
+    ],
+)
+def test_second_nonterminal_rotation_start_is_rejected(tmp_path, state):
+    client = manager_client(tmp_path)
+    add_managed_agent(client)
+    body = {
+        "action": "start",
+        "ssh": {"user": "edaops", "host": "10.0.0.11", "port": 22},
+    }
+
+    first = client.post(
+        "/api/v2/agents/alpha/credential-rotation", headers=AUTH, json=body
+    )
+    enrollment_id = first.json()["rotation"]["enrollment_id"]
+    credential_states = {
+        "credential_issued",
+        "verifying",
+        "verified",
+        "activation_requested",
+        "activated",
+    }
+    activation_states = {"activation_requested", "activated"}
+    with client.app.state.container.database_engine.begin() as connection:
+        connection.exec_driver_sql(
+            "UPDATE agent_enrollment_jobs SET state=?, enrollment_method='ssh_auto', "
+            "credential_temp_ref=?, validated_http_address=?, remote_instance_id=?, "
+            "remote_credential_id=?, save_requested=?, requested_display_name='Alpha' "
+            "WHERE enrollment_id=?",
+            (
+                state,
+                "a" * 48 if state in credential_states else None,
+                "10.0.0.11" if state in credential_states else None,
+                (
+                    "33333333-3333-4333-8333-333333333333"
+                    if state in credential_states
+                    else None
+                ),
+                (
+                    "55555555-5555-4555-8555-555555555555"
+                    if state in credential_states
+                    else None
+                ),
+                int(state in activation_states),
+                enrollment_id,
+            ),
+        )
+    second = client.post(
+        "/api/v2/agents/alpha/credential-rotation", headers=AUTH, json=body
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 409
+    assert second.json()["error"]["code"] == "agent_mutation_in_progress"
+
+
+@pytest.mark.contract
+def test_terminal_rotation_jobs_do_not_block_a_new_start(tmp_path):
+    client = manager_client(tmp_path)
+    add_managed_agent(client)
+    container = client.app.state.container
+    body = {
+        "action": "start",
+        "ssh": {"user": "edaops", "host": "10.0.0.11", "port": 22},
+    }
+    current = client.post(
+        "/api/v2/agents/alpha/credential-rotation", headers=AUTH, json=body
+    ).json()["rotation"]["enrollment_id"]
+
+    for state in ("expired", "cancelled", "failed", "consumed"):
+        with container.database_engine.begin() as connection:
+            connection.exec_driver_sql(
+                "UPDATE agent_enrollment_jobs SET state=? WHERE enrollment_id=?",
+                (state, current),
+            )
+        started = client.post(
+            "/api/v2/agents/alpha/credential-rotation", headers=AUTH, json=body
+        )
+        assert started.status_code == 201
+        current = started.json()["rotation"]["enrollment_id"]
+
+
+@pytest.mark.contract
 def test_local_only_delete_requires_query_and_body_confirmation(tmp_path):
     client = manager_client(tmp_path)
     response = client.request(
