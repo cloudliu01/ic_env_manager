@@ -27,15 +27,19 @@ class PublicClientCidrMiddleware:
 
     def _allows(self, scope: dict[str, Any]) -> bool:
         client = scope.get("client")
-        if not isinstance(client, (list, tuple)) or not client:
+        if not isinstance(client, tuple) or len(client) != 2:
             return False
-        host = client[0]
+        host, port = client
         if not isinstance(host, str) or not host:
+            return False
+        if not isinstance(port, int) or isinstance(port, bool) or not 0 <= port <= 65535:
             return False
         try:
             peer: IPv4Address | IPv6Address = ip_address(host)
         except ValueError:
             return False
+        if isinstance(peer, IPv6Address) and peer.ipv4_mapped is not None:
+            peer = peer.ipv4_mapped
         return any(peer.version == network.version and peer in network for network in self.networks)
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:

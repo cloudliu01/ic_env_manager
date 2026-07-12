@@ -32,6 +32,43 @@ def _container(tmp_path, *client_cidrs: str):
     return build_agent_container(config, tmp_path / "state.db")
 
 
+async def _invoke_public_asgi(app, scope_type, client):
+    sent = []
+    request_received = False
+
+    async def receive():
+        nonlocal request_received
+        if scope_type == "websocket":
+            return {"type": "websocket.connect"}
+        if request_received:
+            return {"type": "http.disconnect"}
+        request_received = True
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": scope_type,
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "scheme": "ws" if scope_type == "websocket" else "http",
+        "path": "/ws/terminals/not-created" if scope_type == "websocket" else "/healthz",
+        "raw_path": (b"/ws/terminals/not-created" if scope_type == "websocket" else b"/healthz"),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [],
+        "client": client,
+        "server": ("0.0.0.0", 8765),
+    }
+    if scope_type == "http":
+        scope["method"] = "GET"
+    else:
+        scope["subprotocols"] = []
+    await app(scope, receive, send)
+    return sent
+
+
 @pytest.mark.security
 @pytest.mark.parametrize(
     ("method", "path"),
@@ -94,6 +131,29 @@ def test_public_http_uses_actual_ipv4_or_ipv6_socket_peer(tmp_path, cidr, peer):
 
 
 @pytest.mark.security
+def test_public_http_normalizes_ipv4_mapped_ipv6_peer_for_ipv4_cidr(tmp_path):
+    container = _container(tmp_path, "10.20.30.0/24")
+    response = TestClient(create_public_app(container), client=("::ffff:10.20.30.40", 50000)).get(
+        "/healthz"
+    )
+
+    assert response.status_code == 200
+    container.database_engine.dispose()
+
+
+@pytest.mark.security
+def test_public_http_rejects_ipv4_mapped_ipv6_peer_outside_ipv4_cidr(tmp_path):
+    container = _container(tmp_path, "10.20.30.0/24")
+    response = TestClient(create_public_app(container), client=("::ffff:10.20.31.40", 50000)).get(
+        "/healthz"
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "public_client_forbidden"
+    container.database_engine.dispose()
+
+
+@pytest.mark.security
 @pytest.mark.parametrize("peer", ["127.0.0.1", "::1", "not-an-ip", ""])
 def test_public_http_fails_closed_unless_exact_peer_is_in_a_configured_cidr(tmp_path, peer):
     container = _container(tmp_path, "10.20.30.0/24")
@@ -143,6 +203,56 @@ async def test_public_http_fails_closed_when_asgi_client_is_missing(tmp_path):
 
     response_start = next(message for message in sent if message["type"] == "http.response.start")
     assert response_start["status"] == 403
+    container.database_engine.dispose()
+
+
+@pytest.mark.security
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope_type", ["http", "websocket"])
+@pytest.mark.parametrize(
+    "malformed_client",
+    [
+        ("10.20.30.40",),
+        ("10.20.30.40", 50000, "extra"),
+        ["10.20.30.40", 50000],
+        ("10.20.30.40", "50000"),
+        ("10.20.30.40", -1),
+        ("10.20.30.40", 65536),
+        ("10.20.30.40", True),
+        (b"10.20.30.40", 50000),
+    ],
+)
+async def test_public_fails_closed_for_noncanonical_asgi_clients(
+    tmp_path, scope_type, malformed_client
+):
+    container = _container(tmp_path, "10.20.30.0/24")
+    sent = await _invoke_public_asgi(create_public_app(container), scope_type, malformed_client)
+
+    if scope_type == "http":
+        response_start = next(
+            message for message in sent if message["type"] == "http.response.start"
+        )
+        assert response_start["status"] == 403
+    else:
+        assert sent == [
+            {
+                "type": "websocket.close",
+                "code": 4403,
+                "reason": "public_client_forbidden",
+            }
+        ]
+    container.database_engine.dispose()
+
+
+@pytest.mark.security
+@pytest.mark.asyncio
+@pytest.mark.parametrize("port", [0, 65535])
+async def test_public_accepts_canonical_asgi_client_port_boundaries(tmp_path, port):
+    container = _container(tmp_path, "10.20.30.0/24")
+    sent = await _invoke_public_asgi(create_public_app(container), "http", ("10.20.30.40", port))
+
+    response_start = next(message for message in sent if message["type"] == "http.response.start")
+    assert response_start["status"] == 200
     container.database_engine.dispose()
 
 
