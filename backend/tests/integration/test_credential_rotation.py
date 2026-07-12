@@ -1,17 +1,29 @@
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
+from threading import Barrier
 from types import SimpleNamespace
 
 import pytest
 
 from ic_env_guard.config.models import AppConfig, AuthConfig, ControlPlaneConfig
 from ic_env_guard.db.control_plane_migrations import run_control_plane_migrations
+from ic_env_guard.db.session import create_sqlite_engine
 from ic_env_guard.enrollment.agent_client import EnrollmentValidationError
 from ic_env_guard.enrollment.credential_store import CredentialStoreError
 from ic_env_guard.enrollment.jobs import EnrollmentConflict
-from ic_env_guard.fleet.models import AgentRecord, EnrollmentMethod, EnrollmentState
+from ic_env_guard.enrollment.orchestrator import MutationSagaError
+from ic_env_guard.fleet.models import (
+    AgentRecord,
+    EnrollmentMethod,
+    EnrollmentState,
+    RegistryConflict,
+    RevisionConflict,
+)
 from ic_env_guard.main import create_app
+from ic_env_guard.storage.enrollment_journal import EnrollmentJournalRepository
+from ic_env_guard.storage.manager_registry import ManagerRegistryRepository
 
 NOW = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
 
@@ -301,6 +313,7 @@ async def test_rotation_consume_rejects_corrupt_mismatched_captured_identity(tmp
                 remote_credential_id="55555555-5555-4555-8555-555555555555",
                 credential_temp_ref=new_ref,
                 validated_http_address="10.0.0.11",
+                last_error_code=None,
                 updated_at=NOW,
             ),
             expected_state=current.state,
@@ -325,6 +338,17 @@ async def test_rotation_consume_rejects_corrupt_mismatched_captured_identity(tmp
             (current.enrollment_id,),
         )
 
+    second_engine = create_sqlite_engine(tmp_path / "manager.db")
+    second_registry = ManagerRegistryRepository(second_engine)
+    try:
+        with pytest.raises(RegistryConflict, match="agent_mutation_in_progress"):
+            second_registry.update_if_revision(
+                replace(old, display_name="Concurrent rename"),
+                expected_revision=old.revision,
+            )
+    finally:
+        second_engine.dispose()
+
     class NoDispatchClient:
         def prepare_pinned(self, *_args):
             raise AssertionError("identity mismatch must be fenced before dispatch")
@@ -339,3 +363,223 @@ async def test_rotation_consume_rejects_corrupt_mismatched_captured_identity(tmp
     assert startup_residual.state is EnrollmentState.ACTIVATION_REQUESTED
     assert startup_residual.last_error_code == "agent_identity_changed"
     assert container.registry_repository.get("alpha") == old
+
+
+@pytest.mark.integration
+async def test_post_activate_swap_mismatch_revokes_new_and_preserves_concurrent_registry(
+    tmp_path,
+):
+    token_file = tmp_path / "manager.token"
+    token_file.write_text("manager-secret\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    app = create_app(
+        config=AppConfig(
+            mode="control-plane",
+            auth=AuthConfig(token_file=token_file),
+            control_plane=ControlPlaneConfig(
+                audit_database=tmp_path / "manager.db",
+                allowed_agent_cidrs=["10.0.0.0/8"],
+            ),
+        )
+    )
+    container = app.state.container
+    with container.credential_store.lifecycle_lease():
+        old_ref = container.credential_store.put(b"old-token")
+        new_ref = container.credential_store.put(b"new-token")
+        concurrent_ref = container.credential_store.put(b"concurrent-token")
+    old = AgentRecord(
+        agent_id="alpha",
+        instance_id="33333333-3333-4333-8333-333333333333",
+        display_name="Alpha",
+        normalized_endpoint="https://10.0.0.11:8765",
+        credential_ref=old_ref,
+        remote_credential_id="44444444-4444-4444-8444-444444444444",
+        transport_profile_id="system-tls",
+        enrollment_method=EnrollmentMethod.SSH_AUTO,
+        enabled=True,
+        source="manual",
+        revision=3,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    container.registry_repository.create(old)
+    orchestrator = container.enrollment_orchestrator
+    orchestrator._clock = lambda: NOW
+    current = orchestrator.start_rotation(
+        "alpha", ssh_user="edaops", ssh_host="10.0.0.11", ssh_port=22
+    ).job
+    for state in (
+        EnrollmentState.CREDENTIAL_ISSUED,
+        EnrollmentState.VERIFYING,
+        EnrollmentState.VERIFIED,
+    ):
+        current = container.enrollment_journal_repository.replace_if_state(
+            replace(
+                current,
+                state=state,
+                remote_instance_id=old.instance_id,
+                remote_credential_id="55555555-5555-4555-8555-555555555555",
+                credential_temp_ref=new_ref,
+                validated_http_address="10.0.0.11",
+                last_error_code=None,
+                updated_at=NOW,
+            ),
+            expected_state=current.state,
+        )
+
+    class Client:
+        calls = []
+        fail_revoke = True
+
+        def prepare_pinned(self, *_args):
+            return object()
+
+        async def activate(self, _target, token, **_kwargs):
+            self.calls.append(("activate", token))
+            with container.database_engine.begin() as connection:
+                connection.exec_driver_sql(
+                    "UPDATE agents SET credential_ref=?, remote_credential_id=?, revision=4 "
+                    "WHERE agent_id='alpha'",
+                    (concurrent_ref, "77777777-7777-4777-8777-777777777777"),
+                )
+
+        async def revoke(self, _target, token, *, credential_id):
+            self.calls.append(("revoke", token, credential_id))
+            if self.fail_revoke:
+                raise EnrollmentValidationError(
+                    "agent_network_error", dispatch_state="unknown"
+                )
+
+    client = Client()
+    orchestrator.agent_client = client
+
+    with pytest.raises(MutationSagaError, match="agent_network_error") as caught:
+        await orchestrator.consume_rotation("alpha", current.enrollment_id)
+    assert caught.value.dispatch_state == "unknown"
+
+    uncertain = container.enrollment_journal_repository.get(current.enrollment_id)
+    assert uncertain.state is EnrollmentState.ACTIVATED
+    assert uncertain.credential_temp_ref == new_ref
+    assert uncertain.validated_http_address == "10.0.0.11"
+    assert container.credential_store.read(new_ref) == b"new-token"
+
+    client.fail_revoke = False
+    await orchestrator.recover()
+
+    residual = container.enrollment_journal_repository.get(current.enrollment_id)
+    assert residual.state is EnrollmentState.FAILED
+    assert residual.last_error_code == "agent_changed"
+    assert residual.credential_temp_ref is None
+    assert residual.old_credential_ref is None
+    registered = container.registry_repository.get("alpha")
+    assert registered.credential_ref == concurrent_ref
+    assert container.credential_store.read(concurrent_ref) == b"concurrent-token"
+    assert container.credential_store.read(old_ref) == b"old-token"
+    with pytest.raises(CredentialStoreError):
+        container.credential_store.read(new_ref)
+    assert client.calls[-1] == (
+        "revoke",
+        b"new-token",
+        "55555555-5555-4555-8555-555555555555",
+    )
+
+
+@pytest.mark.integration
+async def test_rotation_consume_and_registry_update_are_one_atomic_winner(tmp_path):
+    token_file = tmp_path / "manager.token"
+    token_file.write_text("manager-secret\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    app = create_app(
+        config=AppConfig(
+            mode="control-plane",
+            auth=AuthConfig(token_file=token_file),
+            control_plane=ControlPlaneConfig(
+                audit_database=tmp_path / "manager.db",
+                allowed_agent_cidrs=["10.0.0.0/8"],
+            ),
+        )
+    )
+    container = app.state.container
+    with container.credential_store.lifecycle_lease():
+        old_ref = container.credential_store.put(b"old-token")
+        new_ref = container.credential_store.put(b"new-token")
+    old = AgentRecord(
+        agent_id="alpha",
+        instance_id="33333333-3333-4333-8333-333333333333",
+        display_name="Alpha",
+        normalized_endpoint="https://10.0.0.11:8765",
+        credential_ref=old_ref,
+        remote_credential_id="44444444-4444-4444-8444-444444444444",
+        transport_profile_id="system-tls",
+        enrollment_method=EnrollmentMethod.SSH_AUTO,
+        enabled=True,
+        source="manual",
+        revision=1,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    container.registry_repository.create(old)
+    orchestrator = container.enrollment_orchestrator
+    orchestrator._clock = lambda: NOW
+    current = orchestrator.start_rotation(
+        "alpha", ssh_user="edaops", ssh_host="10.0.0.11", ssh_port=22
+    ).job
+    for state in (
+        EnrollmentState.CREDENTIAL_ISSUED,
+        EnrollmentState.VERIFYING,
+        EnrollmentState.VERIFIED,
+    ):
+        current = container.enrollment_journal_repository.replace_if_state(
+            replace(
+                current,
+                state=state,
+                remote_instance_id=old.instance_id,
+                remote_credential_id="55555555-5555-4555-8555-555555555555",
+                credential_temp_ref=new_ref,
+                validated_http_address="10.0.0.11",
+                last_error_code=None,
+                updated_at=NOW,
+            ),
+            expected_state=current.state,
+        )
+
+    second_engine = create_sqlite_engine(tmp_path / "manager.db")
+    second_journal = EnrollmentJournalRepository(second_engine)
+    barrier = Barrier(2)
+
+    def consume():
+        barrier.wait()
+        try:
+            second_journal.consume_rotation(
+                current.enrollment_id,
+                agent_id="alpha",
+                display_name="Alpha",
+                now=NOW,
+            )
+            return "consume_ok"
+        except (RegistryConflict, RevisionConflict) as exc:
+            return str(exc)
+
+    def update():
+        barrier.wait()
+        try:
+            container.registry_repository.update_if_revision(
+                replace(old, display_name="Concurrent rename"),
+                expected_revision=old.revision,
+            )
+            return "update_ok"
+        except (RegistryConflict, RevisionConflict) as exc:
+            return str(exc)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            consume_future = pool.submit(consume)
+            update_future = pool.submit(update)
+            results = {consume_future.result(), update_future.result()}
+    finally:
+        second_engine.dispose()
+
+    assert results in (
+        {"consume_ok", "agent_mutation_in_progress"},
+        {"update_ok", "agent_changed"},
+    )

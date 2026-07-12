@@ -22,6 +22,7 @@ from ic_env_guard.storage.manager_registry import (
     _parse_time,
     _SQLiteRepository,
 )
+from ic_env_guard.storage.mutation_fence import assert_agent_mutation_allowed
 
 _COLUMNS = (
     "removal_id, agent_id, captured_revision, credential_ref, remote_credential_id, "
@@ -89,6 +90,7 @@ class AgentRemovalRepository(_SQLiteRepository):
                 if row is None:
                     raise RegistryConflict("agent_not_found")
                 agent = _agent(row)
+                assert_agent_mutation_allowed(connection, agent.agent_id)
                 job = AgentRemovalJob(
                     removal_id=str(uuid4()),
                     agent_id=agent.agent_id,

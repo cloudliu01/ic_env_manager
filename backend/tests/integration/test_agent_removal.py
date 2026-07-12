@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -9,11 +10,13 @@ from ic_env_guard.db.control_plane_audit import (
     ControlPlaneAuditEventCreate,
     ControlPlaneAuditRepository,
 )
+from ic_env_guard.db.session import create_sqlite_engine
 from ic_env_guard.enrollment.agent_client import EnrollmentValidationError
 from ic_env_guard.enrollment.credential_store import CredentialStoreError
 from ic_env_guard.enrollment.jobs import EnrollmentConflict
 from ic_env_guard.fleet.models import AgentRecord, EnrollmentMethod, RegistryConflict
 from ic_env_guard.main import create_app
+from ic_env_guard.storage.manager_registry import ManagerRegistryRepository
 
 NOW = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
 
@@ -140,12 +143,28 @@ def test_removal_journal_snapshots_target_and_registry_delete_is_cas(tmp_path):
     assert job.credential_ref == reference
     assert job.normalized_endpoint == record.normalized_endpoint
     assert removals.list_recoverable() == (job,)
+    second_engine = create_sqlite_engine(tmp_path / "manager.db")
+    second_registry = ManagerRegistryRepository(second_engine)
+    try:
+        with pytest.raises(RegistryConflict, match="agent_mutation_in_progress"):
+            second_registry.update_if_revision(
+                replace(record, display_name="Concurrent rename"),
+                expected_revision=record.revision,
+            )
+    finally:
+        second_engine.dispose()
     assert container.registry_repository.delete_if_revision_and_credential(
-        "alpha", expected_revision=1, expected_credential_ref=reference
+        "alpha",
+        expected_revision=1,
+        expected_credential_ref=reference,
+        owner_removal_id=job.removal_id,
     ) is False
     assert container.registry_repository.get("alpha") == record
     assert container.registry_repository.delete_if_revision_and_credential(
-        "alpha", expected_revision=2, expected_credential_ref=reference
+        "alpha",
+        expected_revision=2,
+        expected_credential_ref=reference,
+        owner_removal_id=job.removal_id,
     ) is True
 
 

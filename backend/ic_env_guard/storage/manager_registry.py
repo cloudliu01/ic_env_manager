@@ -26,6 +26,7 @@ from ic_env_guard.fleet.models import (
     RegistryInvariantError,
     RevisionConflict,
 )
+from ic_env_guard.storage.mutation_fence import assert_agent_mutation_allowed
 
 _AGENT_COLUMNS = (
     "agent_id, instance_id, display_name, normalized_endpoint, credential_ref, "
@@ -344,7 +345,12 @@ class ManagerRegistryRepository(_SQLiteRepository):
             raise RegistryError("agent registry storage is unavailable") from exc
 
     def update_if_revision(
-        self, record: AgentRecord, expected_revision: int
+        self,
+        record: AgentRecord,
+        expected_revision: int,
+        *,
+        owner_enrollment_id: str | None = None,
+        owner_removal_id: str | None = None,
     ) -> AgentRecord:
         if expected_revision < 1:
             raise RegistryInvariantError("expected revision must be positive")
@@ -353,6 +359,12 @@ class ManagerRegistryRepository(_SQLiteRepository):
         values = self._values(updated)
         try:
             with self._write() as connection:
+                assert_agent_mutation_allowed(
+                    connection,
+                    record.agent_id,
+                    owner_enrollment_id=owner_enrollment_id,
+                    owner_removal_id=owner_removal_id,
+                )
                 cursor = connection.execute(
                     "UPDATE agents SET instance_id=?, display_name=?, normalized_endpoint=?, "
                     "credential_ref=?, remote_credential_id=?, transport_profile_id=?, "
@@ -376,6 +388,8 @@ class ManagerRegistryRepository(_SQLiteRepository):
         *,
         expected_revision: int,
         now: datetime,
+        owner_enrollment_id: str | None = None,
+        owner_removal_id: str | None = None,
     ) -> AgentRecord:
         updated = replace(
             record,
@@ -387,6 +401,12 @@ class ManagerRegistryRepository(_SQLiteRepository):
         connection_status = "unknown" if updated.enabled else "disabled"
         try:
             with self._write() as connection:
+                assert_agent_mutation_allowed(
+                    connection,
+                    record.agent_id,
+                    owner_enrollment_id=owner_enrollment_id,
+                    owner_removal_id=owner_removal_id,
+                )
                 cursor = connection.execute(
                     "UPDATE agents SET instance_id=?, display_name=?, normalized_endpoint=?, "
                     "credential_ref=?, remote_credential_id=?, transport_profile_id=?, "
@@ -435,38 +455,55 @@ class ManagerRegistryRepository(_SQLiteRepository):
             value is None for value in required
         ):
             raise RegistryInvariantError("rotation snapshot is incomplete")
-        old = self.get(job.replace_agent_id or "")
-        if old is None:
-            raise RegistryConflict("agent_not_found")
-        updated = AgentRecord(
-            agent_id=old.agent_id,
-            instance_id=job.remote_instance_id,
-            display_name=job.old_display_name or old.display_name,
-            normalized_endpoint=job.normalized_endpoint,
-            credential_ref=job.credential_temp_ref or "",
-            remote_credential_id=job.remote_credential_id,
-            transport_profile_id=job.transport_profile_id,
-            enrollment_method=job.enrollment_method,
-            enabled=bool(job.old_enabled),
-            source=job.old_source or old.source,
-            revision=job.old_registry_revision or old.revision,
-            created_at=old.created_at,
-            updated_at=now,
-        )
-        _validate_record(replace(updated, revision=updated.revision + 1))
         try:
             with self._write() as connection:
-                values = self._values(replace(updated, revision=updated.revision + 1))
+                row = connection.execute(
+                    f"SELECT {_AGENT_COLUMNS} FROM agents WHERE agent_id=?",
+                    (job.replace_agent_id,),
+                ).fetchone()
+                if row is None:
+                    raise RegistryConflict("agent_not_found")
+                old = _agent(row)
+                assert_agent_mutation_allowed(
+                    connection,
+                    old.agent_id,
+                    owner_enrollment_id=job.enrollment_id,
+                )
+                if (
+                    old.revision != job.old_registry_revision
+                    or old.credential_ref != job.old_credential_ref
+                    or old.instance_id != job.old_instance_id
+                ):
+                    raise RevisionConflict("Agent changed during credential rotation")
+                updated = AgentRecord(
+                    agent_id=old.agent_id,
+                    instance_id=job.remote_instance_id,
+                    display_name=job.old_display_name or old.display_name,
+                    normalized_endpoint=job.normalized_endpoint,
+                    credential_ref=job.credential_temp_ref or "",
+                    remote_credential_id=job.remote_credential_id,
+                    transport_profile_id=job.transport_profile_id,
+                    enrollment_method=job.enrollment_method,
+                    enabled=bool(job.old_enabled),
+                    source=job.old_source or old.source,
+                    revision=(job.old_registry_revision or old.revision) + 1,
+                    created_at=old.created_at,
+                    updated_at=now,
+                )
+                _validate_record(updated)
+                values = self._values(updated)
                 cursor = connection.execute(
                     "UPDATE agents SET instance_id=?, display_name=?, normalized_endpoint=?, "
                     "credential_ref=?, remote_credential_id=?, transport_profile_id=?, "
                     "enrollment_method=?, enabled=?, source=?, revision=?, created_at=?, "
-                    "updated_at=? WHERE agent_id=? AND revision=? AND credential_ref=?",
+                    "updated_at=? WHERE agent_id=? AND revision=? AND credential_ref=? "
+                    "AND instance_id=?",
                     (
                         *values[1:],
                         updated.agent_id,
                         job.old_registry_revision,
                         job.old_credential_ref,
+                        job.old_instance_id,
                     ),
                 )
                 if cursor.rowcount != 1:
@@ -482,19 +519,31 @@ class ManagerRegistryRepository(_SQLiteRepository):
                     "stale_after=NULL, api_version=NULL, agent_version=NULL, "
                     "capabilities_json='[]', "
                     "summary_json='{}', last_error_code=NULL, updated_at=excluded.updated_at",
-                    (updated.agent_id, updated.revision + 1, _format_time(now)),
+                    (updated.agent_id, updated.revision, _format_time(now)),
                 )
-            return replace(updated, revision=updated.revision + 1)
-        except RevisionConflict:
+            return updated
+        except (RegistryConflict, RevisionConflict):
             raise
         except sqlite3.IntegrityError as exc:
             raise RegistryConflict("agent identity or endpoint already exists") from exc
         except (SQLAlchemyError, sqlite3.Error) as exc:
             raise RegistryError("agent registry storage is unavailable") from exc
 
-    def delete(self, agent_id: str) -> None:
+    def delete(
+        self,
+        agent_id: str,
+        *,
+        owner_enrollment_id: str | None = None,
+        owner_removal_id: str | None = None,
+    ) -> None:
         try:
             with self._write() as connection:
+                assert_agent_mutation_allowed(
+                    connection,
+                    agent_id,
+                    owner_enrollment_id=owner_enrollment_id,
+                    owner_removal_id=owner_removal_id,
+                )
                 connection.execute("DELETE FROM agents WHERE agent_id = ?", (agent_id,))
         except (SQLAlchemyError, sqlite3.Error) as exc:
             raise RegistryError("agent registry storage is unavailable") from exc
@@ -505,9 +554,17 @@ class ManagerRegistryRepository(_SQLiteRepository):
         *,
         expected_revision: int,
         expected_credential_ref: str,
+        owner_enrollment_id: str | None = None,
+        owner_removal_id: str | None = None,
     ) -> bool:
         try:
             with self._write() as connection:
+                assert_agent_mutation_allowed(
+                    connection,
+                    agent_id,
+                    owner_enrollment_id=owner_enrollment_id,
+                    owner_removal_id=owner_removal_id,
+                )
                 cursor = connection.execute(
                     "DELETE FROM agents WHERE agent_id=? AND revision=? AND credential_ref=?",
                     (agent_id, expected_revision, expected_credential_ref),

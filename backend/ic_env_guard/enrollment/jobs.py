@@ -163,7 +163,11 @@ class EnrollmentJobs:
             )
         except RegistryConflict as exc:
             code = str(exc)
-            if code in {"agent_not_found", "agent_enrollment_capacity"}:
+            if code in {
+                "agent_not_found",
+                "agent_enrollment_capacity",
+                "agent_mutation_in_progress",
+            }:
                 raise EnrollmentConflict(code) from exc
             raise EnrollmentConflict("agent_enrollment_conflict") from exc
 
@@ -257,5 +261,37 @@ class EnrollmentJobs:
                 ),
                 expected_state=EnrollmentState.VERIFIED,
             )
+        except RevisionConflict as exc:
+            raise EnrollmentConflict("agent_enrollment_conflict") from exc
+
+    def consume_rotation(
+        self,
+        enrollment_id: str,
+        *,
+        agent_id: str,
+        display_name: str,
+        now: datetime | None = None,
+    ) -> EnrollmentJob:
+        try:
+            return self.repository.consume_rotation(
+                enrollment_id,
+                agent_id=agent_id,
+                display_name=display_name,
+                now=now or datetime.now(UTC),
+            )
+        except RegistryConflict as exc:
+            code = str(exc)
+            if code in {
+                "agent_enrollment_not_found",
+                "agent_enrollment_consumed",
+                "agent_enrollment_expired",
+                "agent_enrollment_not_verified",
+                "agent_enrollment_conflict",
+                "agent_not_found",
+                "agent_changed",
+                "agent_mutation_in_progress",
+            }:
+                raise EnrollmentConflict(code) from exc
+            raise EnrollmentConflict("agent_enrollment_conflict") from exc
         except RevisionConflict as exc:
             raise EnrollmentConflict("agent_enrollment_conflict") from exc

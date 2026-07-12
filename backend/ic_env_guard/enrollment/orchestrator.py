@@ -142,6 +142,15 @@ class _AutoStateLost(Exception):
     pass
 
 
+class MutationSagaError(EnrollmentConflict):
+    def __init__(
+        self, code: str, *, dispatch_state: str, recoverable: bool = False
+    ) -> None:
+        super().__init__(code)
+        self.dispatch_state = dispatch_state
+        self.recoverable = recoverable
+
+
 class EnrollmentOrchestrator:
     def __init__(
         self,
@@ -165,6 +174,7 @@ class EnrollmentOrchestrator:
         self.credential_store = credential_store
         self.agent_client = agent_client
         self.registry = registry
+        self._mutation_failures: dict[str, tuple[str, str]] = {}
         self._clock = clock or (lambda: datetime.now(UTC))
         self.ssh_adapter = ssh_adapter
         self.service_key_adapter = service_key_adapter
@@ -338,7 +348,13 @@ class EnrollmentOrchestrator:
         record = self.registry.get(requested.enrollment_id)
         if current is None or current.state is not EnrollmentState.CONSUMED or record is None:
             code = current.last_error_code if current is not None else None
-            raise EnrollmentConflict(code or "agent_enrollment_activation_pending")
+            failure = self._mutation_failures.pop(enrollment_id, None)
+            if failure is not None:
+                raise MutationSagaError(failure[0], dispatch_state=failure[1])
+            raise MutationSagaError(
+                code or "agent_enrollment_activation_pending",
+                dispatch_state="unknown",
+            )
         return record
 
     async def consume_rotation(
@@ -354,16 +370,13 @@ class EnrollmentOrchestrator:
             current.old_enrollment_method is not EnrollmentMethod.LEGACY_ADMIN_TOKEN
             and current.remote_instance_id != current.old_instance_id
         ):
-            raise EnrollmentConflict("agent_identity_changed")
-        if (
-            registered.revision != current.old_registry_revision
-            or registered.credential_ref != current.old_credential_ref
-        ):
-            raise EnrollmentConflict("agent_changed")
-        requested = self.jobs.consume(
+            raise MutationSagaError(
+                "agent_identity_changed", dispatch_state="not_dispatched"
+            )
+        requested = self.jobs.consume_rotation(
             enrollment_id,
+            agent_id=agent_id,
             display_name=current.old_display_name or registered.display_name,
-            input_fingerprint=job_input_fingerprint(current),
             now=self._clock(),
         )
         await self.recover()
@@ -375,7 +388,15 @@ class EnrollmentOrchestrator:
             or rotated is None
         ):
             code = finished.last_error_code if finished is not None else None
-            raise EnrollmentConflict(code or "agent_enrollment_activation_pending")
+            failure = self._mutation_failures.pop(requested.enrollment_id, None)
+            if failure is not None:
+                raise MutationSagaError(
+                    failure[0], dispatch_state=failure[1]
+                )
+            raise MutationSagaError(
+                code or "agent_enrollment_activation_pending",
+                dispatch_state="unknown",
+            )
         return rotated
 
     async def update_agent(
@@ -408,11 +429,17 @@ class EnrollmentOrchestrator:
                     target, token, helper_instance_id=current.instance_id
                 )
             except EnrollmentValidationError as exc:
-                raise EnrollmentConflict(exc.code) from exc
+                raise MutationSagaError(
+                    exc.code, dispatch_state=exc.dispatch_state
+                ) from exc
             except CredentialStoreError as exc:
-                raise EnrollmentConflict("agent_credential_unavailable") from exc
+                raise MutationSagaError(
+                    "agent_credential_unavailable", dispatch_state="not_dispatched"
+                ) from exc
             if validation.instance_id != current.instance_id:
-                raise EnrollmentConflict("agent_identity_changed")
+                raise MutationSagaError(
+                    "agent_identity_changed", dispatch_state="dispatched"
+                )
             endpoint = validation.normalized_endpoint
         candidate = replace(
             current,
@@ -428,11 +455,24 @@ class EnrollmentOrchestrator:
                 now=self._clock(),
             )
         except RevisionConflict as exc:
-            raise EnrollmentConflict("agent_changed") from exc
+            raise MutationSagaError(
+                "agent_changed",
+                dispatch_state="dispatched" if target_changed else "not_dispatched",
+            ) from exc
         except RegistryConflict as exc:
-            raise EnrollmentConflict("agent_already_registered") from exc
+            if str(exc) == "agent_mutation_in_progress":
+                code = "agent_mutation_in_progress"
+            else:
+                code = "agent_already_registered"
+            raise MutationSagaError(
+                code,
+                dispatch_state="dispatched" if target_changed else "not_dispatched",
+            ) from exc
         except RegistryError as exc:
-            raise EnrollmentConflict("agent_registry_unavailable") from exc
+            raise MutationSagaError(
+                "agent_registry_unavailable",
+                dispatch_state="dispatched" if target_changed else "not_dispatched",
+            ) from exc
 
     async def remove_agent(
         self,
@@ -505,7 +545,11 @@ class EnrollmentOrchestrator:
                         now=self._clock(),
                         last_error_code=exc.code,
                     )
-                    raise EnrollmentConflict(exc.code) from exc
+                    raise MutationSagaError(
+                        exc.code,
+                        dispatch_state=exc.dispatch_state,
+                        recoverable=True,
+                    ) from exc
                 except CredentialStoreError as exc:
                     self._removals.transition(
                         current,
@@ -513,13 +557,18 @@ class EnrollmentOrchestrator:
                         now=self._clock(),
                         last_error_code="agent_credential_unavailable",
                     )
-                    raise EnrollmentConflict("agent_credential_unavailable") from exc
+                    raise MutationSagaError(
+                        "agent_credential_unavailable",
+                        dispatch_state="not_dispatched",
+                        recoverable=True,
+                    ) from exc
             current = self._removals.transition(current, "revoked", now=self._clock())
         if current.phase == "revoked":
             deleted = self.registry.delete_if_revision_and_credential(
                 current.agent_id,
                 expected_revision=current.captured_revision,
                 expected_credential_ref=current.credential_ref,
+                owner_removal_id=current.removal_id,
             )
             if not deleted:
                 existing = self.registry.get(current.agent_id)
@@ -530,7 +579,13 @@ class EnrollmentOrchestrator:
                         now=self._clock(),
                         last_error_code="agent_changed",
                     )
-                    raise EnrollmentConflict("agent_changed")
+                    raise MutationSagaError(
+                        "agent_changed",
+                        dispatch_state=(
+                            "not_dispatched" if current.local_only else "dispatched"
+                        ),
+                        recoverable=True,
+                    )
             current = self._removals.transition(
                 current, "registry_deleted", now=self._clock()
             )
@@ -545,7 +600,13 @@ class EnrollmentOrchestrator:
                         now=self._clock(),
                         last_error_code="credential_cleanup_failed",
                     )
-                    raise EnrollmentConflict("credential_cleanup_failed") from exc
+                    raise MutationSagaError(
+                        "credential_cleanup_failed",
+                        dispatch_state=(
+                            "not_dispatched" if current.local_only else "dispatched"
+                        ),
+                        recoverable=True,
+                    ) from exc
             current = self._removals.transition(
                 current, "credential_deleted", now=self._clock()
             )
@@ -1462,6 +1523,11 @@ class EnrollmentOrchestrator:
         except RegistryError:
             return
 
+    def _record_mutation_failure(
+        self, job: EnrollmentJob, code: str, dispatch_state: str
+    ) -> None:
+        self._mutation_failures[job.enrollment_id] = (code, dispatch_state)
+
     def _reload_after_fence_loss(self, enrollment_id: str) -> None:
         try:
             self.journal.get(enrollment_id)
@@ -1492,6 +1558,7 @@ class EnrollmentOrchestrator:
                     current.validated_http_address,
                 )
             except EnrollmentValidationError as exc:
+                self._record_mutation_failure(current, exc.code, exc.dispatch_state)
                 self._fail_claim(current, exc.code)
                 return
         if current.state is EnrollmentState.ACTIVATION_REQUESTED:
@@ -1519,6 +1586,12 @@ class EnrollmentOrchestrator:
                         if isinstance(outcome.error, EnrollmentValidationError)
                         else "agent_network_error"
                     )
+                    dispatch_state = (
+                        outcome.error.dispatch_state
+                        if isinstance(outcome.error, EnrollmentValidationError)
+                        else "unknown"
+                    )
+                    self._record_mutation_failure(current, code, dispatch_state)
                     self._fail_claim(current, code)
                     return
             transitioned = self._transition_claimed(
@@ -1599,6 +1672,12 @@ class EnrollmentOrchestrator:
                     if isinstance(outcome.error, EnrollmentValidationError)
                     else "agent_network_error"
                 )
+                dispatch_state = (
+                    outcome.error.dispatch_state
+                    if isinstance(outcome.error, EnrollmentValidationError)
+                    else "unknown"
+                )
+                self._record_mutation_failure(current, code, dispatch_state)
                 self._residual_claim(current, code)
                 return
         with self.credential_store.lifecycle_lease():
@@ -1607,7 +1686,7 @@ class EnrollmentOrchestrator:
             except CredentialStoreError:
                 self._residual_claim(current, "credential_cleanup_failed")
                 return
-            self._transition_claimed(
+            failed = self._transition_claimed(
                 replace(
                     current,
                     credential_temp_ref=None,
@@ -1617,6 +1696,10 @@ class EnrollmentOrchestrator:
                 EnrollmentState.FAILED,
                 clear_claim=True,
             )
+            if failed is not None:
+                self._record_mutation_failure(
+                    failed, "agent_already_registered", "dispatched"
+                )
 
     async def _recover_rotation(self, job: EnrollmentJob) -> None:
         if (
@@ -1670,6 +1753,12 @@ class EnrollmentOrchestrator:
                     if isinstance(outcome.error, EnrollmentValidationError)
                     else "agent_network_error"
                 )
+                dispatch_state = (
+                    outcome.error.dispatch_state
+                    if isinstance(outcome.error, EnrollmentValidationError)
+                    else "unknown"
+                )
+                self._record_mutation_failure(current, code, dispatch_state)
                 self._residual_claim(current, code)
                 return
             transitioned = self._transition_claimed(
@@ -1695,7 +1784,7 @@ class EnrollmentOrchestrator:
                 self._residual_claim(current, "agent_registry_unavailable")
                 return
         elif registered.credential_ref != current.credential_temp_ref:
-            self._residual_claim(current, "agent_changed")
+            await self._compensate_rotation_registry_mismatch(current, target, token)
             return
         renewed = self._renew_claim(current)
         if renewed is None:
@@ -1719,6 +1808,12 @@ class EnrollmentOrchestrator:
                     if isinstance(outcome.error, EnrollmentValidationError)
                     else "agent_network_error"
                 )
+                dispatch_state = (
+                    outcome.error.dispatch_state
+                    if isinstance(outcome.error, EnrollmentValidationError)
+                    else "unknown"
+                )
+                self._record_mutation_failure(current, code, dispatch_state)
                 self._residual_claim(current, code)
                 return
         with self.credential_store.lifecycle_lease():
@@ -1738,6 +1833,60 @@ class EnrollmentOrchestrator:
                 EnrollmentState.CONSUMED,
                 clear_claim=True,
             )
+
+    async def _compensate_rotation_registry_mismatch(
+        self, job: EnrollmentJob, target: Any, token: bytes
+    ) -> None:
+        """Revoke only the newly activated credential after a lost Registry CAS."""
+        outcome = await self._run_with_recovery_lease(
+            job,
+            self.agent_client.revoke(
+                target,
+                token,
+                credential_id=job.remote_credential_id,
+            ),
+        )
+        if outcome is None:
+            return
+        current = outcome.job
+        if outcome.error is not None:
+            code = (
+                outcome.error.code
+                if isinstance(outcome.error, EnrollmentValidationError)
+                else "agent_network_error"
+            )
+            dispatch_state = (
+                outcome.error.dispatch_state
+                if isinstance(outcome.error, EnrollmentValidationError)
+                else "unknown"
+            )
+            self._record_mutation_failure(current, code, dispatch_state)
+            self._residual_claim(current, code)
+            return
+
+        new_reference = current.credential_temp_ref
+        failed = self._transition_claimed(
+            replace(
+                current,
+                credential_temp_ref=None,
+                old_credential_ref=None,
+                old_remote_credential_id=None,
+                validated_http_address=None,
+                last_error_code="agent_changed",
+            ),
+            EnrollmentState.FAILED,
+            clear_claim=True,
+        )
+        if failed is None:
+            return
+        self._record_mutation_failure(failed, "agent_changed", "dispatched")
+        with self.credential_store.lifecycle_lease():
+            try:
+                self.credential_store.delete_if_exists(new_reference)
+            except CredentialStoreError:
+                # The terminal orphan sweep can retry this without retaining a live
+                # credential in the rotation job or touching either Registry ref.
+                return
 
     def _cleanup_terminal(self, job: EnrollmentJob) -> EnrollmentJob:
         reference = job.credential_temp_ref

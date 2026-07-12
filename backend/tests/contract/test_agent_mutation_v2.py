@@ -1,5 +1,8 @@
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
+from threading import Event
 
 import pytest
 from fastapi.testclient import TestClient
@@ -7,6 +10,7 @@ from fastapi.testclient import TestClient
 from ic_env_guard.config.models import AppConfig, AuthConfig, ControlPlaneConfig
 from ic_env_guard.enrollment.credential_store import CredentialStoreError
 from ic_env_guard.enrollment.jobs import EnrollmentJobRequest
+from ic_env_guard.enrollment.orchestrator import MutationSagaError
 from ic_env_guard.fleet.models import AgentRecord, EnrollmentMethod, EnrollmentState
 from ic_env_guard.main import create_app
 
@@ -142,7 +146,8 @@ def test_rotation_uses_explicit_start_or_consume_action(tmp_path):
 
 @pytest.mark.contract
 def test_local_only_delete_requires_query_and_body_confirmation(tmp_path):
-    response = manager_client(tmp_path).request(
+    client = manager_client(tmp_path)
+    response = client.request(
         "DELETE",
         "/api/v2/agents/missing?local_only=true",
         headers=AUTH,
@@ -151,6 +156,13 @@ def test_local_only_delete_requires_query_and_body_confirmation(tmp_path):
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "local_only_confirmation_required"
+    events = client.get("/api/control-plane/audit?limit=10", headers=AUTH).json()[
+        "events"
+    ]
+    removal = next(event for event in events if event["operation"] == "agents.v2.remove")
+    assert removal["result"] == "failed"
+    assert removal["dispatch_state"] == "not_dispatched"
+    assert removal["failure_category"] == "local_only_confirmation_required"
 
 
 @pytest.mark.contract
@@ -198,3 +210,133 @@ def test_delete_returns_agent_in_use_and_releases_transient_gate(tmp_path):
     assert response.json()["error"]["code"] == "agent_in_use"
     assert tickets.begin_removal("alpha") is True
     tickets.abort_removal("alpha")
+
+
+@pytest.mark.contract
+def test_remote_revoke_fences_all_registry_mutations_until_delete_cas(tmp_path):
+    client = manager_client(tmp_path)
+    add_managed_agent(client)
+    container = client.app.state.container
+    entered = Event()
+    release = Event()
+
+    class BlockingClient:
+        def prepare(self, *_args):
+            return object()
+
+        async def revoke(self, *_args, **_kwargs):
+            entered.set()
+            await asyncio.to_thread(release.wait)
+
+    container.enrollment_orchestrator.agent_client = BlockingClient()
+
+    def remove():
+        return client.delete("/api/v2/agents/alpha", headers=AUTH)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        removal = pool.submit(remove)
+        assert entered.wait(timeout=5)
+        try:
+            renamed = client.put(
+                "/api/v2/agents/alpha",
+                headers=AUTH,
+                json={"display_name": "Concurrent rename"},
+            )
+            disabled = client.post(
+                "/api/v2/agents/alpha/enabled",
+                headers=AUTH,
+                json={"enabled": False},
+            )
+            rotation = client.post(
+                "/api/v2/agents/alpha/credential-rotation",
+                headers=AUTH,
+                json={
+                    "action": "start",
+                    "ssh": {"user": "edaops", "host": "10.0.0.11", "port": 22},
+                },
+            )
+            assert {
+                renamed.json()["error"]["code"],
+                disabled.json()["error"]["code"],
+                rotation.json()["error"]["code"],
+            } == {"agent_mutation_in_progress"}
+            assert renamed.status_code == disabled.status_code == rotation.status_code == 409
+            current = container.registry_repository.get("alpha")
+            assert current.display_name == "Alpha"
+            assert current.enabled is True
+            assert current.revision == 1
+        finally:
+            release.set()
+        removed = removal.result(timeout=5)
+
+    assert removed.status_code == 204
+    assert container.registry_repository.get("alpha") is None
+
+
+@pytest.mark.contract
+def test_add_unique_race_audits_actual_dispatched_state(tmp_path):
+    client = manager_client(tmp_path)
+    container = client.app.state.container
+    job = container.enrollment_jobs.create(
+        EnrollmentJobRequest(
+            normalized_endpoint="https://10.0.0.12:8765",
+            transport_profile_id="system-tls",
+            enrollment_method=EnrollmentMethod.LEGACY_ADMIN_TOKEN,
+        )
+    )
+
+    async def conflict(*_args, **_kwargs):
+        raise MutationSagaError(
+            "agent_already_registered", dispatch_state="dispatched"
+        )
+
+    container.enrollment_orchestrator.consume = conflict
+    response = client.post(
+        "/api/v2/agents",
+        headers=AUTH,
+        json={"enrollment_id": job.enrollment_id, "display_name": "Alpha"},
+    )
+
+    assert response.status_code == 409
+    events = client.get("/api/control-plane/audit?limit=10", headers=AUTH).json()[
+        "events"
+    ]
+    event = next(item for item in events if item["operation"] == "agents.v2.create")
+    assert event["failure_category"] == "agent_already_registered"
+    assert event["dispatch_state"] == "dispatched"
+
+
+@pytest.mark.contract
+@pytest.mark.parametrize(
+    ("code", "dispatch_state", "status"),
+    [
+        ("agent_changed", "dispatched", 409),
+        ("agent_identity_changed", "not_dispatched", 409),
+        ("agent_network_error", "unknown", 503),
+    ],
+)
+def test_rotation_audit_uses_saga_dispatch_state(
+    tmp_path, code, dispatch_state, status
+):
+    client = manager_client(tmp_path)
+    container = client.app.state.container
+
+    async def fail(*_args, **_kwargs):
+        raise MutationSagaError(code, dispatch_state=dispatch_state)
+
+    container.enrollment_orchestrator.consume_rotation = fail
+    response = client.post(
+        "/api/v2/agents/alpha/credential-rotation",
+        headers=AUTH,
+        json={"action": "consume", "enrollment_id": "rotation-1"},
+    )
+
+    assert response.status_code == status
+    events = client.get("/api/control-plane/audit?limit=10", headers=AUTH).json()[
+        "events"
+    ]
+    event = next(
+        item for item in events if item["operation"] == "agents.v2.credential-rotation"
+    )
+    assert event["failure_category"] == code
+    assert event["dispatch_state"] == dispatch_state

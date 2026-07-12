@@ -27,9 +27,10 @@ from ic_env_guard.enrollment.jobs import EnrollmentConflict, job_input_fingerpri
 from ic_env_guard.enrollment.orchestrator import (
     AutoEnrollmentAuditContext,
     EnrollmentOrchestrator,
+    MutationSagaError,
 )
 from ic_env_guard.enrollment.ssh_config import SshConfigError, validate_ssh_destination
-from ic_env_guard.fleet.models import RegistryError
+from ic_env_guard.fleet.models import RegistryConflict, RegistryError
 from ic_env_guard.fleet.probes import AgentProbeDisabled, AgentProbeError, FleetProbeService
 from ic_env_guard.fleet.status import FleetStatusService, InvalidFleetCursor
 
@@ -128,13 +129,33 @@ async def add_agent(
             display_name=body.display_name,
             input_fingerprint=job_input_fingerprint(current),
         )
+    except MutationSagaError as exc:
+        _failure(
+            audit,
+            audit_repo,
+            audit_health,
+            exc.code,
+            dispatch_state=exc.dispatch_state,
+        )
+        status = (
+            503
+            if exc.code
+            in {
+                "agent_network_error",
+                "agent_timeout",
+                "agent_registry_unavailable",
+                "agent_enrollment_activation_pending",
+            }
+            else 409
+        )
+        raise V2ApiError(status, exc.code, "agent enrollment request failed") from exc
     except EnrollmentConflict as exc:
         _failure(
             audit,
             audit_repo,
             audit_health,
             exc.code,
-            dispatch_state=_mutation_dispatch_state(exc.code),
+            dispatch_state="not_dispatched",
         )
         if exc.code == "agent_enrollment_not_found":
             status = 404
@@ -215,13 +236,33 @@ async def rotate_agent_credential(
             _success(audit, audit_repo, audit_health, dispatch_state="not_dispatched")
             return {"rotation": result.to_public_dict()}
         record = await orchestrator.consume_rotation(agent_id, parsed.enrollment_id)
+    except MutationSagaError as exc:
+        _failure(
+            audit,
+            audit_repo,
+            audit_health,
+            exc.code,
+            dispatch_state=exc.dispatch_state,
+        )
+        status = (
+            503
+            if exc.code
+            in {
+                "agent_network_error",
+                "agent_timeout",
+                "agent_registry_unavailable",
+                "agent_enrollment_activation_pending",
+            }
+            else 409
+        )
+        raise V2ApiError(status, exc.code, "credential rotation failed") from exc
     except EnrollmentConflict as exc:
         _failure(
             audit,
             audit_repo,
             audit_health,
             exc.code,
-            dispatch_state=_mutation_dispatch_state(exc.code),
+            dispatch_state="not_dispatched",
         )
         if exc.code in {"agent_not_found", "agent_enrollment_not_found"}:
             status = 404
@@ -289,19 +330,40 @@ async def update_agent(
             base_url=body.base_url,
             transport_profile_id=body.transport_profile_id,
         )
-    except EnrollmentConflict as exc:
-        if exc.code in {
+    except MutationSagaError as exc:
+        _failure(
+            audit,
+            audit_repo,
+            audit_health,
+            exc.code,
+            dispatch_state=exc.dispatch_state,
+        )
+        if exc.code == "agent_not_found":
+            status = 404
+        elif exc.code in {
+            "agent_network_error",
+            "agent_timeout",
+            "agent_validation_unavailable",
+            "agent_registry_unavailable",
+        }:
+            status = 503
+        elif exc.code in {
             "agent_url_invalid",
             "target_address_forbidden",
             "transport_profile_unknown",
-            "legacy_revalidation_required",
         }:
-            dispatch_state = "not_dispatched"
-        elif exc.code in {"agent_network_error", "agent_timeout"}:
-            dispatch_state = "unknown"
+            status = 422
         else:
-            dispatch_state = "dispatched" if dispatched else "not_dispatched"
-        _failure(audit, audit_repo, audit_health, exc.code, dispatch_state=dispatch_state)
+            status = 409
+        raise V2ApiError(status, exc.code, "agent update failed") from exc
+    except EnrollmentConflict as exc:
+        _failure(
+            audit,
+            audit_repo,
+            audit_health,
+            exc.code,
+            dispatch_state="not_dispatched",
+        )
         if exc.code == "agent_not_found":
             status = 404
         elif exc.code in {
@@ -351,13 +413,20 @@ async def remove_agent(
     local_only: bool = Query(default=False),
     body: RemoveAgentRequest | None = None,
 ) -> Response:
+    audit = _intent(request, actor, audit_repo, audit_health, agent_id, "agents.v2.remove")
     if local_only and (body is None or not body.confirm_remote_residual):
+        _failure(
+            audit,
+            audit_repo,
+            audit_health,
+            "local_only_confirmation_required",
+            dispatch_state="not_dispatched",
+        )
         raise V2ApiError(
             422,
             "local_only_confirmation_required",
             "local-only removal requires explicit remote residual confirmation",
         )
-    audit = _intent(request, actor, audit_repo, audit_health, agent_id, "agents.v2.remove")
     try:
         captured = orchestrator.registry.get(agent_id)
     except RegistryError as exc:
@@ -382,6 +451,22 @@ async def remove_agent(
             audit_event_id=audit.id,
             local_only=local_only,
         )
+    except MutationSagaError as exc:
+        if not exc.recoverable:
+            _failure(
+                audit,
+                audit_repo,
+                audit_health,
+                exc.code,
+                dispatch_state=exc.dispatch_state,
+            )
+        status = (
+            409
+            if exc.code
+            in {"agent_in_use", "agent_changed", "agent_removal_in_progress"}
+            else 503
+        )
+        raise V2ApiError(status, exc.code, "agent removal failed") from exc
     except EnrollmentConflict as exc:
         try:
             recoverable = orchestrator.removal_is_recoverable(audit.id)
@@ -393,12 +478,7 @@ async def remove_agent(
                 audit_repo,
                 audit_health,
                 exc.code,
-                dispatch_state=(
-                    "not_dispatched"
-                    if not remote_dispatch_expected
-                    or exc.code in {"agent_not_found", "agent_in_use"}
-                    else "dispatched"
-                ),
+                dispatch_state="not_dispatched",
             )
         if exc.code == "agent_not_found":
             status = 404
@@ -500,6 +580,20 @@ def set_enabled(
             "agent_invalid_configuration",
             "agent cannot be enabled with its current configuration",
         ) from exc
+    except RegistryConflict as exc:
+        code = (
+            "agent_mutation_in_progress"
+            if str(exc) == "agent_mutation_in_progress"
+            else "agent_registry_conflict"
+        )
+        _failure(
+            audit,
+            audit_repo,
+            audit_health,
+            code,
+            dispatch_state="not_dispatched",
+        )
+        raise V2ApiError(409, code, "agent mutation is in progress") from exc
     _success(audit, audit_repo, audit_health, dispatch_state="not_dispatched")
     agent = service.get(agent_id)
     assert agent is not None
@@ -602,17 +696,3 @@ def _success(event, repository, health, *, dispatch_state: str) -> None:
         dispatch_state=dispatch_state,
     )
     commit_audit_outcome(repository, health)
-
-
-def _mutation_dispatch_state(code: str) -> str:
-    if code in {"agent_network_error", "agent_timeout", "agent_unavailable"}:
-        return "unknown"
-    if code in {
-        "agent_credential_activation_failed",
-        "agent_credential_revoke_failed",
-        "agent_auth_error",
-        "agent_protocol_error",
-        "agent_identity_changed",
-    }:
-        return "dispatched"
-    return "not_dispatched"

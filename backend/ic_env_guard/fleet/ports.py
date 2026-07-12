@@ -22,10 +22,21 @@ class ManagerRegistryRepository(Protocol):
     def list(self, query: AgentQuery) -> AgentPage: ...
 
     def update_if_revision(
-        self, record: AgentRecord, expected_revision: int
+        self,
+        record: AgentRecord,
+        expected_revision: int,
+        *,
+        owner_enrollment_id: str | None = None,
+        owner_removal_id: str | None = None,
     ) -> AgentRecord: ...
 
-    def delete(self, agent_id: str) -> None: ...
+    def delete(
+        self,
+        agent_id: str,
+        *,
+        owner_enrollment_id: str | None = None,
+        owner_removal_id: str | None = None,
+    ) -> None: ...
 
     def credential_references(self) -> set[str]: ...
 
@@ -55,5 +66,14 @@ class EnrollmentJournalRepository(Protocol):
         *,
         expected_state: EnrollmentState,
     ) -> None: ...
+
+    def consume_rotation(
+        self,
+        enrollment_id: str,
+        *,
+        agent_id: str,
+        display_name: str,
+        now: datetime,
+    ) -> EnrollmentJob: ...
 
     def recovery_credential_references(self) -> set[str]: ...

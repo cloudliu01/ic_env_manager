@@ -26,6 +26,7 @@ from ic_env_guard.storage.manager_registry import (
     _parse_time,
     _SQLiteRepository,
 )
+from ic_env_guard.storage.mutation_fence import assert_agent_mutation_allowed
 
 _COLUMNS = (
     "enrollment_id, manager_id, state, normalized_endpoint, transport_profile_id, "
@@ -142,7 +143,7 @@ def _validate_job(job: EnrollmentJob) -> None:
     else:
         if any(value is None for value in rotation_metadata):
             raise RegistryInvariantError("rotation enrollment requires an old Agent snapshot")
-        if job.state is not EnrollmentState.CONSUMED:
+        if job.state not in {EnrollmentState.CONSUMED, EnrollmentState.FAILED}:
             if job.old_credential_ref is None:
                 raise RegistryInvariantError("rotation requires the old credential reference")
             if job.old_enrollment_method is not EnrollmentMethod.LEGACY_ADMIN_TOKEN and (
@@ -401,6 +402,7 @@ class EnrollmentJournalRepository(_SQLiteRepository):
                 if row is None:
                     raise RegistryConflict("agent_not_found")
                 old = _agent(row)
+                assert_agent_mutation_allowed(connection, old.agent_id)
                 captured = replace(
                     job,
                     normalized_endpoint=old.normalized_endpoint,
@@ -436,6 +438,71 @@ class EnrollmentJournalRepository(_SQLiteRepository):
         except sqlite3.IntegrityError as exc:
             raise RegistryConflict("agent_enrollment_conflict") from exc
         except (SQLAlchemyError, sqlite3.Error) as exc:
+            raise RegistryError("enrollment journal storage is unavailable") from exc
+
+    def consume_rotation(
+        self,
+        enrollment_id: str,
+        *,
+        agent_id: str,
+        display_name: str,
+        now: datetime,
+    ) -> EnrollmentJob:
+        try:
+            with self._write() as connection:
+                row = connection.execute(
+                    f"SELECT {_COLUMNS} FROM agent_enrollment_jobs WHERE enrollment_id=?",
+                    (enrollment_id,),
+                ).fetchone()
+                if row is None:
+                    raise RegistryConflict("agent_enrollment_not_found")
+                job = _job(row)
+                if job.state is EnrollmentState.CONSUMED:
+                    raise RegistryConflict("agent_enrollment_consumed")
+                if now >= job.expires_at:
+                    raise RegistryConflict("agent_enrollment_expired")
+                if job.state is not EnrollmentState.VERIFIED:
+                    raise RegistryConflict("agent_enrollment_not_verified")
+                if job.replace_agent_id != agent_id:
+                    raise RegistryConflict("agent_enrollment_conflict")
+                registered_row = connection.execute(
+                    f"SELECT {_AGENT_COLUMNS} FROM agents WHERE agent_id=?",
+                    (agent_id,),
+                ).fetchone()
+                if registered_row is None:
+                    raise RegistryConflict("agent_not_found")
+                registered = _agent(registered_row)
+                if (
+                    registered.revision != job.old_registry_revision
+                    or registered.credential_ref != job.old_credential_ref
+                    or registered.instance_id != job.old_instance_id
+                ):
+                    raise RegistryConflict("agent_changed")
+                assert_agent_mutation_allowed(
+                    connection,
+                    agent_id,
+                    owner_enrollment_id=enrollment_id,
+                )
+                updated = replace(
+                    job,
+                    state=EnrollmentState.ACTIVATION_REQUESTED,
+                    requested_display_name=display_name,
+                    save_requested=True,
+                    updated_at=now,
+                )
+                _validate_job(updated)
+                cursor = connection.execute(
+                    "UPDATE agent_enrollment_jobs SET state='activation_requested', "
+                    "requested_display_name=?, save_requested=1, updated_at=? "
+                    "WHERE enrollment_id=? AND state='verified' AND save_requested=0",
+                    (display_name, _format_time(now), enrollment_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RevisionConflict("rotation enrollment state changed")
+            return updated
+        except (RegistryConflict, RevisionConflict):
+            raise
+        except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
             raise RegistryError("enrollment journal storage is unavailable") from exc
 
     def get(self, enrollment_id: str) -> EnrollmentJob | None:
