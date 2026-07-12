@@ -85,6 +85,12 @@ describe('Fleet table', () => {
     expect(within(row).getByRole('button', { name: 'Actions for Alpha' }).classList).toContain('fleet-actions-trigger');
   });
 
+  it('keeps Fleet header cells within the 48px compact contract around a 44px sort target', () => {
+    expect(baseStyles).toContain('.fleet-table thead th');
+    expect(baseStyles).toMatch(/\.fleet-table thead th \{[\s\S]*height: 48px;[\s\S]*padding-top: 0;[\s\S]*padding-bottom: 0;/);
+    expect(baseStyles).toMatch(/\.fleet-table \.table-sort \{[\s\S]*min-height: 44px;[\s\S]*max-height: 44px;/);
+  });
+
   it('defines semantic status styles for every emitted connection and workload state', () => {
     for (const status of ['ready', 'healthy', 'degraded', 'unavailable', 'disabled']) {
       expect(baseStyles).toContain(`.status-${status}`);

@@ -240,6 +240,19 @@ tbody tr[tabindex]:focus-visible {
   white-space: nowrap;
 }
 
+.fleet-table thead th {
+  height: 48px;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+.fleet-table .table-sort {
+  min-height: 44px;
+  max-height: 44px;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
 .fleet-agent-cell,
 .fleet-health-cell,
 .fleet-transport-cell,
