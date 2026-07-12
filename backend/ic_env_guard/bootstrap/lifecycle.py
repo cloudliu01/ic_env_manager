@@ -6,6 +6,7 @@ from fastapi import FastAPI
 
 from ic_env_guard.agents.availability import AgentAvailabilityService
 from ic_env_guard.bootstrap.composition import AgentContainer, ManagerContainer
+from ic_env_guard.fleet.probes import FleetProbeService
 from ic_env_guard.logs.cleanup import expiration_loop as log_expiration_loop
 from ic_env_guard.metrics.collector import MetricsCollector
 from ic_env_guard.observations.cleanup import expiration_loop as observation_expiration_loop
@@ -23,6 +24,12 @@ async def _agent_availability_probe_loop(
     while True:
         await asyncio.sleep(interval_seconds)
         await availability.probe_all()
+
+
+async def _fleet_probe_loop(probes: FleetProbeService, interval_seconds: int) -> None:
+    while True:
+        await asyncio.sleep(interval_seconds)
+        await probes.probe_all()
 
 
 async def _cancel_tasks(*tasks: asyncio.Task[None] | None) -> None:
@@ -52,6 +59,7 @@ def create_lifespan(container: AgentContainer | ManagerContainer):
         app.state.lifecycle_cleanup_complete = False
         refresh_task: asyncio.Task[None] | None = None
         availability_probe_task: asyncio.Task[None] | None = None
+        fleet_probe_task: asyncio.Task[None] | None = None
         observation_cleanup_task: asyncio.Task[None] | None = None
         log_cleanup_task: asyncio.Task[None] | None = None
         enrollment_socket_server = None
@@ -73,6 +81,14 @@ def create_lifespan(container: AgentContainer | ManagerContainer):
                     )
                 )
                 app.state.agent_availability_probe_task = availability_probe_task
+                if container.fleet_probe_service is not None:
+                    fleet_probe_task = asyncio.create_task(
+                        _fleet_probe_loop(
+                            container.fleet_probe_service,
+                            container.config.control_plane.poll_interval_seconds,
+                        )
+                    )
+                    app.state.fleet_probe_task = fleet_probe_task
             else:
                 enrollment_socket_server = container.enrollment_socket_server
                 observation_config = container.config.observations if container.config else None
@@ -117,6 +133,7 @@ def create_lifespan(container: AgentContainer | ManagerContainer):
                     await _cancel_tasks(
                         refresh_task,
                         availability_probe_task,
+                        fleet_probe_task,
                         observation_cleanup_task,
                         log_cleanup_task,
                     )

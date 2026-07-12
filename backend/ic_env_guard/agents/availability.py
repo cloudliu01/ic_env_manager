@@ -30,6 +30,7 @@ class AgentAvailabilityService:
         max_parallel_probes: int = 8,
         probe_jitter_seconds: float = 1.0,
         status_repository: AgentStatusRepository | None = None,
+        persist_probe_status: bool = True,
     ) -> None:
         self._registry = registry
         self._client = client
@@ -37,6 +38,7 @@ class AgentAvailabilityService:
         self._max_parallel_probes = max_parallel_probes
         self._probe_jitter_seconds = probe_jitter_seconds
         self._status_repository = status_repository
+        self._persist_probe_status = persist_probe_status
         self._observations: dict[str, AgentObservation] = {}
 
     def summary(self, agent_id: str) -> dict[str, object]:
@@ -45,7 +47,7 @@ class AgentAvailabilityService:
         if not agent.enabled:
             return summary
         observation = self._observations.get(agent_id)
-        if self._status_repository is not None:
+        if self._status_repository is not None and self._persist_probe_status:
             stored = self._status_repository.get(agent_id)
             revision = self._registry.revision(agent_id)
             if (

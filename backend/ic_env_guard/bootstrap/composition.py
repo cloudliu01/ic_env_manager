@@ -1,8 +1,10 @@
 import socket
 from dataclasses import dataclass
+from ipaddress import ip_address
 from pathlib import Path
 from uuid import UUID
 
+import psutil
 from prometheus_client import CollectorRegistry
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
@@ -33,7 +35,10 @@ from ic_env_guard.enrollment.credential_store import CredentialStore
 from ic_env_guard.enrollment.service import EnrollmentService
 from ic_env_guard.enrollment.socket_server import EnrollmentSocketServer
 from ic_env_guard.fleet.importer import import_yaml_agents_once
+from ic_env_guard.fleet.probes import FleetProbeService
 from ic_env_guard.fleet.registry import FleetRegistry
+from ic_env_guard.fleet.status import FleetStatusService
+from ic_env_guard.fleet.target_policy import AgentTargetPolicy
 from ic_env_guard.logs.policy import LogPathPolicy, LogTailReader
 from ic_env_guard.logs.service import LogSourceService
 from ic_env_guard.metrics.collector import MetricsCollector
@@ -110,6 +115,8 @@ class ManagerContainer:
     status_repository: AgentStatusRepository
     enrollment_journal_repository: EnrollmentJournalRepository
     credential_store: CredentialStore
+    fleet_status_service: FleetStatusService
+    fleet_probe_service: FleetProbeService | None
 
 
 def _service_runtime(service: ServiceConfig) -> ServiceRuntime:
@@ -133,6 +140,36 @@ def configured_agent_capabilities(config: AppConfig) -> tuple[str, ...]:
     if config.server.trusted_lan_http.enabled:
         return ("trusted-lan-http.v1",)
     return ()
+
+
+def _manager_self_targets(bind: str, port: int) -> tuple[tuple[str, int], ...]:
+    try:
+        parsed = ip_address(bind.split("%", 1)[0])
+    except ValueError:
+        try:
+            addresses = {
+                result[4][0].split("%", 1)[0]
+                for result in socket.getaddrinfo(bind, port, type=socket.SOCK_STREAM)
+            }
+        except OSError as exc:
+            raise RuntimeError("Manager self targets are unavailable") from exc
+    else:
+        if not parsed.is_unspecified:
+            addresses = {str(parsed)}
+        else:
+            try:
+                addresses = {
+                    address.address.split("%", 1)[0]
+                    for interface in psutil.net_if_addrs().values()
+                    for address in interface
+                    if address.family in {socket.AF_INET, socket.AF_INET6}
+                }
+            except Exception as exc:
+                raise RuntimeError("Manager self targets are unavailable") from exc
+            if not addresses:
+                raise RuntimeError("Manager self targets are unavailable")
+    addresses.update({"127.0.0.1", "::1"})
+    return tuple((address, port) for address in sorted(addresses))
 
 
 def build_agent_container(
@@ -242,6 +279,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         registry_repository,
         credential_store,
         config.control_plane.transport_profiles,
+        status_repository,
     )
     agent_registry = AgentRegistry(fleet_registry)
     agent_client = AgentHttpClient(legacy_credential_loader=fleet_registry.load_credential)
@@ -250,6 +288,29 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
     service_manager = ServiceManager([])
     metrics_collector = MetricsCollector(metrics_registry, terminal_manager, service_manager)
     metrics_collector.refresh()
+    fleet_status_service = FleetStatusService(
+        registry_repository,
+        status_repository,
+        config.control_plane.transport_profiles,
+    )
+    try:
+        target_policy = AgentTargetPolicy(
+            allowed_agent_cidrs=config.control_plane.allowed_agent_cidrs,
+            self_targets=_manager_self_targets(config.server.bind, config.server.port),
+        )
+    except RuntimeError:
+        fleet_probe_service = None
+    else:
+        fleet_probe_service = FleetProbeService(
+            registry_repository=registry_repository,
+            status_repository=status_repository,
+            credential_store=credential_store,
+            target_policy=target_policy,
+            transport_profiles=config.control_plane.transport_profiles,
+            client=agent_client,
+            stale_after_seconds=config.control_plane.status_stale_after_seconds,
+            max_parallel_probes=config.control_plane.max_parallel_probes,
+        )
     return ManagerContainer(
         config=config,
         agent_registry=agent_registry,
@@ -263,6 +324,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
             stale_after_seconds=config.control_plane.status_stale_after_seconds,
             max_parallel_probes=config.control_plane.max_parallel_probes,
             status_repository=status_repository,
+            persist_probe_status=False,
         ),
         gateway_ticket_store=GatewayTicketStore(
             config.control_plane.max_outstanding_tickets
@@ -285,4 +347,6 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         status_repository=status_repository,
         enrollment_journal_repository=enrollment_journal_repository,
         credential_store=credential_store,
+        fleet_status_service=fleet_status_service,
+        fleet_probe_service=fleet_probe_service,
     )

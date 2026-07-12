@@ -237,7 +237,7 @@ def _is_builtin_system_tls(value: object) -> bool:
 
 
 class ControlPlaneConfig(BaseModel):
-    poll_interval_seconds: int = Field(default=10, ge=1)
+    poll_interval_seconds: int = Field(default=15, ge=1)
     status_stale_after_seconds: int = Field(default=30, ge=1)
     max_parallel_probes: int = Field(default=8, ge=1)
     audit_database: Path = Path("/var/lib/ic-env-guard/control-plane.db")

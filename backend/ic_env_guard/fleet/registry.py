@@ -4,7 +4,7 @@ from urllib.parse import urlsplit
 from ic_env_guard.config.models import AgentConfig, AgentTlsConfig
 from ic_env_guard.enrollment.credential_store import CredentialStore, CredentialStoreError
 from ic_env_guard.fleet.models import AgentQuery, AgentRecord, RevisionConflict
-from ic_env_guard.fleet.ports import ManagerRegistryRepository
+from ic_env_guard.fleet.ports import AgentStatusRepository, ManagerRegistryRepository
 from ic_env_guard.fleet.transport import (
     TransportProfile,
     TrustedLanHttpProfile,
@@ -28,10 +28,12 @@ class FleetRegistry:
         repository: ManagerRegistryRepository,
         credential_store: CredentialStore,
         transport_profiles: tuple[TransportProfile, ...],
+        status_repository: AgentStatusRepository | None = None,
     ) -> None:
         self._repository = repository
         self._credential_store = credential_store
         self._profiles = {profile.id: profile for profile in transport_profiles}
+        self._statuses = status_repository
 
     def get(self, agent_id: str) -> AgentConfig | None:
         record = self._repository.get(agent_id)
@@ -116,6 +118,8 @@ class FleetRegistry:
         )
 
     def _configuration_valid(self, record: AgentRecord) -> bool:
+        if self._identity_conflict(record.agent_id):
+            return False
         scheme = urlsplit(record.normalized_endpoint).scheme
         if record.transport_profile_id == "legacy-disabled-no-credential":
             return False
@@ -131,3 +135,9 @@ class FleetRegistry:
         if isinstance(profile, TrustedLanHttpProfile):
             return scheme == "http"
         return False
+
+    def _identity_conflict(self, agent_id: str) -> bool:
+        if self._statuses is None:
+            return False
+        status = self._statuses.get(agent_id)
+        return status is not None and status.last_error_code == "agent_identity_conflict"

@@ -15,6 +15,11 @@ from ic_env_guard.api import terminal_ws
 from ic_env_guard.api.agent_audit import router as agent_audit_router
 from ic_env_guard.api.agent_http import get_agent_http_client
 from ic_env_guard.api.agent_monitoring import router as agent_monitoring_router
+from ic_env_guard.api.agent_registry import (
+    get_fleet_probe_service,
+    get_fleet_status_service,
+)
+from ic_env_guard.api.agent_registry import router as agent_registry_v2_router
 from ic_env_guard.api.agent_services import router as agent_services_router
 from ic_env_guard.api.agent_terminal_ws import (
     AgentWebSocketConnector,
@@ -44,6 +49,7 @@ from ic_env_guard.api.control_plane_audit import get_control_plane_audit_reposit
 from ic_env_guard.api.control_plane_audit import router as control_plane_audit_router
 from ic_env_guard.api.errors import register_error_handlers
 from ic_env_guard.api.fleet import router as fleet_router
+from ic_env_guard.api.fleet_v2 import router as fleet_v2_router
 from ic_env_guard.api.health import router as health_router
 from ic_env_guard.api.ingest_guard import IngestCapacityMiddleware
 from ic_env_guard.api.ingest_logs import router as ingest_logs_router
@@ -86,6 +92,7 @@ from ic_env_guard.api.terminals import (
     router as terminals_router,
 )
 from ic_env_guard.api.v2_errors import (
+    V2ApiError,
     is_v2_path,
     register_v2_error_handlers,
     resolve_v2_correlation_id,
@@ -106,6 +113,9 @@ from ic_env_guard.config.models import AppConfig
 from ic_env_guard.db.audit import AuditRepository
 from ic_env_guard.db.audit_queries import AuditQueryRepository
 from ic_env_guard.db.control_plane_audit import ControlPlaneAuditRepository
+from ic_env_guard.fleet.probes import FleetProbeService
+from ic_env_guard.fleet.status import FleetStatusService
+from ic_env_guard.fleet.transport import TrustedLanHttpProfile
 from ic_env_guard.monitoring.machines import MachineRegistry
 from ic_env_guard.services.manager import ServiceManager
 from ic_env_guard.terminal.manager import TerminalManager
@@ -257,7 +267,25 @@ def create_app(
             ),
         )
     else:
-        runtime_metadata = RuntimeMetadata(mode="manager", capabilities=())
+        runtime_metadata = RuntimeMetadata(
+            mode="manager",
+            capabilities=(
+                (
+                    "fleet.v2",
+                    "agent-registry.v2",
+                    *(
+                        ("trusted-lan-http.v1",)
+                        if any(
+                            isinstance(profile, TrustedLanHttpProfile)
+                            for profile in container.config.control_plane.transport_profiles
+                        )
+                        else ()
+                    ),
+                )
+                if container.fleet_probe_service is not None
+                else ()
+            ),
+        )
     configured_login_limiter = login_limiter or LoginRateLimiter()
 
     @app.middleware("http")
@@ -371,6 +399,19 @@ def create_app(
             raise RuntimeError("Agent WebSocket connector is not configured in agent mode")
         return agent_ws_connector
 
+    def configured_fleet_status_service() -> FleetStatusService:
+        if not isinstance(container, ManagerContainer):
+            raise RuntimeError("Fleet status is not configured in Agent mode")
+        return container.fleet_status_service
+
+    def configured_fleet_probe_service() -> FleetProbeService:
+        if (
+            not isinstance(container, ManagerContainer)
+            or container.fleet_probe_service is None
+        ):
+            raise V2ApiError(503, "probe_unavailable", "fleet probing is unavailable")
+        return container.fleet_probe_service
+
     def configured_audit_query_repository() -> Iterator[AuditQueryRepository]:
         if audit_session_factory is None:
             raise RuntimeError("agent audit repository is not configured in control-plane mode")
@@ -406,6 +447,8 @@ def create_app(
     app.dependency_overrides[get_gateway_ticket_store] = configured_gateway_ticket_store
     app.dependency_overrides[get_gateway_proxy_limiter] = configured_gateway_proxy_limiter
     app.dependency_overrides[get_agent_ws_connector] = configured_agent_ws_connector
+    app.dependency_overrides[get_fleet_status_service] = configured_fleet_status_service
+    app.dependency_overrides[get_fleet_probe_service] = configured_fleet_probe_service
     app.dependency_overrides[get_audit_query_repository] = configured_audit_query_repository
     app.dependency_overrides[get_control_plane_audit_repository] = (
         configured_control_plane_audit_repository
@@ -444,6 +487,8 @@ def create_app(
         app.include_router(audit_router)
         app.include_router(terminal_ws.router)
     else:
+        app.include_router(agent_registry_v2_router)
+        app.include_router(fleet_v2_router)
         app.include_router(fleet_router)
         app.include_router(control_plane_agents_router)
         app.include_router(agent_audit_router)

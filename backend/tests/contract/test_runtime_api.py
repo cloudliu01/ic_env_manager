@@ -10,6 +10,7 @@ from ic_env_guard.config.models import (
     ServerConfig,
     TrustedLanHttpServerConfig,
 )
+from ic_env_guard.fleet.transport import TrustedLanHttpProfile
 from ic_env_guard.main import create_app
 
 
@@ -89,7 +90,7 @@ def test_v2_capabilities_are_authenticated_and_include_stable_identity(tmp_path)
 
 
 @pytest.mark.contract
-def test_manager_runtime_exposes_no_unimplemented_capabilities(tmp_path):
+def test_manager_runtime_exposes_only_healthy_local_capabilities(tmp_path):
     token_file = _token_file(tmp_path)
     config = AppConfig(
         mode="control-plane",
@@ -101,4 +102,66 @@ def test_manager_runtime_exposes_no_unimplemented_capabilities(tmp_path):
     response = client.get("/api/v2/runtime")
 
     assert response.status_code == 200
+    assert response.json() == {
+        "mode": "manager",
+        "capabilities": ["fleet.v2", "agent-registry.v2"],
+    }
+    assert response.headers["Cache-Control"] == "no-store"
+    for forbidden in (
+        str(tmp_path),
+        "username",
+        "allowed_agent_cidrs",
+        "transport_profiles",
+        "agents",
+    ):
+        assert forbidden not in response.text
+
+
+@pytest.mark.contract
+def test_manager_runtime_reports_configured_trusted_lan_adapter_without_policy_details(
+    tmp_path,
+):
+    token_file = _token_file(tmp_path)
+    config = AppConfig(
+        mode="control-plane",
+        auth=AuthConfig(token_file=token_file),
+        control_plane=ControlPlaneConfig(
+            audit_database=tmp_path / "control-plane.db",
+            allowed_agent_cidrs=["10.0.0.0/8"],
+            transport_profiles=(
+                TrustedLanHttpProfile(id="lab-http", allowed_cidrs=["10.1.0.0/16"]),
+            ),
+        ),
+    )
+
+    response = TestClient(create_app(config=config)).get("/api/v2/runtime")
+
+    assert response.json()["capabilities"] == [
+        "fleet.v2",
+        "agent-registry.v2",
+        "trusted-lan-http.v1",
+    ]
+    assert "lab-http" not in response.text
+    assert "10.1.0.0/16" not in response.text
+
+
+@pytest.mark.contract
+def test_manager_runtime_does_not_claim_v2_when_self_target_inventory_fails(
+    tmp_path, monkeypatch
+):
+    import psutil
+
+    monkeypatch.setattr(
+        psutil, "net_if_addrs", lambda: (_ for _ in ()).throw(OSError("unavailable"))
+    )
+    token_file = _token_file(tmp_path)
+    config = AppConfig(
+        mode="control-plane",
+        auth=AuthConfig(token_file=token_file),
+        server=ServerConfig(bind="0.0.0.0", remote_bind_enabled=True),
+        control_plane=ControlPlaneConfig(audit_database=tmp_path / "control-plane.db"),
+    )
+
+    response = TestClient(create_app(config=config)).get("/api/v2/runtime")
+
     assert response.json() == {"mode": "manager", "capabilities": []}
