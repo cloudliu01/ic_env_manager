@@ -103,10 +103,10 @@ For normal local development, prefer:
 
 This creates and validates the default development token/config under `/tmp/ic-env-guard-dev`.
 
-The installed/systemd configuration path is:
+The recommended existing-user systemd configuration path is:
 
 ```text
-/etc/ic-env-guard/config.yaml
+/etc/ic-env-guard/<linux-user>.yaml
 ```
 
 For local development, create a temporary config and bearer token outside the repo or under a scratch directory:
@@ -167,13 +167,6 @@ Validate a config file with the packaged CLI entrypoint:
 ```bash
 cd backend
 ic-env-guard-config validate /tmp/ic-env-guard-dev/config.yaml
-```
-
-or directly from source:
-
-```bash
-cd backend
-python -m ic_env_guard.systemd.cli validate /tmp/ic-env-guard-dev/config.yaml
 ```
 
 See [docs/operations/service-config.md](docs/operations/service-config.md) for the service configuration reference.
@@ -299,18 +292,20 @@ Packaging artifacts are under [packaging/](packaging/):
 
 On a supported Linux host, install and start with:
 
+Choose an existing non-root Linux account; the installer never creates a user.
+
 ```bash
-sudo packaging/install/install.sh
+sudo packaging/install/install.sh edaops
 sudo systemctl daemon-reload
-sudo systemctl enable --now ic-env-guard
-systemctl status ic-env-guard --no-pager
-journalctl -u ic-env-guard -n 100 --no-pager
+sudo systemctl enable --now ic-env-guard@edaops
+systemctl status ic-env-guard@edaops --no-pager
+journalctl -u ic-env-guard@edaops -n 100 --no-pager
 ```
 
 Uninstall with:
 
 ```bash
-sudo packaging/install/uninstall.sh
+sudo packaging/install/uninstall.sh edaops
 ```
 
 See [docs/operations/lifecycle.md](docs/operations/lifecycle.md), [docs/operations/recovery.md](docs/operations/recovery.md), and [docs/operations/platform-validation.md](docs/operations/platform-validation.md) for full operator workflows and Linux validation commands.

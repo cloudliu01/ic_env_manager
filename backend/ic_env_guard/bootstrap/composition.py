@@ -12,7 +12,9 @@ from ic_env_guard.agents.client import AgentHttpClient
 from ic_env_guard.agents.registry import AgentRegistry
 from ic_env_guard.agents.terminal_proxy import GatewayProxyLimiter, GatewayTicketStore
 from ic_env_guard.api.audit_health import AuditStorageHealth
-from ic_env_guard.bootstrap.identity import load_or_create_instance_id
+from ic_env_guard.bootstrap.identity import (
+    initialize_instance_id,
+)
 from ic_env_guard.config.models import (
     AppConfig,
     EnrollmentConfig,
@@ -120,7 +122,11 @@ def build_agent_container(
     state_database: Path,
     instance_id_path: Path | None = None,
 ) -> AgentContainer:
-    run_migrations(state_database)
+    instance_id = initialize_instance_id(
+        instance_id_path or state_database.with_name("instance-id"),
+        state_database,
+        run_migrations,
+    )
     database_engine = create_sqlite_engine(state_database)
     session_factory = create_session_factory(database_engine)
     terminal_manager = TerminalManager()
@@ -158,9 +164,6 @@ def build_agent_container(
         AgentEnrollmentAudit(session_factory),
         pending_ttl_seconds=enrollment_config.pending_ttl_seconds,
         max_pending=enrollment_config.max_pending,
-    )
-    instance_id = load_or_create_instance_id(
-        instance_id_path or state_database.with_name("instance-id"), allow_create=True
     )
     enrollment_socket_server = (
         EnrollmentSocketServer(

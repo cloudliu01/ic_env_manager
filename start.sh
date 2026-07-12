@@ -158,16 +158,52 @@ ingest:
 YAML
   fi
 
+  python - "${CONFIG_FILE}" "${DEV_CONFIG_MODE}" "${BACKEND_HOST}" \
+    "${BACKEND_PORT}" "${AGENT_INGEST_PORT}" "${AGENT_PORT}" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+path = Path(sys.argv[1])
+mode, host = sys.argv[2:4]
+public_port, ingest_port, agent_port = map(int, sys.argv[4:7])
+config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+config["mode"] = mode
+server = config.setdefault("server", {})
+server["bind"] = host
+server["port"] = public_port
+if mode == "agent":
+    ingest = config.setdefault("ingest", {})
+    ingest["bind"] = "127.0.0.1"
+    ingest["port"] = ingest_port
+else:
+    for agent in config.get("agents", []):
+        if agent.get("id") == "local-agent":
+            agent["base_url"] = f"http://{host}:{agent_port}"
+path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+PY
+  chmod 0600 "${CONFIG_FILE}"
+
   echo "Dev mode:   ${DEV_CONFIG_MODE}"
   echo "Dev token:  ${TOKEN_FILE}"
   if [[ "${DEV_CONFIG_MODE}" == "control-plane" ]]; then
     echo "Agent token: ${AGENT_TOKEN_FILE}"
   fi
   echo "Dev config: ${CONFIG_FILE}"
-  echo "Public listener: ${BACKEND_HOST}:${BACKEND_PORT}"
-  if [[ "${DEV_CONFIG_MODE}" == "agent" ]]; then
-    echo "Ingest listener: 127.0.0.1:${AGENT_INGEST_PORT}"
-  fi
+  python - "${CONFIG_FILE}" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+config = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8"))
+server = config["server"]
+print(f"Public listener: {server['bind']}:{server['port']}")
+if config["mode"] == "agent":
+    ingest = config["ingest"]
+    print(f"Ingest listener: {ingest['bind']}:{ingest['port']}")
+PY
 }
 
 ensure_backend_deps() {
@@ -196,7 +232,13 @@ PY
 
 validate_config() {
   cd "${BACKEND_DIR}"
-  python -m ic_env_guard.systemd.cli validate "${CONFIG_FILE}"
+  python - "${CONFIG_FILE}" <<'PY'
+import sys
+
+from ic_env_guard.systemd.cli import main
+
+raise SystemExit(main(["validate", sys.argv[1]]))
+PY
 }
 
 start_backend() {

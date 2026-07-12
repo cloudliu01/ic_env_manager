@@ -1,5 +1,6 @@
 import argparse
 import os
+import pwd
 import sys
 from pathlib import Path
 
@@ -7,6 +8,16 @@ from ic_env_guard.config.loader import ConfigLoadError, load_config
 from ic_env_guard.enrollment.helper import run_helper
 
 DEFAULT_CONFIG = Path("/etc/ic-env-guard/config.yaml")
+USER_CONFIG_DIR = Path("/etc/ic-env-guard")
+
+
+def resolve_helper_config_path() -> Path:
+    configured = os.environ.get("IC_ENV_GUARD_CONFIG")
+    if configured:
+        return Path(configured)
+    username = pwd.getpwuid(os.geteuid()).pw_name
+    user_config = USER_CONFIG_DIR / f"{username}.yaml"
+    return user_config if user_config.is_file() else DEFAULT_CONFIG
 
 
 def build_runtime_parser() -> argparse.ArgumentParser:
@@ -22,7 +33,7 @@ def build_runtime_parser() -> argparse.ArgumentParser:
 def runtime_main(argv: list[str] | None = None) -> int:
     args = build_runtime_parser().parse_args(argv)
     if args.command == "agent":
-        config_path = Path(os.environ.get("IC_ENV_GUARD_CONFIG", DEFAULT_CONFIG))
+        config_path = resolve_helper_config_path()
         try:
             config = load_config(config_path)
         except ConfigLoadError:
@@ -44,7 +55,7 @@ def runtime_main(argv: list[str] | None = None) -> int:
 
     config_path = args.config or Path(os.environ.get("IC_ENV_GUARD_CONFIG", DEFAULT_CONFIG))
     config = load_config(config_path)
-    asyncio.run(serve_config(config))
+    asyncio.run(serve_config(config, config_path=config_path))
     return 0
 
 

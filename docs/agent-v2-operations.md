@@ -20,7 +20,7 @@ and submit to loopback.
 
 ## Agent account and systemd
 
-Use the template unit with an existing Linux account:
+Use the template unit with an existing non-root Linux account:
 
 ```bash
 sudo install -m 0644 packaging/systemd/ic-env-guard@.service /etc/systemd/system/
@@ -51,6 +51,11 @@ enrollment:
 
 The socket is ephemeral and must not be backed up. Its parent must be owned by the Agent
 account and no wider than `0700`. The fixed helper is `ic-env-guard agent enroll-manager`.
+It accepts no config or shell arguments. It resolves configuration from `IC_ENV_GUARD_CONFIG`
+when set, otherwise `/etc/ic-env-guard/<current-euid-name>.yaml`, then the deprecated
+`/etc/ic-env-guard/config.yaml` fallback. The template sets the environment for service
+execution; SSH forced commands do not inherit the service environment, so keep the normal
+per-user path or set a fixed `IC_ENV_GUARD_CONFIG` in the forced command for a custom path.
 
 For an optional unattended Manager SSH key, install the public key manually for the Agent
 account with a forced command. Keep host-key verification enabled and use an entry equivalent
@@ -107,6 +112,8 @@ Stop the service and make a consistent backup before an upgrade:
 
 1. Back up the Agent config, legacy local-admin token file, `instance-id`, and SQLite state DB
    together while the process is stopped. Preserve owner and `0600` modes for identity/token.
+   The DB contains the initialization marker but never a copy of the identity UUID; both the
+   DB and `instance-id` are required for recovery.
 2. Back up `logs.allowed_roots` configuration, but not log contents unless normal operations
    require them.
 3. On a Manager, back up its DB, durable enrollment journal, and `0600` plaintext Agent
@@ -117,9 +124,10 @@ Stop the service and make a consistent backup before an upgrade:
 
 On the first v2 Agent startup, `instance-id` is created once next to the state DB. Subsequent
 restarts and upgrades must retain that exact file. If it disappears after enrollment, stop the
-Agent and restore it from the matching backup. Starting without it creates a new identity;
-Managers treat the host as a different Agent and it must be deliberately re-enrolled. Never
-copy one Agent's identity to another host.
+Agent and restore it from the matching backup. Once the SQLite initialization marker or an
+existing v2 schema proves initialization occurred, startup without the file fails closed and
+does not generate a replacement UUID. A new install or an explicitly pre-v2 database may
+create the file once. Never copy one Agent's identity to another host.
 
 Migrations add Observation, Log Source, and `manager_credentials` tables in place and retain
 existing tables. A failed migration prevents startup. An older binary may leave unknown new

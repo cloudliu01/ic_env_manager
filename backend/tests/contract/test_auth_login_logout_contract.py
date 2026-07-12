@@ -128,6 +128,7 @@ def test_production_launcher_uses_configured_coordinated_servers(tmp_path, monke
     assert config.mode == "agent"
     assert config.server.port == 8765
     assert config.ingest.port == 8766
+    assert launcher.await_args.kwargs["config_path"] == config_path
 
 
 @pytest.mark.contract

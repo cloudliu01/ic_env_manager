@@ -11,6 +11,7 @@ WorkingDirectory=~
 RuntimeDirectory=ic-env-guard
 RuntimeDirectoryMode=0700
 EnvironmentFile=-/etc/ic-env-guard/%i.env
+Environment=IC_ENV_GUARD_CONFIG=/etc/ic-env-guard/%i.yaml
 ExecStart=/usr/local/bin/ic-env-guard --config /etc/ic-env-guard/%i.yaml
 ExecReload=/usr/local/bin/ic-env-guard-config validate /etc/ic-env-guard/%i.yaml
 Restart=on-failure

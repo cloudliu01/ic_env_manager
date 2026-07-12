@@ -505,6 +505,7 @@ def create_ingest_app(container: AgentContainer) -> FastAPI:
 async def serve_config(
     config: AppConfig,
     *,
+    config_path: Path | None = None,
     shutdown_event: asyncio.Event | None = None,
 ) -> None:
     import uvicorn
@@ -513,48 +514,50 @@ async def serve_config(
         container: AgentContainer | ManagerContainer = build_agent_container(
             config,
             _resolve_state_db(None, config),
-            _resolve_instance_id_path(None, None, None, None, config),
+            _resolve_instance_id_path(None, None, None, config_path, config),
         )
     else:
         container = build_manager_container(config)
 
-    public_app = create_public_app(container)
-    server_specs: list[tuple[uvicorn.Server, str, int]] = [
-        (
-            uvicorn.Server(
-                uvicorn.Config(
-                    public_app,
-                    host=config.server.bind,
-                    port=config.server.port,
-                    proxy_headers=False,
-                    lifespan="on",
-                )
-            ),
-            config.server.bind,
-            config.server.port,
-        )
-    ]
-    if isinstance(container, AgentContainer):
+    public_app: FastAPI | None = None
+    server_specs: list[tuple[uvicorn.Server, str, int]] = []
+    sockets = []
+    tasks: list[asyncio.Task[None]] = []
+    shutdown_task: asyncio.Task[bool] | None = None
+    completion_error: BaseException | None = None
+    try:
+        public_app = create_public_app(container)
         server_specs.append(
             (
                 uvicorn.Server(
                     uvicorn.Config(
-                        create_ingest_app(container),
-                        host=config.ingest.bind,
-                        port=config.ingest.port,
+                        public_app,
+                        host=config.server.bind,
+                        port=config.server.port,
                         proxy_headers=False,
-                        lifespan="off",
+                        lifespan="on",
                     )
                 ),
-                config.ingest.bind,
-                config.ingest.port,
+                config.server.bind,
+                config.server.port,
             )
         )
-
-    sockets = []
-    tasks: list[asyncio.Task[None]] = []
-    shutdown_task: asyncio.Task[bool] | None = None
-    try:
+        if isinstance(container, AgentContainer):
+            server_specs.append(
+                (
+                    uvicorn.Server(
+                        uvicorn.Config(
+                            create_ingest_app(container),
+                            host=config.ingest.bind,
+                            port=config.ingest.port,
+                            proxy_headers=False,
+                            lifespan="off",
+                        )
+                    ),
+                    config.ingest.bind,
+                    config.ingest.port,
+                )
+            )
         for server, _host, _port in server_specs:
             sockets.append(server.config.bind_socket())
         tasks = [
@@ -565,25 +568,60 @@ async def serve_config(
         if shutdown_event is not None:
             shutdown_task = asyncio.create_task(shutdown_event.wait())
             waiters.append(shutdown_task)
-        await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        done, _pending = await asyncio.wait(
+            waiters, return_when=asyncio.FIRST_COMPLETED
+        )
+        explicit_shutdown = shutdown_task is not None and shutdown_task in done
+        if not explicit_shutdown:
+            for task, (server, _host, port) in zip(tasks, server_specs, strict=True):
+                if task not in done:
+                    continue
+                if task.cancelled():
+                    completion_error = RuntimeError(
+                        f"listener task on port {port} was cancelled"
+                    )
+                else:
+                    exception = task.exception()
+                    if exception is not None:
+                        completion_error = exception
+                    elif not server.started:
+                        completion_error = RuntimeError(
+                            f"listener on port {port} failed to start"
+                        )
+                    elif not server.should_exit:
+                        completion_error = RuntimeError(
+                            f"listener task on port {port} returned unexpectedly"
+                        )
+                if completion_error is not None:
+                    break
     finally:
         for server, _host, _port in server_specs:
             server.should_exit = True
         if shutdown_task is not None:
             shutdown_task.cancel()
+            await asyncio.gather(shutdown_task, return_exceptions=True)
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for listener in sockets:
             listener.close()
-        if not getattr(public_app.state, "lifecycle_cleanup_complete", False):
+        if public_app is None or not getattr(
+            public_app.state, "lifecycle_cleanup_complete", False
+        ):
             await close_container(container)
 
+    if completion_error is not None:
+        raise completion_error
     for result in results:
         if isinstance(result, BaseException):
+            if isinstance(result, asyncio.CancelledError):
+                raise RuntimeError("listener task was cancelled") from result
             raise result
 
 
 def main() -> None:
-    config = _resolve_config(None, None)
-    if config is None:
+    configured_path = os.environ.get("IC_ENV_GUARD_CONFIG")
+    if configured_path is None:
         raise RuntimeError("IC_ENV_GUARD_CONFIG is required")
-    asyncio.run(serve_config(config))
+    config_path = Path(configured_path)
+    config = _resolve_config(config_path, None)
+    assert config is not None
+    asyncio.run(serve_config(config, config_path=config_path))
