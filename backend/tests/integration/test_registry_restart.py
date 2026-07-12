@@ -1,5 +1,6 @@
 from dataclasses import replace
 
+import httpx
 import pytest
 
 from ic_env_guard.bootstrap.composition import build_manager_container
@@ -44,7 +45,20 @@ def test_sqlite_registry_changes_survive_restart_and_yaml_is_ignored(tmp_path):
     second = build_manager_container(_config(tmp_path, yaml_name="Changed YAML name"))
     try:
         assert second.agent_registry.get("lab-01").name == "Web rename"
-        assert second.agent_registry.get("lab-01").token_file.parent == tmp_path / "credentials"
+    finally:
+        second.database_engine.dispose()
+
+
+@pytest.mark.integration
+def test_deleting_last_sqlite_agent_does_not_reimport_yaml_on_restart(tmp_path):
+    config = _config(tmp_path, yaml_name="Lab 01")
+    first = build_manager_container(config)
+    first.registry_repository.delete("lab-01")
+    first.database_engine.dispose()
+
+    second = build_manager_container(config)
+    try:
+        assert second.agent_registry.list_configs() == []
     finally:
         second.database_engine.dispose()
 
@@ -62,3 +76,31 @@ def test_disabled_import_is_not_routable_after_restart(tmp_path):
         assert second.agent_registry.summary("lab-01")["status"] == "disabled"
     finally:
         second.database_engine.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_manager_client_reads_imported_token_through_credential_store(
+    tmp_path, monkeypatch
+):
+    observed = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        observed["authorization"] = request.headers["authorization"]
+        return httpx.Response(200, json={"ok": True})
+
+    container = build_manager_container(_config(tmp_path, yaml_name="Lab 01"))
+    container.agent_client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(
+        "ic_env_guard.agents.client.load_bearer_token",
+        lambda _path: (_ for _ in ()).throw(AssertionError("raw path read")),
+    )
+    try:
+        response = await container.agent_client.request(
+            container.agent_registry.get("lab-01"), "GET", "/api/capabilities"
+        )
+        assert response.status_code == 200
+        assert observed["authorization"] == "Bearer agent-secret"
+    finally:
+        await container.agent_client.aclose()
+        container.database_engine.dispose()

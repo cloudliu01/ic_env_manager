@@ -98,6 +98,30 @@ async def test_agent_client_forwards_only_allowlisted_headers(tmp_path):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_agent_client_uses_injected_legacy_credential_loader(tmp_path, monkeypatch):
+    observed = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        observed["authorization"] = request.headers["authorization"]
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(
+        "ic_env_guard.agents.client.load_bearer_token",
+        lambda _path: (_ for _ in ()).throw(AssertionError("raw path read")),
+    )
+    client = AgentHttpClient(
+        transport=httpx.MockTransport(handler),
+        legacy_credential_loader=lambda _agent: "stored-secret",
+    )
+    response = await client.request(_agent(tmp_path), "GET", "/api/capabilities")
+    await client.aclose()
+
+    assert response.status_code == 200
+    assert observed["authorization"] == "Bearer stored-secret"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_agent_client_rejects_redirects_as_protocol_errors(tmp_path):
     async def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(302, headers={"Location": "https://other.example"})

@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import ssl
+from collections.abc import Callable
 from typing import Annotated
 from urllib.parse import urlencode, urlsplit, urlunsplit
 from uuid import uuid4
@@ -48,6 +49,16 @@ def get_gateway_proxy_limiter() -> GatewayProxyLimiter:
 
 
 class AgentWebSocketConnector:
+    def __init__(
+        self,
+        legacy_credential_loader: Callable[[AgentConfig], str] | None = None,
+    ) -> None:
+        self._legacy_credential_loader = (
+            legacy_credential_loader
+            if legacy_credential_loader is not None
+            else lambda agent: load_bearer_token(agent.token_file)
+        )
+
     def connect(
         self,
         agent: AgentConfig,
@@ -61,8 +72,12 @@ class AgentWebSocketConnector:
         path = f"/ws/terminals/{terminal_id}"
         query = urlencode({"ticket": ticket, "cursor": str(cursor)})
         url = urlunsplit((scheme, parsed.netloc, path, query, ""))
+        try:
+            token = self._legacy_credential_loader(agent)
+        except Exception as exc:
+            raise OSError("credential unavailable") from exc
         headers = {
-            "Authorization": f"Bearer {load_bearer_token(agent.token_file)}",
+            "Authorization": f"Bearer {token}",
             "X-Correlation-ID": correlation_id,
         }
         kwargs = {

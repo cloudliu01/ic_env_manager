@@ -19,7 +19,19 @@ class AgentConfigImportError(Exception):
     pass
 
 
+class AgentConfigImportOutcomeUncertain(AgentConfigImportError):
+    pass
+
+
+class _ConcurrentImportComplete(Exception):
+    pass
+
+
 _AGENT_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_IMPORT_MARKER_KEY = "yaml_agents_imported_v1"
+_IMPORT_MARKER_VALUE = "complete"
+_MAX_TOKEN_BYTES = 64 * 1024
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 
 @dataclass(frozen=True)
@@ -39,7 +51,7 @@ def import_yaml_agents_once(
     transport_profiles: tuple[TransportProfile, ...] = (),
 ) -> bool:
     """Import legacy YAML inventory once, without contacting any Agent."""
-    if _registry_has_agents(engine):
+    if not _prepare_import_if_needed(engine):
         return False
     try:
         prepared = _prepare_all(agents, manager_token, transport_profiles)
@@ -54,6 +66,16 @@ def import_yaml_agents_once(
             for item in prepared:
                 new_references.append(credential_store.put(item.token))
             _commit_import(engine, prepared, new_references)
+    except _ConcurrentImportComplete as exc:
+        cleanup_errors = _delete_new_credentials(credential_store, new_references)
+        if cleanup_errors:
+            raise AgentConfigImportError(
+                "concurrent YAML import completed but credential cleanup failed"
+            ) from exc
+        return False
+    except AgentConfigImportOutcomeUncertain:
+        # The only safe recovery is to retain every new reference for operator audit.
+        raise
     except Exception as exc:
         cleanup_errors = _delete_new_credentials(credential_store, new_references)
         if cleanup_errors:
@@ -66,12 +88,28 @@ def import_yaml_agents_once(
     return True
 
 
-def _registry_has_agents(engine: Engine) -> bool:
+def _prepare_import_if_needed(engine: Engine) -> bool:
+    raw = engine.raw_connection()
+    connection = raw.driver_connection
     try:
-        with engine.connect() as connection:
-            return connection.exec_driver_sql("SELECT 1 FROM agents LIMIT 1").first() is not None
+        connection.execute("BEGIN IMMEDIATE")
+        if _marker_complete(connection):
+            _rollback_transaction(connection)
+            return False
+        if connection.execute("SELECT 1 FROM agents LIMIT 1").fetchone() is not None:
+            _insert_marker(connection)
+            _commit_transaction(connection)
+            return False
+        _rollback_transaction(connection)
+        return True
     except Exception as exc:
-        raise AgentConfigImportError("Agent Registry is unavailable") from exc
+        try:
+            _rollback_transaction(connection)
+        except Exception:
+            pass
+        raise AgentConfigImportError("Agent import state is unavailable") from exc
+    finally:
+        raw.close()
 
 
 def _prepare_all(
@@ -115,19 +153,43 @@ def _read_source_token(path: Path | None, *, enabled: bool) -> bytes:
         if enabled:
             raise AgentConfigImportError("enabled imported Agents require a token file")
         return secrets.token_bytes(32)
+    fd = -1
     try:
-        metadata = path.lstat()
-        if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        before = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(before.st_mode):
             raise AgentConfigImportError("Agent token file must be a regular file")
+        fd = os.open(path, os.O_RDONLY | _NOFOLLOW)
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise AgentConfigImportError("Agent token file changed during access")
         if metadata.st_uid != os.geteuid():
             raise AgentConfigImportError("Agent token file has the wrong owner")
         if stat.S_IMODE(metadata.st_mode) & 0o077:
             raise AgentConfigImportError("Agent token file permissions are too broad")
-        token = path.read_text(encoding="utf-8").strip().encode("utf-8")
+        if metadata.st_size > _MAX_TOKEN_BYTES:
+            raise AgentConfigImportError("Agent token file is too large")
+        chunks: list[bytes] = []
+        remaining = _MAX_TOKEN_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(8192, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw_token = b"".join(chunks)
+        if len(raw_token) > _MAX_TOKEN_BYTES:
+            raise AgentConfigImportError("Agent token file is too large")
+        token = raw_token.decode("utf-8").strip().encode("utf-8")
     except AgentConfigImportError:
         raise
     except (OSError, UnicodeError) as exc:
         raise AgentConfigImportError("Agent token file is unavailable") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
     if not token:
         raise AgentConfigImportError("Agent token file is empty")
     return token
@@ -184,18 +246,48 @@ def _commit_import(
     now = datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
     try:
         connection.execute("BEGIN IMMEDIATE")
+        if _marker_complete(connection):
+            raise _ConcurrentImportComplete
         if connection.execute("SELECT 1 FROM agents LIMIT 1").fetchone() is not None:
-            raise AgentConfigImportError("Agent Registry was populated during import")
+            _insert_marker(connection)
+            _commit_transaction(connection)
+            raise _ConcurrentImportComplete
         for item, reference in zip(prepared, references, strict=True):
             _insert_agent(connection, item, reference, now)
             _insert_initial_status(
                 connection, item.config.id, item.config.enabled, now
             )
-        _commit_transaction(connection)
+        _insert_marker(connection)
     except Exception:
-        connection.rollback()
+        try:
+            _rollback_transaction(connection)
+        finally:
+            raw.close()
         raise
-    finally:
+    try:
+        _commit_transaction(connection)
+    except Exception as commit_error:
+        try:
+            _rollback_transaction(connection)
+        except Exception:
+            pass
+        raw.close()
+        expected = {
+            item.config.id: reference
+            for item, reference in zip(prepared, references, strict=True)
+        }
+        try:
+            outcome = _verify_committed_import(engine, expected)
+        except Exception as verification_error:
+            raise AgentConfigImportOutcomeUncertain(
+                "YAML Agent commit outcome is uncertain; credentials were retained"
+            ) from verification_error
+        if outcome == "own":
+            return
+        if outcome == "other":
+            raise _ConcurrentImportComplete from commit_error
+        raise commit_error
+    else:
         raw.close()
 
 
@@ -226,6 +318,41 @@ def _insert_agent(
 
 def _commit_transaction(connection: sqlite3.Connection) -> None:
     connection.commit()
+
+
+def _rollback_transaction(connection: sqlite3.Connection) -> None:
+    connection.rollback()
+
+
+def _marker_complete(connection: sqlite3.Connection) -> bool:
+    row = connection.execute(
+        "SELECT value FROM manager_metadata WHERE key = ?", (_IMPORT_MARKER_KEY,)
+    ).fetchone()
+    return row is not None and row[0] == _IMPORT_MARKER_VALUE
+
+
+def _insert_marker(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "INSERT INTO manager_metadata(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (_IMPORT_MARKER_KEY, _IMPORT_MARKER_VALUE),
+    )
+
+
+def _verify_committed_import(engine: Engine, expected: dict[str, str]) -> str:
+    with engine.connect() as connection:
+        marker = connection.exec_driver_sql(
+            "SELECT value FROM manager_metadata WHERE key = ?", (_IMPORT_MARKER_KEY,)
+        ).first()
+        if marker is None or marker[0] != _IMPORT_MARKER_VALUE:
+            return "absent"
+        for agent_id, reference in expected.items():
+            row = connection.exec_driver_sql(
+                "SELECT credential_ref, source FROM agents WHERE agent_id = ?", (agent_id,)
+            ).first()
+            if row is None or row[0] != reference or row[1] != "config_import":
+                return "other"
+    return "own"
 
 
 def _insert_initial_status(

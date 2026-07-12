@@ -11,6 +11,7 @@ from ic_env_guard.agents.availability import AgentAvailabilityService
 from ic_env_guard.agents.client import AgentHttpClient
 from ic_env_guard.agents.registry import AgentRegistry
 from ic_env_guard.agents.terminal_proxy import GatewayProxyLimiter, GatewayTicketStore
+from ic_env_guard.api.agent_terminal_ws import AgentWebSocketConnector
 from ic_env_guard.api.audit_health import AuditStorageHealth
 from ic_env_guard.auth.token import load_bearer_token
 from ic_env_guard.bootstrap.identity import (
@@ -90,6 +91,7 @@ class ManagerContainer:
     config: AppConfig
     agent_registry: AgentRegistry
     agent_client: AgentHttpClient
+    agent_ws_connector: AgentWebSocketConnector
     agent_availability: AgentAvailabilityService
     gateway_ticket_store: GatewayTicketStore
     gateway_proxy_limiter: GatewayProxyLimiter
@@ -242,7 +244,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         config.control_plane.transport_profiles,
     )
     agent_registry = AgentRegistry(fleet_registry)
-    agent_client = AgentHttpClient()
+    agent_client = AgentHttpClient(legacy_credential_loader=fleet_registry.load_credential)
     metrics_registry = create_registry()
     terminal_manager = TerminalManager()
     service_manager = ServiceManager([])
@@ -252,6 +254,9 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         config=config,
         agent_registry=agent_registry,
         agent_client=agent_client,
+        agent_ws_connector=AgentWebSocketConnector(
+            legacy_credential_loader=fleet_registry.load_credential
+        ),
         agent_availability=AgentAvailabilityService(
             agent_registry,
             agent_client,

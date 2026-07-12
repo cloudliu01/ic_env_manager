@@ -32,6 +32,47 @@ CAPABILITIES = {
 }
 
 
+@pytest.mark.integration
+def test_websocket_connector_uses_injected_credential_loader(tmp_path, monkeypatch):
+    captured = {}
+
+    class FakeConnection:
+        process_redirect = None
+
+    def fake_connect(_url, **kwargs):
+        captured.update(kwargs)
+        return FakeConnection()
+
+    monkeypatch.setattr(
+        "ic_env_guard.api.agent_terminal_ws.load_bearer_token",
+        lambda _path: (_ for _ in ()).throw(AssertionError("raw path read")),
+    )
+    monkeypatch.setattr(
+        "ic_env_guard.api.agent_terminal_ws.websockets.connect", fake_connect
+    )
+    connector = AgentWebSocketConnector(
+        legacy_credential_loader=lambda _agent: "stored-secret"
+    )
+    agent = AgentConfig(
+        id="lab-01",
+        name="Lab 01",
+        base_url="https://lab-01.example",
+        token_file=_token_file(tmp_path, "lab-01.token"),
+    )
+
+    connector.connect(agent, "term-1", "ticket", 0, "corr-1")
+
+    assert captured["additional_headers"]["Authorization"] == "Bearer stored-secret"
+
+    failing = AgentWebSocketConnector(
+        legacy_credential_loader=lambda _agent: (_ for _ in ()).throw(
+            RuntimeError("credential unavailable")
+        )
+    )
+    with pytest.raises(OSError, match="credential unavailable"):
+        failing.connect(agent, "term-1", "ticket", 0, "corr-1")
+
+
 def _token_file(tmp_path, name="token"):
     token_file = tmp_path / name
     token = "secret-token" if name == "token" else "agent-secret-token"

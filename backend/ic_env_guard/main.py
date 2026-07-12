@@ -16,7 +16,11 @@ from ic_env_guard.api.agent_audit import router as agent_audit_router
 from ic_env_guard.api.agent_http import get_agent_http_client
 from ic_env_guard.api.agent_monitoring import router as agent_monitoring_router
 from ic_env_guard.api.agent_services import router as agent_services_router
-from ic_env_guard.api.agent_terminal_ws import get_gateway_proxy_limiter
+from ic_env_guard.api.agent_terminal_ws import (
+    AgentWebSocketConnector,
+    get_agent_ws_connector,
+    get_gateway_proxy_limiter,
+)
 from ic_env_guard.api.agent_terminal_ws import router as agent_terminal_ws_router
 from ic_env_guard.api.agent_terminals import get_gateway_ticket_store
 from ic_env_guard.api.agent_terminals import router as agent_terminals_router
@@ -193,6 +197,7 @@ def create_app(
         agent_availability = None
         gateway_ticket_store = None
         gateway_proxy_limiter = None
+        agent_ws_connector = None
         login_audit_recorder = AgentLoginAuditRecorder(container.session_factory)
         auth_state = AuthState(
             token_file=auth_token_file,
@@ -214,6 +219,7 @@ def create_app(
         agent_availability = container.agent_availability
         gateway_ticket_store = container.gateway_ticket_store
         gateway_proxy_limiter = container.gateway_proxy_limiter
+        agent_ws_connector = container.agent_ws_connector
         login_audit_recorder = ManagerLoginAuditRecorder(
             container.control_plane_session_factory
         )
@@ -360,6 +366,11 @@ def create_app(
             raise RuntimeError("gateway proxy limiter is not configured in agent mode")
         return gateway_proxy_limiter
 
+    def configured_agent_ws_connector() -> AgentWebSocketConnector:
+        if agent_ws_connector is None:
+            raise RuntimeError("Agent WebSocket connector is not configured in agent mode")
+        return agent_ws_connector
+
     def configured_audit_query_repository() -> Iterator[AuditQueryRepository]:
         if audit_session_factory is None:
             raise RuntimeError("agent audit repository is not configured in control-plane mode")
@@ -394,6 +405,7 @@ def create_app(
     app.dependency_overrides[get_agent_http_client] = configured_agent_http_client
     app.dependency_overrides[get_gateway_ticket_store] = configured_gateway_ticket_store
     app.dependency_overrides[get_gateway_proxy_limiter] = configured_gateway_proxy_limiter
+    app.dependency_overrides[get_agent_ws_connector] = configured_agent_ws_connector
     app.dependency_overrides[get_audit_query_repository] = configured_audit_query_repository
     app.dependency_overrides[get_control_plane_audit_repository] = (
         configured_control_plane_audit_repository

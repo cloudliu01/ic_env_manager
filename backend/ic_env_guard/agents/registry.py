@@ -1,5 +1,9 @@
 from ic_env_guard.config.models import AgentConfig
-from ic_env_guard.fleet.registry import FleetRegistry
+from ic_env_guard.fleet.registry import (
+    FleetRegistry,
+    FleetRegistryConfigurationError,
+    FleetRegistryConflict,
+)
 
 
 class AgentNotFoundError(Exception):
@@ -50,7 +54,10 @@ class AgentRegistry:
             current = self.get(agent_id)
             if enabled and current.token_file is None:
                 raise AgentInvalidConfigurationError("enabled agents require a token_file")
-            agent = self._fleet.set_enabled(agent_id, enabled)
+            try:
+                agent = self._fleet.set_enabled(agent_id, enabled)
+            except (FleetRegistryConfigurationError, FleetRegistryConflict) as exc:
+                raise AgentInvalidConfigurationError(str(exc)) from exc
             if agent is None:
                 raise AgentNotFoundError(agent_id)
             return agent

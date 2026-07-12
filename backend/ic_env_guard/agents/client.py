@@ -1,7 +1,7 @@
 import json as json_module
 import re
 import ssl
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import overload
 from urllib.parse import unquote_to_bytes
 
@@ -34,10 +34,16 @@ class AgentHttpClient:
         *,
         connect_timeout_seconds: float = 3,
         request_timeout_seconds: float = 10,
+        legacy_credential_loader: Callable[[AgentConfig], str] | None = None,
     ) -> None:
         self._client: httpx.AsyncClient | None = None
         self._connect_timeout_seconds = connect_timeout_seconds
         self._request_timeout_seconds = request_timeout_seconds
+        self._legacy_credential_loader = (
+            legacy_credential_loader
+            if legacy_credential_loader is not None
+            else lambda agent: load_bearer_token(agent.token_file)
+        )
         if transport is not None:
             self._client = httpx.AsyncClient(
                 follow_redirects=False, transport=transport, trust_env=False
@@ -226,9 +232,13 @@ class AgentHttpClient:
         params: Mapping[str, str | int] | None,
         json: object | None,
     ) -> httpx.Response:
-        headers = self._headers(
-            load_bearer_token(agent.token_file), incoming_headers or {}, correlation_id
-        )
+        try:
+            token = self._legacy_credential_loader(agent)
+        except Exception as exc:
+            raise AgentClientError(
+                "agent_auth_error", "Agent credential is unavailable"
+            ) from exc
+        headers = self._headers(token, incoming_headers or {}, correlation_id)
         _validate_upstream_path(path)
         client = self._client
         transient_client: httpx.AsyncClient | None = None
