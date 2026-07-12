@@ -274,11 +274,7 @@ class EnrollmentSocketServer:
                 return
             payload = self._read_request(connection)
             request = parse_request(payload)
-            issued = self.service.issue_pending(
-                str(request.manager_id),
-                request.enrollment_id,
-                expires_at=request.expires_at,
-            )
+            issued = self.service.issue_pending(str(request.manager_id), request.enrollment_id)
             response = EnrollmentResponse(
                 protocol="manager-enrollment.v1",
                 instance_id=self.instance_id,

@@ -8,7 +8,7 @@ import signal
 import stat
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -39,6 +39,7 @@ MAX_HELPER_STDIN_BYTES = 4 * 1024
 MAX_HELPER_STDOUT_BYTES = 8 * 1024
 MAX_HELPER_STDERR_BYTES = 8 * 1024
 _PROTOCOL = "manager-enrollment.v1"
+MAX_HELPER_EXPIRY_SKEW_SECONDS = 5
 
 
 class SshEnrollmentError(Exception):
@@ -437,7 +438,6 @@ def _request_payload(request: SshEnrollmentRequest) -> bytes:
             "protocol": _PROTOCOL,
             "manager_id": request.manager_id,
             "enrollment_id": request.enrollment_id,
-            "expires_at": request.expires_at.isoformat(),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -484,7 +484,9 @@ def _parse_helper_result(
     ):
         raise ValueError
     expires_at = _parse_time(value["expires_at"])
-    if now.tzinfo is None or not now < expires_at <= request.expires_at:
+    if now.tzinfo is None or not now < expires_at <= request.expires_at + timedelta(
+        seconds=MAX_HELPER_EXPIRY_SKEW_SECONDS
+    ):
         raise ValueError
     return EnrollmentHelperResult(
         instance_id=instance_id,

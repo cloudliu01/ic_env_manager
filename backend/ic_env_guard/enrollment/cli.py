@@ -168,7 +168,6 @@ def run_cli_enrollment(
                 "protocol": "manager-enrollment.v1",
                 "manager_id": ready["manager_id"],
                 "enrollment_id": ready["enrollment_id"],
-                "expires_at": ready["expires_at"],
             },
             separators=(",", ":"),
         ).encode()

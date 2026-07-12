@@ -565,6 +565,13 @@ class ManagerRegistryRepository(_SQLiteRepository):
                     owner_enrollment_id=owner_enrollment_id,
                     owner_removal_id=owner_removal_id,
                 )
+                matched = connection.execute(
+                    "SELECT 1 FROM agents "
+                    "WHERE agent_id=? AND revision=? AND credential_ref=?",
+                    (agent_id, expected_revision, expected_credential_ref),
+                ).fetchone()
+                if matched is None:
+                    return False
                 terminal_states = ("consumed", "cancelled", "failed", "expired")
                 placeholders = ",".join("?" for _ in terminal_states)
                 active_rotation = connection.execute(
@@ -585,7 +592,9 @@ class ManagerRegistryRepository(_SQLiteRepository):
                     "DELETE FROM agents WHERE agent_id=? AND revision=? AND credential_ref=?",
                     (agent_id, expected_revision, expected_credential_ref),
                 )
-            return cursor.rowcount == 1
+                if cursor.rowcount != 1:
+                    raise RegistryError("agent registry changed during delete")
+            return True
         except (SQLAlchemyError, sqlite3.Error) as exc:
             raise RegistryError("agent registry storage is unavailable") from exc
 

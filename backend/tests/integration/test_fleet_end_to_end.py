@@ -332,6 +332,19 @@ async def test_real_manager_agent_enrollment_probe_proxy_restart_and_online_remo
             )
             await _wait_for_enrollment_state(client, rotation_id, "verified")
             rotated_credential = rotation_cli.responses[0]
+            manager_shutdown.set()
+            await asyncio.wait_for(manager_task, timeout=5)
+            manager_shutdown = asyncio.Event()
+            manager_task = asyncio.create_task(
+                serve_config(manager, shutdown_event=manager_shutdown)
+            )
+            await _wait_for_health(manager_url)
+            recovered_rotation = await client.get(
+                f"/api/v2/agent-enrollments/{rotation_id}"
+            )
+            assert recovered_rotation.status_code == 200
+            assert recovered_rotation.json()["state"] == "verified"
+            assert rotated_credential["token"] not in recovered_rotation.text
             applied = await client.post(
                 f"/api/v2/agents/{agent_id}/credential-rotation",
                 json={"action": "consume", "enrollment_id": rotation_id},

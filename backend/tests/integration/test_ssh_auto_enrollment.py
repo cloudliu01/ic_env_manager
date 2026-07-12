@@ -155,11 +155,27 @@ async def test_issue_runs_preflight_then_fixed_helper_and_returns_secret_safe_re
         "protocol": "manager-enrollment.v1",
         "manager_id": MANAGER_ID,
         "enrollment_id": ENROLLMENT_ID,
-        "expires_at": "2026-07-12T12:10:00+00:00",
     }
     argv = json.loads(Path(f"{executable}.argv").read_text())
     assert "Hostname=10.20.30.40" in argv
     assert argv[-1] == "ic-env-guard agent enroll-manager"
+
+
+@pytest.mark.integration
+async def test_v1_helper_expiry_allows_only_bounded_issuance_skew(tmp_path):
+    within_skew = _script(
+        tmp_path,
+        f"sys.stdout.write({_result_json(expires_at='2026-07-12T12:10:04Z')!r} + '\\n')",
+    )
+    accepted = await _adapter(within_skew).issue(_request(), TRUSTED)
+    assert accepted.expires_at == NOW + timedelta(minutes=10, seconds=4)
+
+    outside_skew = _script(
+        tmp_path,
+        f"sys.stdout.write({_result_json(expires_at='2026-07-12T12:10:06Z')!r} + '\\n')",
+    )
+    with pytest.raises(SshEnrollmentError, match="ssh_remote_command_failed"):
+        await _adapter(outside_skew).issue(_request(), TRUSTED)
 
 
 @pytest.mark.integration

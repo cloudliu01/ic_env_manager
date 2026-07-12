@@ -6,7 +6,8 @@ export function RouteFocus() {
 
   useEffect(() => {
     const focusHeading = () => {
-      const heading = document.querySelector<HTMLElement>('#main-content h1:not(.sr-only)');
+      const heading = Array.from(document.querySelectorAll<HTMLElement>('#main-content h1:not(.sr-only)'))
+        .find((candidate) => !candidate.closest('[hidden]'));
       if (!heading) return false;
       heading.focus();
       return true;

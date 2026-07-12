@@ -320,6 +320,87 @@ def test_registry_delete_never_detaches_a_nonterminal_rotation(tmp_path):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize(
+    ("revision", "credential_ref"),
+    ((1, "match"), (2, "stale")),
+    ids=("stale-revision", "stale-credential"),
+)
+def test_registry_delete_cas_miss_never_detaches_terminal_rotation(
+    tmp_path, revision, credential_ref
+):
+    token_file = tmp_path / "manager.token"
+    token_file.write_text("manager-secret\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    app = create_app(
+        config=AppConfig(
+            mode="control-plane",
+            auth=AuthConfig(token_file=token_file),
+            control_plane=ControlPlaneConfig(audit_database=tmp_path / "manager.db"),
+        )
+    )
+    container = app.state.container
+    with container.credential_store.lifecycle_lease():
+        reference = container.credential_store.put(b"remove-token")
+    record = AgentRecord(
+        agent_id="alpha",
+        instance_id="33333333-3333-4333-8333-333333333333",
+        display_name="Alpha",
+        normalized_endpoint="https://10.0.0.11:8765",
+        credential_ref=reference,
+        remote_credential_id="44444444-4444-4444-8444-444444444444",
+        transport_profile_id="system-tls",
+        enrollment_method=EnrollmentMethod.SSH_AUTO,
+        enabled=True,
+        source="manual",
+        revision=2,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    container.registry_repository.create(record)
+    with container.database_engine.begin() as connection:
+        connection.exec_driver_sql(
+            """INSERT INTO agent_enrollment_jobs (
+                enrollment_id, manager_id, state, normalized_endpoint,
+                transport_profile_id, replace_agent_id, requested_display_name,
+                ssh_user, ssh_host, ssh_port, enrollment_method, save_requested,
+                expires_at, created_at, updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "rotation-history",
+                "22222222-2222-4222-8222-222222222222",
+                "consumed",
+                record.normalized_endpoint,
+                record.transport_profile_id,
+                record.agent_id,
+                record.display_name,
+                "edaops",
+                "10.0.0.11",
+                22,
+                "ssh_cli",
+                1,
+                "2026-07-12T13:00:00.000000Z",
+                "2026-07-12T12:00:00.000000Z",
+                "2026-07-12T12:00:00.000000Z",
+            ),
+        )
+
+    result = container.registry_repository.delete_if_revision_and_credential(
+        "alpha",
+        expected_revision=revision,
+        expected_credential_ref=(reference if credential_ref == "match" else "f" * 48),
+    )
+
+    assert result is False
+    assert container.registry_repository.get("alpha") == record
+    with container.database_engine.connect() as connection:
+        row = connection.exec_driver_sql(
+            "SELECT replace_agent_id, replace_agent_tombstone "
+            "FROM agent_enrollment_jobs WHERE enrollment_id='rotation-history'"
+        ).one()
+    assert tuple(row) == ("alpha", None)
+
+
+@pytest.mark.integration
 async def test_startup_finalizes_remove_intent_crash_before_journal_create(tmp_path):
     token_file = tmp_path / "manager.token"
     token_file.write_text("manager-secret\n", encoding="utf-8")

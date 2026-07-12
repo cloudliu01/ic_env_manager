@@ -1,9 +1,17 @@
 import asyncio
+import io
+import json
+import os
+import shutil
+import tempfile
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
+from ic_env_guard.bootstrap.composition import build_agent_container
+from ic_env_guard.config.models import AppConfig
 from ic_env_guard.db.control_plane_audit import ControlPlaneAuditEvent
 from ic_env_guard.db.control_plane_migrations import run_control_plane_migrations
 from ic_env_guard.db.session import create_session_factory, create_sqlite_engine
@@ -13,7 +21,9 @@ from ic_env_guard.enrollment.agent_client import (
 )
 from ic_env_guard.enrollment.audit import ManagerAutoEnrollmentAudit
 from ic_env_guard.enrollment.credential_store import CredentialStore, CredentialStoreError
+from ic_env_guard.enrollment.helper import run_helper
 from ic_env_guard.enrollment.jobs import EnrollmentJobRequest, EnrollmentJobs
+from ic_env_guard.enrollment.manager_socket import ManagerEnrollmentSocket
 from ic_env_guard.enrollment.orchestrator import (
     AutoEnrollmentAuditContext,
     EnrollmentOrchestrator,
@@ -40,6 +50,7 @@ VALIDATION_TARGET = type(
     {
         "normalized_endpoint": "http://10.20.30.40:8765",
         "pinned_address": "10.20.30.40",
+        "profile": PROFILE,
     },
 )()
 AUDIT_CONTEXT = AutoEnrollmentAuditContext(
@@ -201,6 +212,210 @@ def setup_services(
         clock=clock or (lambda: NOW),
     )
     return orchestrator, jobs, journal, credential_store, client, engine
+
+
+async def _socket_object(
+    reader: asyncio.StreamReader,
+) -> dict[str, object]:
+    value = json.loads(await asyncio.wait_for(reader.readline(), timeout=2))
+    assert isinstance(value, dict)
+    return value
+
+
+async def _open_manager_cli(
+    path: Path, header: dict[str, object]
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, dict[str, object]]:
+    reader, writer = await asyncio.open_unix_connection(path)
+    writer.write(json.dumps(header, separators=(",", ":")).encode() + b"\n")
+    await writer.drain()
+    return reader, writer, await _socket_object(reader)
+
+
+@pytest.mark.integration
+async def test_real_cli_socket_resumes_after_manager_restart_and_returns_acceptance(
+    tmp_path,
+):
+    now = datetime.now(UTC)
+    adapter = Adapter()
+    adapter.healthy = False
+    orchestrator, _jobs, journal, _store, _client, engine = setup_services(
+        tmp_path, adapter, clock=lambda: now
+    )
+    runtime = Path(tempfile.mkdtemp(prefix="ieg-r-", dir="/tmp"))
+    runtime.chmod(0o700)
+    manager_path = runtime / "m.sock"
+    agent_path = runtime / "a.sock"
+    server: ManagerEnrollmentSocket | None = None
+    restarted_server: ManagerEnrollmentSocket | None = None
+    restarted_orchestrator: EnrollmentOrchestrator | None = None
+    restarted_engine = None
+    agent_container = None
+    try:
+        created = orchestrator.create_auto(request(), AUDIT_CONTEXT)
+        await orchestrator.wait_for_background()
+        assert journal.get(created.job.enrollment_id).state is EnrollmentState.AWAITING_CLI
+
+        server = ManagerEnrollmentSocket(
+            path=manager_path,
+            mode=0o600,
+            orchestrator=orchestrator,
+            allowed_uid=os.geteuid(),
+            peer_credentials=lambda _socket: (
+                os.getpid(),
+                os.geteuid(),
+                os.getegid(),
+            ),
+        )
+        await server.start()
+        header = {
+            "protocol": "manager-cli-enrollment.header.v1",
+            "enrollment_id": created.job.enrollment_id,
+            "ssh": "edaops@agent.lab.example:2222",
+            "pinned_address": "10.20.30.40",
+        }
+        first_reader, first_writer, ready = await _open_manager_cli(manager_path, header)
+        assert ready.get("protocol") == "manager-cli-enrollment.ready.v1", ready
+        resume_nonce = ready["nonce"]
+        assert isinstance(resume_nonce, str)
+        first_writer.close()
+        await first_writer.wait_closed()
+        assert await asyncio.wait_for(first_reader.read(), timeout=2) == b""
+        await server.stop()
+        server = None
+        await orchestrator.shutdown()
+        engine.dispose()
+
+        restarted_adapter = Adapter()
+        restarted_adapter.healthy = False
+        (
+            restarted_orchestrator,
+            _restarted_jobs,
+            restarted_journal,
+            restarted_store,
+            restarted_client,
+            restarted_engine,
+        ) = setup_services(tmp_path, restarted_adapter, clock=lambda: now)
+
+        async def accept_real_helper(_target, token, *, helper_instance_id):
+            assert token
+            return EnrollmentValidation(
+                normalized_endpoint="http://10.20.30.40:8765",
+                api_version="2",
+                agent_version="0.3.0",
+                capabilities=("manager-enrollment.v1", "summary.v2"),
+                instance_id=helper_instance_id,
+                summary=None,
+                readiness_warning="agent_readiness_unavailable",
+            )
+
+        restarted_client.validate_pending = accept_real_helper
+        await restarted_orchestrator.recover_and_cleanup()
+        assert restarted_journal.get(created.job.enrollment_id).state is EnrollmentState.RUNNING
+        restarted_server = ManagerEnrollmentSocket(
+            path=manager_path,
+            mode=0o600,
+            orchestrator=restarted_orchestrator,
+            allowed_uid=os.geteuid(),
+            peer_credentials=lambda _socket: (
+                os.getpid(),
+                os.geteuid(),
+                os.getegid(),
+            ),
+        )
+        await restarted_server.start()
+
+        resume_header = {**header, "resume_nonce": resume_nonce}
+        resumed_reader, resumed_writer, resumed_ready = await _open_manager_cli(
+            manager_path, resume_header
+        )
+        assert resumed_ready == ready
+
+        token_file = tmp_path / "agent-admin.token"
+        token_file.write_text("agent-admin\n", encoding="utf-8")
+        token_file.chmod(0o600)
+        agent_config = AppConfig.model_validate(
+            {
+                "mode": "agent",
+                "auth": {"token_file": token_file},
+                "enrollment": {"socket_path": agent_path, "socket_mode": "0600"},
+            }
+        )
+        agent_container = build_agent_container(
+            agent_config,
+            tmp_path / "agent.db",
+            tmp_path / "agent-instance-id",
+        )
+        assert agent_container.enrollment_socket_server is not None
+        agent_container.enrollment_socket_server.start()
+        helper_stdout, helper_stderr = io.BytesIO(), io.StringIO()
+        helper_request = json.dumps(
+            {
+                "protocol": "manager-enrollment.v1",
+                "manager_id": resumed_ready["manager_id"],
+                "enrollment_id": resumed_ready["enrollment_id"],
+            },
+            separators=(",", ":"),
+        ).encode()
+        assert run_helper(
+            agent_path,
+            io.BytesIO(helper_request),
+            helper_stdout,
+            helper_stderr,
+        ) == 0, helper_stderr.getvalue()
+        helper = json.loads(helper_stdout.getvalue())
+        secret = helper["token"]
+        result = {
+            "protocol": "manager-cli-enrollment.result.v1",
+            "input_fingerprint": resumed_ready["input_fingerprint"],
+            "nonce": resumed_ready["nonce"],
+            "helper": helper,
+        }
+        resumed_writer.write(json.dumps(result, separators=(",", ":")).encode() + b"\n")
+        await resumed_writer.drain()
+        resumed_writer.write_eof()
+        verified_bytes = await asyncio.wait_for(resumed_reader.readline(), timeout=2)
+        assert json.loads(verified_bytes) == {
+            "status": "verified",
+            "enrollment_id": created.job.enrollment_id,
+        }
+        assert secret.encode() not in verified_bytes
+        resumed_writer.close()
+        await resumed_writer.wait_closed()
+
+        accepted_reader, accepted_writer, accepted = await _open_manager_cli(
+            manager_path, resume_header
+        )
+        accepted_bytes = json.dumps(accepted, separators=(",", ":")).encode()
+        assert accepted == {
+            "protocol": "manager-cli-enrollment.accepted.v1",
+            "status": "already_accepted",
+            "enrollment_id": created.job.enrollment_id,
+        }
+        assert secret.encode() not in accepted_bytes
+        assert await asyncio.wait_for(accepted_reader.read(), timeout=2) == b""
+        accepted_writer.close()
+        await accepted_writer.wait_closed()
+        persisted = restarted_journal.get(created.job.enrollment_id)
+        assert persisted.state is EnrollmentState.VERIFIED
+        assert persisted.cli_resume_nonce == resume_nonce
+        assert secret not in restarted_journal.dump_serialized_rows()
+        assert restarted_store.read(persisted.credential_temp_ref).decode() == secret
+    finally:
+        if restarted_server is not None:
+            await restarted_server.stop()
+        if server is not None:
+            await server.stop()
+        if restarted_orchestrator is not None:
+            await restarted_orchestrator.shutdown()
+        await orchestrator.shutdown()
+        if agent_container is not None:
+            if agent_container.enrollment_socket_server is not None:
+                agent_container.enrollment_socket_server.stop()
+            agent_container.database_engine.dispose()
+        if restarted_engine is not None:
+            restarted_engine.dispose()
+        engine.dispose()
+        shutil.rmtree(runtime, ignore_errors=True)
 
 
 @pytest.mark.integration
