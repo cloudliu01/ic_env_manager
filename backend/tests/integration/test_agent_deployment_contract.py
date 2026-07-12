@@ -134,3 +134,13 @@ def test_default_installer_requires_existing_user_and_never_enables_legacy_unit(
     assert "ic-env-guard@${account}.service" in installer
     assert "enable ic-env-guard.service" not in installer
     assert "sudo packaging/install/install.sh edaops" in readme
+
+
+def test_installer_parent_directories_are_traversable_but_user_state_is_private():
+    installer = (PROJECT_ROOT / "packaging/install/install.sh").read_text(encoding="utf-8")
+
+    assert "install -d -o root -g root -m 0755 /etc/ic-env-guard" in installer
+    assert "install -d -o root -g root -m 0755 /var/lib/ic-env-guard" in installer
+    assert '-o "${account}" -g "${group}" -m 0700 "${state_dir}"' in installer
+    assert 'chmod 0600 "${token_file}"' in installer
+    assert 'chmod 0640 "${config_file}"' in installer

@@ -13,6 +13,8 @@ class InstanceIdentityError(RuntimeError):
 
 
 _MARKER_KEY = "instance_identity_initialized"
+_INTENT_NAME = ".instance-identity-bootstrap"
+_INTENT_CONTENT = b"instance-identity-bootstrap-v1\n"
 
 
 def identity_bootstrap_allowed(database: Path) -> bool:
@@ -25,8 +27,7 @@ def identity_bootstrap_allowed(database: Path) -> bool:
         if table is None:
             return True
         v2 = connection.execute(
-            "SELECT 1 FROM schema_versions WHERE version = '0004_manager_credentials' "
-            "AND result = 'success'"
+            "SELECT 1 FROM schema_versions WHERE version = '0004_manager_credentials'"
         ).fetchone()
     return v2 is None
 
@@ -111,9 +112,13 @@ def initialize_instance_id(
     migrate: Callable[[Path], None],
 ) -> UUID:
     with _identity_lock(path) as parent_fd:
-        bootstrap_allowed = identity_bootstrap_allowed(database)
+        intent_path = database.with_name(_INTENT_NAME)
+        has_intent = _read_bootstrap_intent(intent_path)
+        bootstrap_allowed = has_intent or identity_bootstrap_allowed(database)
+        if bootstrap_allowed and not has_intent:
+            _create_bootstrap_intent(intent_path)
         migrate(database)
-        return _load_or_create_instance_id_locked(
+        instance_id = _load_or_create_instance_id_locked(
             path,
             parent_fd=parent_fd,
             allow_create=True,
@@ -121,6 +126,75 @@ def initialize_instance_id(
                 database, bootstrap_allowed=bootstrap_allowed
             ),
         )
+        if bootstrap_allowed:
+            _remove_bootstrap_intent(intent_path)
+        return instance_id
+
+
+def _read_bootstrap_intent(path: Path) -> bool:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise InstanceIdentityError("unsafe instance identity bootstrap intent") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        content = os.read(descriptor, len(_INTENT_CONTENT) + 1)
+    except OSError as exc:
+        raise InstanceIdentityError("invalid instance identity bootstrap intent") from exc
+    finally:
+        os.close(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or content != _INTENT_CONTENT
+    ):
+        raise InstanceIdentityError("invalid instance identity bootstrap intent")
+    return True
+
+
+def _create_bootstrap_intent(path: Path) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(temporary, flags, 0o600)
+        try:
+            written = os.write(descriptor, _INTENT_CONTENT)
+            if written != len(_INTENT_CONTENT):
+                raise OSError("short bootstrap intent write")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            _read_bootstrap_intent(path)
+        _fsync_directory(path.parent)
+    except OSError as exc:
+        raise InstanceIdentityError("unable to create identity bootstrap intent") from exc
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _remove_bootstrap_intent(path: Path) -> None:
+    if not _read_bootstrap_intent(path):
+        return
+    try:
+        path.unlink()
+        _fsync_directory(path.parent)
+    except OSError as exc:
+        raise InstanceIdentityError("unable to remove identity bootstrap intent") from exc
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _load_or_create_instance_id_locked(

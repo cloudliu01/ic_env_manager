@@ -53,14 +53,8 @@ def test_new_install_creates_identity_once_and_persists_marker(tmp_path):
 def test_pre_v2_legacy_database_may_create_identity_once(tmp_path):
     config = _config(tmp_path)
     with sqlite3.connect(config.state_database) as connection:
-        connection.execute(
-            "CREATE TABLE schema_versions (version TEXT PRIMARY KEY, applied_at TEXT, "
-            "description TEXT, direction TEXT, result TEXT, failure_reason TEXT)"
-        )
-        connection.execute(
-            "INSERT INTO schema_versions VALUES "
-            "('0001_initial', datetime('now'), 'legacy', 'upgrade', 'success', NULL)"
-        )
+        connection.execute("CREATE TABLE schema_versions (version TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO schema_versions VALUES ('0001_initial')")
 
     container = build_agent_container(config, config.state_database)
     container.database_engine.dispose()
@@ -142,3 +136,68 @@ def test_concurrent_new_container_builds_share_cutoff_and_identity(tmp_path):
 
     assert results[0] == results[1]
     assert _marker(config.state_database) == "initialized"
+
+
+def test_pre_v2_upgrade_retries_after_migrations_commit_before_identity(tmp_path, monkeypatch):
+    from ic_env_guard.bootstrap import composition
+
+    config = _config(tmp_path)
+    real_migrate = composition.run_migrations
+    calls = 0
+
+    def migrate_then_crash(database):
+        nonlocal calls
+        calls += 1
+        real_migrate(database)
+        if calls == 1:
+            raise RuntimeError("crash after migrations")
+
+    monkeypatch.setattr(composition, "run_migrations", migrate_then_crash)
+    with pytest.raises(RuntimeError, match="crash after migrations"):
+        build_agent_container(config, config.state_database)
+
+    intent = config.state_database.with_name(".instance-identity-bootstrap")
+    assert intent.is_file()
+    assert stat.S_IMODE(intent.stat().st_mode) == 0o600
+
+    container = build_agent_container(config, config.state_database)
+    container.database_engine.dispose()
+
+    assert (tmp_path / "instance-id").is_file()
+    assert _marker(config.state_database) == "initialized"
+    assert not intent.exists()
+
+
+@pytest.mark.parametrize("unsafe", ["symlink", "permissions", "content"])
+def test_existing_v2_rejects_forged_or_unsafe_bootstrap_intent(tmp_path, unsafe):
+    config = _config(tmp_path)
+    run_migrations(config.state_database)
+    intent = config.state_database.with_name(".instance-identity-bootstrap")
+    if unsafe == "symlink":
+        target = tmp_path / "target"
+        target.write_text("instance-identity-bootstrap-v1\n", encoding="ascii")
+        intent.symlink_to(target)
+    else:
+        content = "wrong\n" if unsafe == "content" else "instance-identity-bootstrap-v1\n"
+        intent.write_text(content, encoding="ascii")
+        intent.chmod(0o644 if unsafe == "permissions" else 0o600)
+
+    with pytest.raises(InstanceIdentityError, match="bootstrap intent"):
+        build_agent_container(config, config.state_database)
+
+    assert not (tmp_path / "instance-id").exists()
+
+
+def test_stale_valid_intent_cannot_replace_an_initialized_missing_identity(tmp_path):
+    config = _config(tmp_path)
+    container = build_agent_container(config, config.state_database)
+    container.database_engine.dispose()
+    (tmp_path / "instance-id").unlink()
+    intent = config.state_database.with_name(".instance-identity-bootstrap")
+    intent.write_text("instance-identity-bootstrap-v1\n", encoding="ascii")
+    intent.chmod(0o600)
+
+    with pytest.raises(InstanceIdentityError, match="restore instance identity"):
+        build_agent_container(config, config.state_database)
+
+    assert not (tmp_path / "instance-id").exists()

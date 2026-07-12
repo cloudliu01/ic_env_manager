@@ -19,8 +19,8 @@ state_dir="/var/lib/ic-env-guard/${account}"
 config_file="/etc/ic-env-guard/${account}.yaml"
 token_file="${state_dir}/token"
 
-install -d -m 0750 /etc/ic-env-guard
-install -d -m 0750 /var/lib/ic-env-guard
+install -d -o root -g root -m 0755 /etc/ic-env-guard
+install -d -o root -g root -m 0755 /var/lib/ic-env-guard
 install -d -o "${account}" -g "${group}" -m 0700 "${state_dir}"
 install -d -o "${account}" -g "${group}" -m 0750 "${state_dir}/runtime"
 install -d -o "${account}" -g "${group}" -m 0750 "/var/log/ic-env-guard-${account}"

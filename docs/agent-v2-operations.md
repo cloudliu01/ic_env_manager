@@ -122,6 +122,13 @@ Stop the service and make a consistent backup before an upgrade:
 4. Do not back up the enrollment socket or anything under `/run`; systemd recreates the runtime
    directory and the Agent recreates its owned socket.
 
+During the first new/pre-v2 initialization, the Agent may briefly create the owner-only
+`.instance-identity-bootstrap` beside the state DB. It contains no UUID or secret and is
+removed only after migrations, the identity file, and the SQLite initialization marker are
+durable. If an upgrade is interrupted and this file remains, do not recreate, edit, loosen, or
+delete it; retry the same v2 startup. Unsafe files fail closed. A stale intent cannot replace a
+missing identity after the SQLite initialized marker exists.
+
 On the first v2 Agent startup, `instance-id` is created once next to the state DB. Subsequent
 restarts and upgrades must retain that exact file. If it disappears after enrollment, stop the
 Agent and restore it from the matching backup. Once the SQLite initialization marker or an

@@ -28,10 +28,22 @@ def _schema_versions_exists(connection: sqlite3.Connection) -> bool:
 def _ensure_no_failed_migrations(connection: sqlite3.Connection) -> None:
     if not _schema_versions_exists(connection):
         return
-    failed = connection.execute(
-        "SELECT version, failure_reason FROM schema_versions "
-        "WHERE result = 'failed' ORDER BY version"
-    ).fetchone()
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(schema_versions)").fetchall()
+    }
+    if "result" not in columns:
+        return
+    if "failure_reason" in columns:
+        query = (
+            "SELECT version, failure_reason FROM schema_versions "
+            "WHERE result = 'failed' ORDER BY version"
+        )
+    else:
+        query = (
+            "SELECT version, NULL FROM schema_versions "
+            "WHERE result = 'failed' ORDER BY version"
+        )
+    failed = connection.execute(query).fetchone()
     if failed:
         version, reason = failed
         detail = f": {reason}" if reason else ""
