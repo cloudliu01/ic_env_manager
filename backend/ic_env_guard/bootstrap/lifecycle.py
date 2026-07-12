@@ -64,6 +64,8 @@ def create_lifespan(container: AgentContainer | ManagerContainer):
                 )
                 app.state.metrics_refresh_task = refresh_task
             if isinstance(container, ManagerContainer):
+                if container.ssh_enrollment_adapter is not None:
+                    await container.ssh_enrollment_adapter.check_available()
                 await container.enrollment_orchestrator.recover_and_cleanup()
                 if container.fleet_probe_service is not None:
                     fleet_probe_task = asyncio.create_task(
@@ -110,6 +112,8 @@ def create_lifespan(container: AgentContainer | ManagerContainer):
             yield
         finally:
             try:
+                if isinstance(container, ManagerContainer):
+                    await container.enrollment_orchestrator.shutdown()
                 if enrollment_socket_server is not None:
                     enrollment_socket_server.stop()
             finally:

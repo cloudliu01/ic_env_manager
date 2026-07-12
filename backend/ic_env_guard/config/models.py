@@ -126,6 +126,9 @@ class EnrollmentConfig(BaseModel):
     socket_mode: Literal["0600", "0660"] = "0600"
     pending_ttl_seconds: int = Field(default=600, ge=60, le=900)
     max_pending: int = Field(default=16, ge=1, le=128)
+    ssh_binary: Path = Path("/usr/bin/ssh")
+    ssh_connect_timeout_seconds: int = Field(default=10, ge=1, le=60)
+    ssh_total_timeout_seconds: int = Field(default=15, ge=2, le=120)
 
     @field_validator("socket_path")
     @classmethod
@@ -133,6 +136,19 @@ class EnrollmentConfig(BaseModel):
         if not value.is_absolute():
             raise ValueError("enrollment socket path must be absolute")
         return value
+
+    @field_validator("ssh_binary")
+    @classmethod
+    def validate_ssh_binary(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("ssh binary must be absolute")
+        return value
+
+    @model_validator(mode="after")
+    def validate_ssh_timeouts(self) -> "EnrollmentConfig":
+        if self.ssh_total_timeout_seconds < self.ssh_connect_timeout_seconds:
+            raise ValueError("ssh total timeout must cover connect timeout")
+        return self
 
 
 class HealthCheckConfig(BaseModel):

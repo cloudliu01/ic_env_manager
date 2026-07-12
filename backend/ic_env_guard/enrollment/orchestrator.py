@@ -13,6 +13,11 @@ from ic_env_guard.enrollment.agent_client import (
 )
 from ic_env_guard.enrollment.credential_store import CredentialStore, CredentialStoreError
 from ic_env_guard.enrollment.jobs import EnrollmentJobRequest, EnrollmentJobs
+from ic_env_guard.enrollment.ssh import (
+    SshEnrollmentAdapter,
+    SshEnrollmentError,
+    SshEnrollmentRequest,
+)
 from ic_env_guard.fleet.models import (
     AgentRecord,
     EnrollmentJob,
@@ -22,6 +27,7 @@ from ic_env_guard.fleet.models import (
     RegistryError,
     RevisionConflict,
 )
+from ic_env_guard.fleet.transport import TransportProfile
 from ic_env_guard.storage.enrollment_journal import EnrollmentJournalRepository
 
 PHASES = (
@@ -45,6 +51,13 @@ _PUBLIC_STATE = {
 class LegacyValidationRequest:
     base_url: str
     transport_profile_id: str
+
+
+@dataclass(frozen=True)
+class AutoEnrollmentAuditContext:
+    actor_id: str | None
+    source_addr: str | None
+    correlation_id: str | None
 
 
 @dataclass(frozen=True)
@@ -102,6 +115,10 @@ class _LeasedOutcome:
     error: Exception | None = None
 
 
+class _AutoStateLost(Exception):
+    pass
+
+
 class EnrollmentOrchestrator:
     def __init__(
         self,
@@ -112,6 +129,9 @@ class EnrollmentOrchestrator:
         agent_client: EnrollmentAgentClient | None,
         registry: Any,
         clock: Callable[[], datetime] | None = None,
+        ssh_adapter: SshEnrollmentAdapter | Any | None = None,
+        transport_profiles: tuple[TransportProfile, ...] = (),
+        auto_audit: Any | None = None,
     ) -> None:
         self.jobs = jobs
         self.journal = journal
@@ -119,6 +139,12 @@ class EnrollmentOrchestrator:
         self.agent_client = agent_client
         self.registry = registry
         self._now = clock or (lambda: datetime.now(UTC))
+        self.ssh_adapter = ssh_adapter
+        self._transport_profiles = {
+            profile.id: profile for profile in transport_profiles
+        }
+        self._auto_audit = auto_audit
+        self._background_tasks: dict[str, asyncio.Task[None]] = {}
         self._validation_cache: dict[str, EnrollmentValidation] = {}
         self._recovery_owner = str(uuid4())
         max_operation = getattr(agent_client, "max_network_operation_seconds", 10.0)
@@ -127,13 +153,65 @@ class EnrollmentOrchestrator:
     def create(self, request: EnrollmentJobRequest) -> EnrollmentPublicResult:
         return EnrollmentPublicResult(self.jobs.create(request))
 
+    def create_auto(
+        self,
+        request: EnrollmentJobRequest,
+        audit_context: AutoEnrollmentAuditContext,
+    ) -> EnrollmentPublicResult:
+        request = replace(request, enrollment_method=EnrollmentMethod.SSH_AUTO)
+        pending = self.jobs.create(request)
+        adapter = self.ssh_adapter
+        if adapter is None or not adapter.healthy:
+            awaiting = self.journal.replace_if_state(
+                replace(
+                    pending,
+                    state=EnrollmentState.AWAITING_CLI,
+                    last_error_code="ssh_unavailable",
+                    updated_at=self._now(),
+                ),
+                expected_state=EnrollmentState.PENDING,
+            )
+            return EnrollmentPublicResult(awaiting)
+        running = self.journal.replace_if_state(
+            replace(
+                pending,
+                state=EnrollmentState.RUNNING,
+                updated_at=self._now(),
+            ),
+            expected_state=EnrollmentState.PENDING,
+        )
+        self._schedule_auto(running, audit_context)
+        return EnrollmentPublicResult(running)
+
+    @property
+    def background_task_count(self) -> int:
+        return len(self._background_tasks)
+
+    async def wait_for_background(self) -> None:
+        while self._background_tasks:
+            await asyncio.gather(
+                *tuple(self._background_tasks.values()), return_exceptions=True
+            )
+
+    async def shutdown(self) -> None:
+        tasks = tuple(self._background_tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     def get(self, enrollment_id: str) -> EnrollmentPublicResult:
         return EnrollmentPublicResult(
             self.jobs.get(enrollment_id), self._validation_cache.get(enrollment_id)
         )
 
-    def cancel(self, enrollment_id: str) -> EnrollmentPublicResult:
-        return EnrollmentPublicResult(self._cleanup_terminal(self.jobs.cancel(enrollment_id)))
+    async def cancel(self, enrollment_id: str) -> EnrollmentPublicResult:
+        task = self._background_tasks.get(enrollment_id)
+        if task is not None:
+            task.cancel()
+        with self.credential_store.lifecycle_lease():
+            return EnrollmentPublicResult(
+                self._cleanup_terminal(self.jobs.cancel(enrollment_id))
+            )
 
     async def validate_legacy(
         self, request: LegacyValidationRequest, token: str
@@ -239,6 +317,221 @@ class EnrollmentOrchestrator:
                 self._reload_after_fence_loss(enrollment_id)
         for terminal in self.journal.list_terminal_cleanup():
             self._cleanup_terminal(terminal)
+
+    def _schedule_auto(
+        self, job: EnrollmentJob, context: AutoEnrollmentAuditContext
+    ) -> None:
+        if job.enrollment_id in self._background_tasks:
+            return
+        task = asyncio.create_task(self._run_auto(job, context))
+        self._background_tasks[job.enrollment_id] = task
+        task.add_done_callback(
+            lambda _task, enrollment_id=job.enrollment_id: self._background_tasks.pop(
+                enrollment_id, None
+            )
+        )
+
+    async def _run_auto(
+        self, job: EnrollmentJob, context: AutoEnrollmentAuditContext
+    ) -> None:
+        event_id = None
+        audit = self._auto_audit
+        try:
+            if audit is None:
+                self._converge_auto(job.enrollment_id, "audit_unavailable")
+                return
+            try:
+                event_id = audit.record_intent(job.enrollment_id, context)
+            except Exception:
+                self._converge_auto(job.enrollment_id, "audit_unavailable")
+                return
+            await self._issue_and_validate_auto(job)
+        except asyncio.CancelledError:
+            self._record_auto_outcome(
+                event_id,
+                result="failure",
+                dispatch_state="unknown",
+                failure_category="agent_enrollment_cancelled",
+            )
+            raise
+        except _AutoStateLost:
+            self._record_auto_outcome(
+                event_id,
+                result="failure",
+                dispatch_state="unknown",
+                failure_category="agent_enrollment_cancelled",
+            )
+            return
+        except SshEnrollmentError as exc:
+            state = (
+                EnrollmentState.AWAITING_CLI
+                if exc.code == "ssh_interaction_required"
+                else EnrollmentState.FAILED
+            )
+            self._converge_auto(job.enrollment_id, exc.code, state=state)
+            self._record_auto_outcome(
+                event_id,
+                result="failure",
+                dispatch_state=exc.dispatch_state,
+                failure_category=exc.code,
+            )
+            return
+        except CredentialStoreError:
+            self._converge_auto(job.enrollment_id, "credential_store_unavailable")
+            self._record_auto_outcome(
+                event_id,
+                result="failure",
+                dispatch_state="dispatched",
+                failure_category="credential_store_unavailable",
+            )
+            return
+        except EnrollmentValidationError as exc:
+            self._record_auto_outcome(
+                event_id,
+                result="failure",
+                dispatch_state=exc.dispatch_state,
+                failure_category=exc.code,
+            )
+            return
+        except RegistryError:
+            self._converge_auto(job.enrollment_id, "storage_unavailable")
+            self._record_auto_outcome(
+                event_id,
+                result="failure",
+                dispatch_state="dispatched",
+                failure_category="storage_unavailable",
+            )
+            return
+        except Exception:
+            current = self.journal.get(job.enrollment_id)
+            if current is not None and current.state is EnrollmentState.RUNNING:
+                self._converge_auto(job.enrollment_id, "ssh_remote_command_failed")
+            self._record_auto_outcome(
+                event_id,
+                result="failure",
+                dispatch_state="dispatched",
+                failure_category="ssh_remote_command_failed",
+            )
+            return
+        self._record_auto_outcome(
+            event_id,
+            result="success",
+            dispatch_state="dispatched",
+        )
+
+    async def _issue_and_validate_auto(self, job: EnrollmentJob) -> None:
+        adapter = self.ssh_adapter
+        if adapter is None or not job.ssh_user or not job.ssh_host or not job.ssh_port:
+            raise SshEnrollmentError("ssh_unavailable")
+        try:
+            profile = self._transport_profiles[job.transport_profile_id]
+        except KeyError:
+            raise SshEnrollmentError("ssh_unavailable") from None
+        helper = await adapter.issue(
+            SshEnrollmentRequest(
+                manager_id=job.manager_id,
+                enrollment_id=job.enrollment_id,
+                ssh_user=job.ssh_user,
+                ssh_host=job.ssh_host,
+                ssh_port=job.ssh_port,
+                expires_at=job.expires_at,
+            ),
+            profile,
+        )
+        reference = None
+        try:
+            with self.credential_store.lifecycle_lease():
+                current = self.journal.get(job.enrollment_id)
+                if current is None or current.state is not EnrollmentState.RUNNING:
+                    raise _AutoStateLost
+                reference = self.credential_store.put(helper.token)
+                issued = self.journal.replace_if_state(
+                    replace(
+                        current,
+                        state=EnrollmentState.CREDENTIAL_ISSUED,
+                        remote_instance_id=helper.instance_id,
+                        remote_credential_id=helper.credential_id,
+                        credential_temp_ref=reference,
+                        updated_at=self._now(),
+                    ),
+                    expected_state=EnrollmentState.RUNNING,
+                )
+        except Exception:
+            if reference is not None:
+                self.credential_store.delete_if_exists(reference)
+            raise
+        verifying = self.journal.replace_if_state(
+            replace(
+                issued,
+                state=EnrollmentState.VERIFYING,
+                updated_at=self._now(),
+            ),
+            expected_state=EnrollmentState.CREDENTIAL_ISSUED,
+        )
+        if self.agent_client is None:
+            raise EnrollmentValidationError(
+                "enrollment_unavailable", dispatch_state="not_dispatched"
+            )
+        target = self.agent_client.prepare(
+            verifying.normalized_endpoint, verifying.transport_profile_id
+        )
+        validation = await self.agent_client.validate_pending(
+            target,
+            self.credential_store.read(verifying.credential_temp_ref),
+            helper_instance_id=helper.instance_id,
+        )
+        verified = self.journal.replace_if_state(
+            replace(
+                verifying,
+                state=EnrollmentState.VERIFIED,
+                updated_at=self._now(),
+            ),
+            expected_state=EnrollmentState.VERIFYING,
+        )
+        self._validation_cache[verified.enrollment_id] = validation
+
+    def _converge_auto(
+        self,
+        enrollment_id: str,
+        code: str,
+        *,
+        state: EnrollmentState = EnrollmentState.FAILED,
+    ) -> None:
+        current = self.journal.get(enrollment_id)
+        if current is None or current.state is not EnrollmentState.RUNNING:
+            return
+        try:
+            self.journal.replace_if_state(
+                replace(
+                    current,
+                    state=state,
+                    last_error_code=code,
+                    updated_at=self._now(),
+                ),
+                expected_state=EnrollmentState.RUNNING,
+            )
+        except (RegistryError, RevisionConflict):
+            return
+
+    def _record_auto_outcome(
+        self,
+        event_id: Any,
+        *,
+        result: str,
+        dispatch_state: str,
+        failure_category: str | None = None,
+    ) -> None:
+        if event_id is None or self._auto_audit is None:
+            return
+        try:
+            self._auto_audit.record_outcome(
+                event_id,
+                result=result,
+                dispatch_state=dispatch_state,
+                failure_category=failure_category,
+            )
+        except Exception:
+            return
 
     async def _recover_validation(self, job: EnrollmentJob) -> None:
         if self.agent_client is None:
@@ -496,8 +789,56 @@ class EnrollmentOrchestrator:
             )
 
     async def recover_and_cleanup(self) -> None:
+        self._recover_auto_startup()
         await self.recover()
         self.credential_store.cleanup_orphans(self.registry, self.journal)
+
+    def _recover_auto_startup(self) -> None:
+        for job in self.journal.list_non_terminal():
+            if job.enrollment_method is not EnrollmentMethod.SSH_AUTO:
+                continue
+            if job.state is EnrollmentState.PENDING:
+                if self.ssh_adapter is None or not self.ssh_adapter.healthy:
+                    self.journal.replace_if_state(
+                        replace(
+                            job,
+                            state=EnrollmentState.AWAITING_CLI,
+                            last_error_code="ssh_unavailable",
+                            updated_at=self._now(),
+                        ),
+                        expected_state=EnrollmentState.PENDING,
+                    )
+                    continue
+                running = self.journal.replace_if_state(
+                    replace(
+                        job,
+                        state=EnrollmentState.RUNNING,
+                        updated_at=self._now(),
+                    ),
+                    expected_state=EnrollmentState.PENDING,
+                )
+                self._schedule_auto(
+                    running,
+                    AutoEnrollmentAuditContext(
+                        actor_id="system:startup",
+                        source_addr=None,
+                        correlation_id=None,
+                    ),
+                )
+            elif (
+                job.state is EnrollmentState.RUNNING
+                and job.credential_temp_ref is None
+                and job.enrollment_id not in self._background_tasks
+            ):
+                self.journal.replace_if_state(
+                    replace(
+                        job,
+                        state=EnrollmentState.AWAITING_CLI,
+                        last_error_code="ssh_interaction_required",
+                        updated_at=self._now(),
+                    ),
+                    expected_state=EnrollmentState.RUNNING,
+                )
 
 
 def _same_committed_agent(existing: AgentRecord, expected: AgentRecord) -> bool:

@@ -327,7 +327,16 @@ def create_app(
         return auth_state
 
     def configured_runtime_metadata() -> RuntimeMetadata:
-        if not isinstance(container, AgentContainer):
+        if isinstance(container, ManagerContainer):
+            adapter = container.ssh_enrollment_adapter
+            if adapter is not None and adapter.healthy:
+                return RuntimeMetadata(
+                    mode=runtime_metadata.mode,
+                    capabilities=(
+                        *runtime_metadata.capabilities,
+                        "ssh-enrollment.auto.v1",
+                    ),
+                )
             return runtime_metadata
         enrollment_socket = container.enrollment_socket_server
         if enrollment_socket is None or not enrollment_socket.healthy:

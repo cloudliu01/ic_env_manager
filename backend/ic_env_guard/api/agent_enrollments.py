@@ -1,7 +1,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from ic_env_guard.api.audit_health import (
     AuditStorageHealth,
@@ -20,9 +20,11 @@ from ic_env_guard.db.control_plane_audit import (
 from ic_env_guard.enrollment.agent_client import EnrollmentValidationError
 from ic_env_guard.enrollment.jobs import EnrollmentConflict, EnrollmentJobRequest
 from ic_env_guard.enrollment.orchestrator import (
+    AutoEnrollmentAuditContext,
     EnrollmentOrchestrator,
     LegacyValidationRequest,
 )
+from ic_env_guard.enrollment.ssh_config import SshConfigError, validate_ssh_destination
 from ic_env_guard.fleet.models import EnrollmentMethod
 
 router = APIRouter(prefix="/api/v2", tags=["agent-enrollments"])
@@ -33,6 +35,14 @@ class SshRequest(BaseModel):
     user: str = Field(min_length=1, max_length=128)
     host: str = Field(min_length=1, max_length=253)
     port: int = Field(default=22, ge=1, le=65535)
+
+    @model_validator(mode="after")
+    def validate_destination(self) -> "SshRequest":
+        try:
+            validate_ssh_destination(user=self.user, host=self.host, port=self.port)
+        except SshConfigError as exc:
+            raise ValueError("SSH destination is invalid") from exc
+        return self
 
 
 class CreateEnrollmentRequest(BaseModel):
@@ -55,7 +65,7 @@ def get_enrollment_orchestrator() -> EnrollmentOrchestrator:
 
 
 @router.post("/agent-enrollments", status_code=201)
-def create_enrollment(
+async def create_enrollment(
     body: CreateEnrollmentRequest,
     request: Request,
     actor: Annotated[AuthContext, Depends(require_v2_auth)],
@@ -65,7 +75,7 @@ def create_enrollment(
 ) -> dict[str, object]:
     audit = _intent(request, actor, audit_repo, audit_health, None, "agent-enrollment.create")
     try:
-        result = orchestrator.create(
+        result = orchestrator.create_auto(
             EnrollmentJobRequest(
                 normalized_endpoint=body.base_url,
                 transport_profile_id=body.transport_profile_id,
@@ -73,8 +83,13 @@ def create_enrollment(
                 ssh_user=body.ssh.user,
                 ssh_host=body.ssh.host,
                 ssh_port=body.ssh.port,
-                enrollment_method=EnrollmentMethod.SSH_CLI,
-            )
+                enrollment_method=EnrollmentMethod.SSH_AUTO,
+            ),
+            AutoEnrollmentAuditContext(
+                actor_id=actor.actor_id,
+                source_addr=request.client.host if request.client else None,
+                correlation_id=getattr(request.state, "correlation_id", None),
+            ),
         )
     except EnrollmentConflict as exc:
         _failure(audit, audit_repo, audit_health, exc.code, "not_dispatched")
@@ -96,7 +111,7 @@ def get_enrollment(
 
 
 @router.post("/agent-enrollments/{enrollment_id}/cancel")
-def cancel_enrollment(
+async def cancel_enrollment(
     enrollment_id: str,
     request: Request,
     actor: Annotated[AuthContext, Depends(require_v2_auth)],
@@ -108,7 +123,7 @@ def cancel_enrollment(
         request, actor, audit_repo, audit_health, enrollment_id, "agent-enrollment.cancel"
     )
     try:
-        result = orchestrator.cancel(enrollment_id).to_public_dict()
+        result = (await orchestrator.cancel(enrollment_id)).to_public_dict()
     except EnrollmentConflict as exc:
         _failure(audit, audit_repo, audit_health, exc.code, "not_dispatched")
         raise _job_error(exc) from exc

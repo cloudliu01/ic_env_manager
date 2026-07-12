@@ -850,7 +850,7 @@ async def test_cancelled_verified_enrollment_deletes_secret_then_clears_referenc
         )
         reference = verified.job.credential_temp_ref
 
-        cancelled = orchestrator.cancel(verified.job.enrollment_id)
+        cancelled = await orchestrator.cancel(verified.job.enrollment_id)
 
         assert cancelled.job.state is EnrollmentState.CANCELLED
         assert journal.get(verified.job.enrollment_id).credential_temp_ref is None
@@ -889,7 +889,7 @@ async def test_terminal_delete_failure_keeps_visible_retryable_residual(
             ),
         )
 
-        residual = orchestrator.cancel(verified.job.enrollment_id)
+        residual = await orchestrator.cancel(verified.job.enrollment_id)
 
         assert residual.job.credential_temp_ref == reference
         assert residual.job.last_error_code == "credential_cleanup_failed"

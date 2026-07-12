@@ -31,12 +31,13 @@ from ic_env_guard.db.migrations import run_migrations
 from ic_env_guard.db.services import ServiceRuntime
 from ic_env_guard.db.session import create_session_factory, create_sqlite_engine
 from ic_env_guard.enrollment.agent_client import EnrollmentAgentClient
-from ic_env_guard.enrollment.audit import AgentEnrollmentAudit
+from ic_env_guard.enrollment.audit import AgentEnrollmentAudit, ManagerAutoEnrollmentAudit
 from ic_env_guard.enrollment.credential_store import CredentialStore
 from ic_env_guard.enrollment.jobs import EnrollmentJobs
 from ic_env_guard.enrollment.orchestrator import EnrollmentOrchestrator
 from ic_env_guard.enrollment.service import EnrollmentService
 from ic_env_guard.enrollment.socket_server import EnrollmentSocketServer
+from ic_env_guard.enrollment.ssh import SshEnrollmentAdapter
 from ic_env_guard.fleet.importer import import_yaml_agents_once
 from ic_env_guard.fleet.probes import AgentProbeError, FleetProbeService
 from ic_env_guard.fleet.registry import FleetRegistry
@@ -122,6 +123,7 @@ class ManagerContainer:
     fleet_probe_service: FleetProbeService | None
     enrollment_jobs: EnrollmentJobs
     enrollment_orchestrator: EnrollmentOrchestrator
+    ssh_enrollment_adapter: SshEnrollmentAdapter | None
 
 
 def _service_runtime(service: ServiceConfig) -> ServiceRuntime:
@@ -267,6 +269,7 @@ def build_agent_container(
 def build_manager_container(config: AppConfig) -> ManagerContainer:
     run_control_plane_migrations(config.control_plane.audit_database)
     database_engine = create_sqlite_engine(config.control_plane.audit_database)
+    control_plane_session_factory = create_session_factory(database_engine)
     registry_repository = SQLiteManagerRegistryRepository(database_engine)
     status_repository = AgentStatusRepository(database_engine)
     enrollment_journal_repository = EnrollmentJournalRepository(database_engine)
@@ -308,6 +311,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         persist_probe_status=False,
     )
     enrollment_agent_client = None
+    ssh_enrollment_adapter = None
     try:
         target_policy = AgentTargetPolicy(
             allowed_agent_cidrs=config.control_plane.allowed_agent_cidrs,
@@ -323,6 +327,12 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
 
         agent_availability.set_probe_delegate(unavailable_probe)
     else:
+        ssh_enrollment_adapter = SshEnrollmentAdapter(
+            target_policy=target_policy,
+            executable=config.enrollment.ssh_binary,
+            connect_timeout_seconds=config.enrollment.ssh_connect_timeout_seconds,
+            total_timeout_seconds=config.enrollment.ssh_total_timeout_seconds,
+        )
         enrollment_agent_client = EnrollmentAgentClient(
             target_policy=target_policy,
             transport_profiles=config.control_plane.transport_profiles,
@@ -355,6 +365,9 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         credential_store=credential_store,
         agent_client=enrollment_agent_client,
         registry=registry_repository,
+        ssh_adapter=ssh_enrollment_adapter,
+        transport_profiles=config.control_plane.transport_profiles,
+        auto_audit=ManagerAutoEnrollmentAudit(control_plane_session_factory),
     )
     return ManagerContainer(
         config=config,
@@ -370,7 +383,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         gateway_proxy_limiter=GatewayProxyLimiter(
             config.control_plane.max_active_terminal_proxies
         ),
-        control_plane_session_factory=create_session_factory(database_engine),
+        control_plane_session_factory=control_plane_session_factory,
         metrics_registry=metrics_registry,
         database_engine=database_engine,
         metrics_collector=metrics_collector,
@@ -389,4 +402,5 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         fleet_probe_service=fleet_probe_service,
         enrollment_jobs=enrollment_jobs,
         enrollment_orchestrator=enrollment_orchestrator,
+        ssh_enrollment_adapter=ssh_enrollment_adapter,
     )

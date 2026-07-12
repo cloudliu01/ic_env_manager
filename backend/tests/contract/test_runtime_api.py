@@ -7,6 +7,7 @@ from ic_env_guard.config.models import (
     AppConfig,
     AuthConfig,
     ControlPlaneConfig,
+    EnrollmentConfig,
     ServerConfig,
     TrustedLanHttpServerConfig,
 )
@@ -175,3 +176,43 @@ def test_manager_runtime_does_not_claim_v2_when_self_target_inventory_fails(
     }
     assert probe.status_code == 503
     assert probe.json()["error"]["code"] == "probe_unavailable"
+
+
+@pytest.mark.contract
+def test_manager_runtime_advertises_auto_ssh_only_after_safe_probe(
+    tmp_path, monkeypatch
+):
+    async def healthy(self):
+        self.healthy = True
+        return True
+
+    monkeypatch.setattr(
+        "ic_env_guard.enrollment.ssh.SshEnrollmentAdapter.check_available", healthy
+    )
+    token_file = _token_file(tmp_path)
+    config = AppConfig(
+        mode="control-plane",
+        auth=AuthConfig(token_file=token_file),
+        enrollment=EnrollmentConfig(ssh_binary=tmp_path / "private-fixed-ssh"),
+        control_plane=ControlPlaneConfig(
+            audit_database=tmp_path / "control-plane.db",
+            allowed_agent_cidrs=["10.0.0.0/8"],
+        ),
+    )
+
+    with TestClient(create_app(config=config)) as client:
+        response = client.get("/api/v2/runtime")
+
+    assert response.json()["capabilities"] == [
+        "fleet.v2",
+        "agent-registry.v2",
+        "ssh-enrollment.auto.v1",
+    ]
+    assert str(tmp_path) not in response.text
+    assert "ssh_binary" not in response.text
+
+
+@pytest.mark.contract
+def test_enrollment_ssh_binary_must_be_absolute(tmp_path):
+    with pytest.raises(ValueError, match="ssh binary must be absolute"):
+        EnrollmentConfig(ssh_binary="relative/ssh")
