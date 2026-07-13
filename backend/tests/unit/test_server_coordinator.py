@@ -116,6 +116,20 @@ async def test_explicit_and_server_graceful_shutdown_are_normal(tmp_path, fake_u
     await main.serve_config(_config(tmp_path / "signal"))
 
 
+@pytest.mark.asyncio
+async def test_runtime_installs_uvicorn_ticket_redaction_once(
+    tmp_path, monkeypatch, fake_uvicorn
+):
+    install = Mock()
+    monkeypatch.setattr(main, "install_uvicorn_ticket_redaction", install)
+    shutdown = asyncio.Event()
+    shutdown.set()
+
+    await main.serve_config(_config(tmp_path), shutdown_event=shutdown)
+
+    install.assert_called_once_with()
+
+
 @pytest.mark.parametrize("failure", ["public_app", "ingest_app", "config", "prebind"])
 @pytest.mark.asyncio
 async def test_setup_failure_closes_agent_container_once(

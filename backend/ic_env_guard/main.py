@@ -132,6 +132,7 @@ from ic_env_guard.fleet.probes import FleetProbeService
 from ic_env_guard.fleet.status import FleetStatusService
 from ic_env_guard.fleet.transport import TrustedLanHttpProfile
 from ic_env_guard.monitoring.machines import MachineRegistry
+from ic_env_guard.runtime_log_redaction import install_uvicorn_ticket_redaction
 from ic_env_guard.services.manager import ServiceManager
 from ic_env_guard.terminal.manager import TerminalManager
 from ic_env_guard.terminal.tickets import TerminalTicketManager
@@ -654,6 +655,8 @@ async def serve_config(
     shutdown_event: asyncio.Event | None = None,
 ) -> None:
     import uvicorn
+
+    install_uvicorn_ticket_redaction()
 
     if config.mode == "agent":
         container: AgentContainer | ManagerContainer = build_agent_container(
