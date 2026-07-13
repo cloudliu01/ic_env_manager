@@ -2,6 +2,7 @@ import os
 import signal
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -401,6 +402,131 @@ def test_cleanup_preserves_replaced_enrollment_sockets():
 
 
 @pytest.mark.integration
+def test_cleanup_lock_prevents_new_all_socket_from_compare_unlink_race():
+    dev_dir = Path(mkdtemp(prefix="ieg-socket-race-", dir="/tmp")).resolve()
+    dev_dir.chmod(0o700)
+    environment, manager_port, agent_port = _launcher_environment(dev_dir)
+    frontend_count = dev_dir / "frontend.count"
+    first_frontend_exit = dev_dir / "first-frontend.exit"
+    second_frontend_exit = dev_dir / "second-frontend.exit"
+    (dev_dir / "bin" / "npm").write_text(
+        f"#!{sys.executable}\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        f"counter = Path({str(frontend_count)!r})\n"
+        "count = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+        "counter.write_text(str(count))\n"
+        f"exit_path = Path({str(first_frontend_exit)!r}) if count == 1 else "
+        f"Path({str(second_frontend_exit)!r})\n"
+        "while not exit_path.exists():\n"
+        "    time.sleep(0.02)\n"
+        "raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    cleanup_ready = dev_dir / "cleanup-unlink.ready"
+    release_cleanup = dev_dir / "cleanup-unlink.release"
+    replacement_ready = dev_dir / "replacement-socket.ready"
+    race_armed = dev_dir / "socket-race.armed"
+    agent_socket = dev_dir / "agent-enrollment.sock"
+    python = dev_dir / "bin" / "python"
+    python.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import sys\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        "sys.path[0] = os.getcwd()\n"
+        f"target = {str(agent_socket)!r}\n"
+        f"cleanup_ready = Path({str(cleanup_ready)!r})\n"
+        f"release_cleanup = Path({str(release_cleanup)!r})\n"
+        f"replacement_ready = Path({str(replacement_ready)!r})\n"
+        f"race_armed = Path({str(race_armed)!r})\n"
+        "if len(sys.argv) > 1 and sys.argv[1] == '-':\n"
+        "    source = sys.stdin.read()\n"
+        "    sys.argv = sys.argv[1:]\n"
+        "    if (\n"
+        "        race_armed.exists()\n"
+        "        and len(sys.argv) > 1\n"
+        "        and sys.argv[1] == target\n"
+        "        and 'path, expected = sys.argv[1:]' in source\n"
+        "    ):\n"
+        "        cleanup_ready.touch()\n"
+        "        while not release_cleanup.exists():\n"
+        "            time.sleep(0.02)\n"
+        "    elif (\n"
+        "        race_armed.exists()\n"
+        "        and len(sys.argv) > 1\n"
+        "        and sys.argv[1] == target\n"
+        "        and 'enrollment socket identity mismatch' in source\n"
+        "    ):\n"
+        "        replacement_ready.touch()\n"
+        "    exec(compile(source, '<stdin>', 'exec'))\n"
+        "else:\n"
+        "    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    python.chmod(0o700)
+    first = _start_all(environment)
+    second: subprocess.Popen | None = None
+    try:
+        _wait_for_health(f"http://127.0.0.1:{manager_port}/healthz", first)
+        _wait_for_health(f"http://127.0.0.1:{agent_port}/healthz", first)
+        _wait_for_local_agent(dev_dir / "control-plane.db", first)
+        original = agent_socket.lstat()
+        original_identity = (original.st_dev, original.st_ino)
+        race_armed.touch()
+        first_frontend_exit.touch()
+        for _ in range(1000):
+            if cleanup_ready.exists():
+                break
+            if first.poll() is not None:
+                break
+            time.sleep(0.02)
+        assert cleanup_ready.exists(), _stop_all(first)
+
+        second = _start_all(environment)
+        for _ in range(150):
+            if replacement_ready.exists() or second.poll() is not None:
+                break
+            time.sleep(0.02)
+        replaced_before_cleanup_released = replacement_ready.exists()
+        release_cleanup.touch()
+        first.communicate(timeout=10)
+
+        assert not replaced_before_cleanup_released
+        _wait_for_health(f"http://127.0.0.1:{manager_port}/healthz", second)
+        _wait_for_health(f"http://127.0.0.1:{agent_port}/healthz", second)
+        _wait_for_local_agent(dev_dir / "control-plane.db", second)
+        replacement = agent_socket.lstat()
+        assert (replacement.st_dev, replacement.st_ino) != original_identity
+    finally:
+        release_cleanup.touch()
+        second_frontend_exit.touch()
+        if first.poll() is None:
+            _stop_all(first)
+        if second is not None and second.poll() is None:
+            _stop_all(second)
+        rmtree(dev_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+def test_start_all_rejects_symlink_lifecycle_lock_without_following_target(tmp_path):
+    dev_dir = (tmp_path / "development").resolve()
+    dev_dir.mkdir(mode=0o700)
+    environment, _, _ = _launcher_environment(dev_dir)
+    target = tmp_path / "must-survive"
+    target.write_text("unchanged", encoding="utf-8")
+    (dev_dir / ".start-all.lock").symlink_to(target)
+
+    returncode, output = _bounded_all(environment, timeout=3)
+
+    assert returncode is not None
+    assert returncode != 0
+    assert "development lifecycle lock is unsafe" in output
+    assert target.read_text(encoding="utf-8") == "unchanged"
+
+
+@pytest.mark.integration
 def test_recorded_process_identity_change_before_kill_fails_closed():
     dev_dir = Path(mkdtemp(prefix="ieg-reused-process-", dir="/tmp")).resolve()
     dev_dir.chmod(0o700)
@@ -470,6 +596,171 @@ def test_recorded_process_identity_change_before_kill_fails_closed():
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("post_kill_identity", ["same", "changed"])
+def test_post_kill_uncertainty_preserves_recorded_pid_metadata(
+    tmp_path, post_kill_identity
+):
+    dev_dir = (tmp_path / "development").resolve()
+    dev_dir.mkdir(mode=0o700)
+    environment, _, _ = _launcher_environment(dev_dir)
+    pid_file = dev_dir / "agent.pid"
+    pid_file.write_text("99999998\n", encoding="ascii")
+    pid_file.chmod(0o600)
+    config_path = dev_dir / "agent.yaml"
+    killed = dev_dir / "kill-issued"
+    environment |= {
+        "POST_KILL_IDENTITY": post_kill_identity,
+        "KILL_MARKER": str(killed),
+    }
+    script = f"""
+source {str(PROJECT_ROOT / 'start.sh')!r} help >/dev/null
+recorded_process_matches() {{
+  if [[ -e "$KILL_MARKER" && "$POST_KILL_IDENTITY" == "changed" ]]; then
+    return 1
+  fi
+  printf 'recorded-identity\n'
+}}
+wait_for_recorded_process_exit() {{
+  if [[ -e "$KILL_MARKER" && "$POST_KILL_IDENTITY" == "changed" ]]; then
+    return 2
+  fi
+  return 1
+}}
+kill() {{
+  if [[ "$1" == "-KILL" ]]; then
+    : > "$KILL_MARKER"
+  fi
+  return 0
+}}
+sleep() {{ return 0; }}
+set +e
+stop_recorded_process {str(pid_file)!r} {str(config_path)!r}
+exit $?
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+
+    assert result.returncode != 0
+    expected_error = (
+        "development process identity mismatch"
+        if post_kill_identity == "changed"
+        else "development process did not exit"
+    )
+    assert expected_error in result.stderr
+    assert pid_file.read_text(encoding="ascii") == "99999998\n"
+
+
+@pytest.mark.integration
+def test_captured_child_second_wait_never_calls_unbounded_wait(tmp_path):
+    dev_dir = (tmp_path / "development").resolve()
+    dev_dir.mkdir(mode=0o700)
+    environment, _, _ = _launcher_environment(dev_dir)
+    pid_file = dev_dir / "agent.pid"
+    wait_called = dev_dir / "unbounded-wait-called"
+    script = f"""
+source {str(PROJECT_ROOT / 'start.sh')!r} help >/dev/null
+( while :; do builtin read -r -t 1 || true; done ) &
+child=$!
+printf '%s\n' "$child" > {str(pid_file)!r}
+chmod 0600 {str(pid_file)!r}
+trap 'builtin kill -KILL "$child" 2>/dev/null; builtin wait "$child" 2>/dev/null' EXIT
+kill() {{ return 0; }}
+wait_for_process_exit() {{ return 1; }}
+wait() {{ : > {str(wait_called)!r}; return 0; }}
+set +e
+if terminate_child "$child"; then
+  remove_owned_pid_file {str(pid_file)!r} "$child"
+  status=0
+else
+  status=$?
+fi
+exit "$status"
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+
+    assert result.returncode != 0
+    assert "development child did not exit" in result.stderr
+    assert pid_file.exists()
+    assert not wait_called.exists()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("probe_error", "expected_status", "pid_metadata_survives"),
+    [("ESRCH", 0, False), ("EPERM", 1, True)],
+)
+def test_recorded_process_probe_distinguishes_esrch_from_eperm(
+    tmp_path, probe_error, expected_status, pid_metadata_survives
+):
+    dev_dir = (tmp_path / "development").resolve()
+    dev_dir.mkdir(mode=0o700)
+    environment, _, _ = _launcher_environment(dev_dir)
+    pid_file = dev_dir / "agent.pid"
+    pid_file.write_text("99999997\n", encoding="ascii")
+    pid_file.chmod(0o600)
+    config_path = dev_dir / "agent.yaml"
+    (dev_dir / "bin" / "ps").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    (dev_dir / "bin" / "ps").chmod(0o700)
+    python = dev_dir / "bin" / "python"
+    python.write_text(
+        f"#!{sys.executable}\n"
+        "import errno\n"
+        "import os\n"
+        "import sys\n"
+        "if len(sys.argv) > 1 and sys.argv[1] == '-':\n"
+        "    source = sys.stdin.read()\n"
+        "    sys.argv = sys.argv[1:]\n"
+        "    if 'os.kill(pid, 0)' in source:\n"
+        "        error = os.environ['PROCESS_PROBE_ERROR']\n"
+        "        def injected_kill(pid, signal_number):\n"
+        "            number = errno.ESRCH if error == 'ESRCH' else errno.EPERM\n"
+        "            raise OSError(number, error)\n"
+        "        os.kill = injected_kill\n"
+        "    exec(compile(source, '<stdin>', 'exec'))\n"
+        "else:\n"
+        "    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    python.chmod(0o700)
+    environment["PROCESS_PROBE_ERROR"] = probe_error
+    script = f"""
+source {str(PROJECT_ROOT / 'start.sh')!r} help >/dev/null
+set +e
+stop_recorded_process {str(pid_file)!r} {str(config_path)!r}
+exit $?
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+
+    assert result.returncode == expected_status
+    assert pid_file.exists() is pid_metadata_survives
+    if probe_error == "EPERM":
+        assert "development process identity mismatch" in result.stderr
+
+
+@pytest.mark.integration
 def test_pid_metadata_symlink_fails_closed_without_following_target():
     dev_dir = Path(mkdtemp(prefix="ieg-pid-symlink-", dir="/tmp")).resolve()
     dev_dir.chmod(0o700)
@@ -504,6 +795,50 @@ def test_pid_metadata_fifo_fails_closed_without_blocking():
         assert "development process identity mismatch" in output
     finally:
         rmtree(dev_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+def test_pid_metadata_replaced_with_fifo_after_lstat_fails_closed_without_blocking(
+    tmp_path,
+):
+    dev_dir = (tmp_path / "development").resolve()
+    dev_dir.mkdir(mode=0o700)
+    environment, _, _ = _launcher_environment(dev_dir)
+    pid_file = dev_dir / "agent.pid"
+    pid_file.write_text("99999999\n", encoding="ascii")
+    pid_file.chmod(0o600)
+    python = dev_dir / "bin" / "python"
+    python.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import sys\n"
+        f"target = {str(pid_file)!r}\n"
+        "if len(sys.argv) == 4 and sys.argv[1:3] == ['-', target]:\n"
+        "    source = sys.stdin.read()\n"
+        "    sys.argv = sys.argv[1:]\n"
+        "    original_lstat = os.lstat\n"
+        "    def replace_after_lstat(path):\n"
+        "        metadata = original_lstat(path)\n"
+        "        os.lstat = original_lstat\n"
+        "        os.unlink(path)\n"
+        "        os.mkfifo(path, 0o600)\n"
+        "        return metadata\n"
+        "    os.lstat = replace_after_lstat\n"
+        "    exec(compile(source, '<stdin>', 'exec'))\n"
+        "else:\n"
+        "    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    python.chmod(0o700)
+    started = time.monotonic()
+    returncode, output = _bounded_all(environment, timeout=1)
+
+    assert time.monotonic() - started < 3
+    assert returncode is not None
+    assert returncode != 0
+    assert "development process identity mismatch" in output
+    assert "Traceback" not in output
+    assert stat.S_ISFIFO(pid_file.lstat().st_mode), output
 
 
 @pytest.mark.integration

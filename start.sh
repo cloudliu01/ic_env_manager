@@ -378,6 +378,156 @@ PY
 )"
 }
 
+lifecycle_lock_keeper() {
+  exec python - "${DEV_DIR}/.start-all.lock" "$(id -u)" \
+    3<"${lifecycle_lock_io_dir}/control" \
+    4>"${lifecycle_lock_io_dir}/status" <<'PY'
+import fcntl
+import os
+import signal
+import stat
+import sys
+import time
+
+def fail(message):
+    os.write(4, b"error\n")
+    raise SystemExit(message)
+
+
+path, expected_uid = sys.argv[1], int(sys.argv[2])
+flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+created = False
+try:
+    descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+    created = True
+except FileExistsError:
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        fail("development lifecycle lock is unsafe")
+except OSError:
+    fail("development lifecycle lock is unsafe")
+
+try:
+    if created:
+        os.fchmod(descriptor, 0o600)
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != expected_uid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        fail("development lifecycle lock is unsafe")
+
+    deadline = time.monotonic() + 120.0
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                fail("development lifecycle lock timed out")
+            time.sleep(0.05)
+
+    try:
+        current = os.lstat(path)
+    except OSError:
+        fail("development lifecycle lock is unsafe")
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or current.st_uid != expected_uid
+        or stat.S_IMODE(current.st_mode) != 0o600
+        or (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino)
+    ):
+        fail("development lifecycle lock is unsafe")
+
+    for signal_number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signal_number, signal.SIG_IGN)
+    os.write(4, b"locked\n")
+    while os.read(3, 1):
+        pass
+    os.write(4, b"released\n")
+finally:
+    os.close(descriptor)
+PY
+}
+
+close_lifecycle_lock_io() {
+  if [[ "${lifecycle_lock_fds_open}" == "1" ]]; then
+    exec 8>&-
+    exec 9>&-
+    lifecycle_lock_fds_open=0
+  fi
+  if [[ -n "${lifecycle_lock_io_dir}" ]]; then
+    rm -f \
+      "${lifecycle_lock_io_dir}/control" \
+      "${lifecycle_lock_io_dir}/status"
+    rmdir "${lifecycle_lock_io_dir}" 2>/dev/null || true
+    lifecycle_lock_io_dir=""
+  fi
+}
+
+acquire_lifecycle_lock() {
+  local ready
+  if [[ "${lifecycle_lock_held}" == "1" ]]; then
+    return
+  fi
+
+  lifecycle_lock_io_dir="$(mktemp -d "${DEV_DIR}/.start-all-lock.XXXXXX")"
+  chmod 0700 "${lifecycle_lock_io_dir}"
+  mkfifo \
+    "${lifecycle_lock_io_dir}/control" \
+    "${lifecycle_lock_io_dir}/status"
+  chmod 0600 \
+    "${lifecycle_lock_io_dir}/control" \
+    "${lifecycle_lock_io_dir}/status"
+  lifecycle_lock_keeper &
+  lifecycle_lock_pid="$!"
+  exec 8>"${lifecycle_lock_io_dir}/control"
+  exec 9<"${lifecycle_lock_io_dir}/status"
+  lifecycle_lock_fds_open=1
+  if ! IFS= read -r -t 121 ready <&9; then
+    exec 8>&-
+    lifecycle_lock_fds_open=0
+    wait "${lifecycle_lock_pid}" >/dev/null 2>&1 || true
+    exec 9>&-
+    close_lifecycle_lock_io
+    lifecycle_lock_pid=""
+    echo "could not acquire development lifecycle lock" >&2
+    return 1
+  fi
+  if [[ "${ready}" != "locked" ]]; then
+    exec 8>&-
+    lifecycle_lock_fds_open=0
+    wait "${lifecycle_lock_pid}" >/dev/null 2>&1 || true
+    exec 9>&-
+    close_lifecycle_lock_io
+    lifecycle_lock_pid=""
+    echo "could not acquire development lifecycle lock" >&2
+    return 1
+  fi
+  lifecycle_lock_held=1
+}
+
+release_lifecycle_lock() {
+  local released
+  if [[ "${lifecycle_lock_held}" != "1" ]]; then
+    return
+  fi
+  exec 8>&-
+  lifecycle_lock_fds_open=0
+  if ! IFS= read -r -t 2 released <&9 \
+    || [[ "${released}" != "released" ]]; then
+    echo "could not release development lifecycle lock" >&2
+    return 1
+  fi
+  wait "${lifecycle_lock_pid}"
+  exec 9>&-
+  close_lifecycle_lock_io
+  lifecycle_lock_pid=""
+  lifecycle_lock_held=0
+}
+
 recorded_process_matches() {
   local pid="$1"
   local expected_config="$2"
@@ -407,12 +557,32 @@ print(hashlib.sha256(identity.encode("utf-8")).hexdigest())
 PY
 }
 
+process_exists() {
+  local pid="$1"
+  python - "${pid}" <<'PY'
+import errno
+import os
+import sys
+
+pid = int(sys.argv[1])
+try:
+    os.kill(pid, 0)
+except OSError as error:
+    if error.errno == errno.ESRCH:
+        raise SystemExit(1)
+    if error.errno == errno.EPERM:
+        raise SystemExit(0)
+    raise SystemExit(2)
+PY
+}
+
 wait_for_recorded_process_exit() {
   local pid="$1"
   local expected_config="$2"
   local expected_identity="$3"
   local current_identity
   local identity_status
+  local process_status
   for _ in $(seq 1 50); do
     if current_identity="$(recorded_process_matches "${pid}" "${expected_config}")"; then
       if [[ "${current_identity}" != "${expected_identity}" ]]; then
@@ -423,8 +593,15 @@ wait_for_recorded_process_exit() {
       if [[ "${identity_status}" == "3" ]]; then
         return
       fi
-      if [[ "${identity_status}" == "2" ]] && ! kill -0 "${pid}" >/dev/null 2>&1; then
-        return
+      if [[ "${identity_status}" == "2" ]]; then
+        if process_exists "${pid}"; then
+          return 2
+        else
+          process_status=$?
+        fi
+        if [[ "${process_status}" == "1" ]]; then
+          return
+        fi
       fi
       return 2
     fi
@@ -436,9 +613,16 @@ wait_for_recorded_process_exit() {
 wait_for_process_exit() {
   local pid="$1"
   local process_state
+  local process_status
   for _ in $(seq 1 50); do
-    if ! kill -0 "${pid}" >/dev/null 2>&1; then
-      return
+    if process_exists "${pid}"; then
+      :
+    else
+      process_status=$?
+      if [[ "${process_status}" == "1" ]]; then
+        return
+      fi
+      return 1
     fi
     process_state="$(ps -ww -o stat= -p "${pid}" 2>/dev/null || true)"
     if [[ "${process_state}" == Z* ]]; then
@@ -470,18 +654,28 @@ if (
     or not 1 <= metadata.st_size <= 32
 ):
     raise SystemExit(1)
-flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+descriptor = None
 try:
     descriptor = os.open(path, flags)
-except OSError:
-    raise SystemExit(1)
-try:
     opened = os.fstat(descriptor)
-    if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_uid != expected_uid
+        or stat.S_IMODE(opened.st_mode) & 0o077
+        or not 1 <= opened.st_size <= 32
+        or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+    ):
         raise SystemExit(1)
     payload = os.read(descriptor, 33)
+except OSError:
+    raise SystemExit(1)
 finally:
-    os.close(descriptor)
+    if descriptor is not None:
+        try:
+            os.close(descriptor)
+        except OSError:
+            raise SystemExit(1)
 try:
     value = payload.decode("ascii")
 except UnicodeDecodeError:
@@ -500,6 +694,7 @@ stop_recorded_process() {
   local recorded_identity
   local current_identity
   local wait_status
+  local process_status
 
   if pid="$(read_pid_metadata "${pid_file}")"; then
     :
@@ -519,9 +714,16 @@ stop_recorded_process() {
       remove_owned_pid_file "${pid_file}" "${pid}"
       return
     fi
-    if [[ "${identity_status}" == "2" ]] && ! kill -0 "${pid}" >/dev/null 2>&1; then
-      remove_owned_pid_file "${pid_file}" "${pid}"
-      return
+    if [[ "${identity_status}" == "2" ]]; then
+      if process_exists "${pid}"; then
+        :
+      else
+        process_status=$?
+        if [[ "${process_status}" == "1" ]]; then
+          remove_owned_pid_file "${pid_file}" "${pid}"
+          return
+        fi
+      fi
     fi
     echo "development process identity mismatch" >&2
     return 1
@@ -533,19 +735,33 @@ stop_recorded_process() {
     fi
   else
     identity_status=$?
-    if [[ "${identity_status}" == "3" ]] || (
-      [[ "${identity_status}" == "2" ]] && ! kill -0 "${pid}" >/dev/null 2>&1
-    ); then
+    if [[ "${identity_status}" == "3" ]]; then
       remove_owned_pid_file "${pid_file}" "${pid}"
       return
+    fi
+    if [[ "${identity_status}" == "2" ]]; then
+      if process_exists "${pid}"; then
+        :
+      else
+        process_status=$?
+        if [[ "${process_status}" == "1" ]]; then
+          remove_owned_pid_file "${pid_file}" "${pid}"
+          return
+        fi
+      fi
     fi
     echo "development process identity mismatch" >&2
     return 1
   fi
   if ! kill -TERM "${pid}" >/dev/null 2>&1; then
-    if ! kill -0 "${pid}" >/dev/null 2>&1; then
-      remove_owned_pid_file "${pid_file}" "${pid}"
-      return
+    if process_exists "${pid}"; then
+      :
+    else
+      process_status=$?
+      if [[ "${process_status}" == "1" ]]; then
+        remove_owned_pid_file "${pid_file}" "${pid}"
+        return
+      fi
     fi
     echo "development process identity mismatch" >&2
     return 1
@@ -571,16 +787,33 @@ stop_recorded_process() {
       remove_owned_pid_file "${pid_file}" "${pid}"
       return
     fi
-    if [[ "${wait_status}" == "2" ]] && ! kill -0 "${pid}" >/dev/null 2>&1; then
-      remove_owned_pid_file "${pid_file}" "${pid}"
-      return
+    if [[ "${wait_status}" == "2" ]]; then
+      if process_exists "${pid}"; then
+        :
+      else
+        process_status=$?
+        if [[ "${process_status}" == "1" ]]; then
+          remove_owned_pid_file "${pid_file}" "${pid}"
+          return
+        fi
+      fi
     fi
     echo "development process identity mismatch" >&2
     return 1
   fi
   kill -KILL "${pid}" >/dev/null 2>&1 || true
-  wait_for_recorded_process_exit "${pid}" "${expected_config}" "${recorded_identity}" || true
-  remove_owned_pid_file "${pid_file}" "${pid}"
+  if wait_for_recorded_process_exit "${pid}" "${expected_config}" "${recorded_identity}"; then
+    remove_owned_pid_file "${pid_file}" "${pid}"
+    return
+  else
+    wait_status=$?
+  fi
+  if [[ "${wait_status}" == "2" ]]; then
+    echo "development process identity mismatch" >&2
+  else
+    echo "development process did not exit" >&2
+  fi
+  return 1
 }
 
 reset_generated_state() {
@@ -694,16 +927,30 @@ PY
 
 terminate_child() {
   local pid="$1"
-  if ! kill -0 "${pid}" >/dev/null 2>&1; then
+  local process_status
+  if process_exists "${pid}"; then
+    :
+  else
+    process_status=$?
+    if [[ "${process_status}" == "1" ]]; then
+      wait "${pid}" >/dev/null 2>&1 || true
+      return
+    fi
+    echo "development child process state is unknown" >&2
+    return 1
+  fi
+  kill -TERM "${pid}" >/dev/null 2>&1 || true
+  if wait_for_process_exit "${pid}"; then
     wait "${pid}" >/dev/null 2>&1 || true
     return
   fi
-  kill -TERM "${pid}" >/dev/null 2>&1 || true
-  if ! wait_for_process_exit "${pid}"; then
-    kill -KILL "${pid}" >/dev/null 2>&1 || true
-    wait_for_process_exit "${pid}" || true
+  kill -KILL "${pid}" >/dev/null 2>&1 || true
+  if wait_for_process_exit "${pid}"; then
+    wait "${pid}" >/dev/null 2>&1 || true
+    return
   fi
-  wait "${pid}" >/dev/null 2>&1 || true
+  echo "development child did not exit" >&2
+  return 1
 }
 
 bootstrap_local_agent() {
@@ -735,43 +982,66 @@ start_all() {
   local agent_socket_identity=""
   local control_plane_socket_identity=""
   local cleaned_up=0
+  local lifecycle_lock_pid=""
+  local lifecycle_lock_io_dir=""
+  local lifecycle_lock_fds_open=0
+  local lifecycle_lock_held=0
 
   activate_backend_env
   prepare_dev_dir_for_reset
-  reset_generated_state
 
   cleanup() {
     local status=$?
+    local cleanup_status="${status}"
     if [[ "${cleaned_up}" == "1" ]]; then
       return "${status}"
     fi
     cleaned_up=1
     trap - EXIT INT TERM
     if [[ -n "${agent_pid}" ]]; then
-      terminate_child "${agent_pid}"
-      remove_owned_pid_file "${DEV_DIR}/agent.pid" "${agent_pid}"
+      if terminate_child "${agent_pid}"; then
+        remove_owned_pid_file "${DEV_DIR}/agent.pid" "${agent_pid}"
+      else
+        cleanup_status=1
+      fi
     fi
     if [[ -n "${control_plane_pid}" ]]; then
-      terminate_child "${control_plane_pid}"
-      remove_owned_pid_file "${DEV_DIR}/control-plane.pid" "${control_plane_pid}"
+      if terminate_child "${control_plane_pid}"; then
+        remove_owned_pid_file "${DEV_DIR}/control-plane.pid" "${control_plane_pid}"
+      else
+        cleanup_status=1
+      fi
     fi
-    if [[ -n "${agent_socket_identity}" ]]; then
-      remove_owned_socket "${DEV_DIR}/agent-enrollment.sock" "${agent_socket_identity}"
+    if [[ -n "${agent_socket_identity}" \
+      || -n "${control_plane_socket_identity}" ]]; then
+      if ! acquire_lifecycle_lock; then
+        return 1
+      fi
+      if [[ -n "${agent_socket_identity}" ]]; then
+        remove_owned_socket \
+          "${DEV_DIR}/agent-enrollment.sock" "${agent_socket_identity}"
+      fi
+      if [[ -n "${control_plane_socket_identity}" ]]; then
+        remove_owned_socket \
+          "${DEV_DIR}/manager-enrollment.sock" "${control_plane_socket_identity}"
+      fi
     fi
-    if [[ -n "${control_plane_socket_identity}" ]]; then
-      remove_owned_socket \
-        "${DEV_DIR}/manager-enrollment.sock" "${control_plane_socket_identity}"
+    if ! release_lifecycle_lock; then
+      cleanup_status=1
     fi
-    return "${status}"
+    return "${cleanup_status}"
   }
   trap cleanup EXIT INT TERM
+
+  acquire_lifecycle_lock
+  reset_generated_state
 
   use_generated_mode_defaults agent
   BACKEND_PORT="${AGENT_PORT}"
   if [[ -z "${IC_ENV_GUARD_AGENT_INGEST_PORT:-}" ]]; then
     AGENT_INGEST_PORT=8767
   fi
-  start_backend &
+  start_backend 8>&- 9>&- &
   agent_pid=$!
   write_pid_file "${DEV_DIR}/agent.pid" "${agent_pid}"
   wait_for_backend
@@ -780,7 +1050,7 @@ start_all() {
 
   use_generated_mode_defaults control-plane
   BACKEND_PORT="${control_plane_port}"
-  start_backend &
+  start_backend 8>&- 9>&- &
   control_plane_pid=$!
   write_pid_file "${DEV_DIR}/control-plane.pid" "${control_plane_pid}"
   wait_for_backend
@@ -789,6 +1059,7 @@ start_all() {
     capture_socket_identity "${DEV_DIR}/manager-enrollment.sock"
   )"
   bootstrap_local_agent
+  release_lifecycle_lock
 
   start_frontend
 }
