@@ -1257,12 +1257,12 @@ async def test_cli_result_read_before_put_failure_can_resume_and_publish_once(
             b'"token":"eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg",'
             b'"expires_at":"2026-07-12T12:05:00Z"}'
         )
-        publish = orchestrator._publish_cli_helper
+        publish = orchestrator._publish_managed_helper
 
         async def crash_before_put(*_args, **_kwargs):
             raise RuntimeError("manager crashed before put")
 
-        monkeypatch.setattr(orchestrator, "_publish_cli_helper", crash_before_put)
+        monkeypatch.setattr(orchestrator, "_publish_managed_helper", crash_before_put)
         with pytest.raises(RuntimeError, match="before put"):
             await orchestrator.complete_cli_submission(
                 claim,
@@ -1285,7 +1285,7 @@ async def test_cli_result_read_before_put_failure_can_resume_and_publish_once(
             resume_nonce=claim.nonce,
             context=AUDIT_CONTEXT,
         )
-        monkeypatch.setattr(orchestrator, "_publish_cli_helper", publish)
+        monkeypatch.setattr(orchestrator, "_publish_managed_helper", publish)
         completed = await orchestrator.complete_cli_submission(
             resumed,
             helper_payload=payload,
