@@ -25,6 +25,7 @@ from ic_env_guard.config.models import (
     AuthConfig,
     ControlPlaneConfig,
 )
+from ic_env_guard.fleet.models import EnrollmentMethod
 from ic_env_guard.fleet.target_policy import ValidatedTarget
 from ic_env_guard.fleet.transport import SYSTEM_TLS_PROFILE
 from ic_env_guard.main import create_app
@@ -620,7 +621,20 @@ def test_agent_terminal_ticket_is_agent_bound_and_single_use(tmp_path):
 
 
 @pytest.mark.integration
-def test_agent_terminal_ticket_rejects_registry_revision_change_before_attach(tmp_path):
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("revision", 99),
+        ("credential_ref", "f" * 48),
+        ("transport_profile_id", "changed-profile"),
+        ("normalized_endpoint", "https://10.20.30.9:8765"),
+        ("enrollment_method", EnrollmentMethod.SSH_CLI),
+        ("source", "changed-source"),
+    ],
+)
+def test_agent_terminal_ticket_rejects_registry_capture_change_before_attach(
+    tmp_path, monkeypatch, field, value
+):
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/capabilities":
             return httpx.Response(200, json=CAPABILITIES)
@@ -643,8 +657,10 @@ def test_agent_terminal_ticket_rejects_registry_revision_change_before_attach(tm
             headers={"Authorization": "Bearer secret-token"},
         ).json()["ticket"]
         record = app.state.container.registry_repository.get("lab-01")
-        app.state.container.registry_repository.update_if_revision(
-            replace(record, display_name="Changed"), record.revision
+        monkeypatch.setattr(
+            app.state.container.agent_registry,
+            "record",
+            lambda _agent_id: replace(record, **{field: value}),
         )
         with pytest.raises(WebSocketDisconnect) as mismatch:
             with client.websocket_connect(
@@ -658,7 +674,9 @@ def test_agent_terminal_ticket_rejects_registry_revision_change_before_attach(tm
 
 
 @pytest.mark.integration
-def test_active_terminal_proxy_closes_and_releases_slot_on_registry_change(tmp_path):
+def test_active_terminal_proxy_closes_and_releases_slot_on_registry_change(
+    tmp_path, monkeypatch
+):
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/capabilities":
             return httpx.Response(200, json=CAPABILITIES)
@@ -685,8 +703,10 @@ def test_active_terminal_proxy_closes_and_releases_slot_on_registry_change(tmp_p
             headers=_ws_headers(),
         ) as websocket:
             record = app.state.container.registry_repository.get("lab-01")
-            app.state.container.registry_repository.update_if_revision(
-                replace(record, enabled=False), record.revision
+            monkeypatch.setattr(
+                app.state.container.agent_registry,
+                "record",
+                lambda _agent_id: replace(record, source="changed-source"),
             )
             with pytest.raises(WebSocketDisconnect) as closed:
                 websocket.receive_text()

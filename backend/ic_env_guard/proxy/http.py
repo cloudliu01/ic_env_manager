@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from ic_env_guard.agents.availability import AgentAvailabilityService
 from ic_env_guard.agents.client import AgentClientError, AgentHttpClient
 from ic_env_guard.enrollment.credential_store import CredentialStore, CredentialStoreError
+from ic_env_guard.fleet.models import EnrollmentMethod
 from ic_env_guard.fleet.ports import ManagerRegistryRepository
+from ic_env_guard.fleet.registered_target import resolve_registered_target
 from ic_env_guard.fleet.target_policy import AgentTargetPolicy, TargetPolicyError, ValidatedTarget
 from ic_env_guard.fleet.transport import TransportProfile
 
@@ -44,6 +46,8 @@ class AgentRouteCapture:
     credential_ref: str
     transport_profile_id: str
     normalized_endpoint: str
+    enrollment_method: EnrollmentMethod | None
+    source: str | None
 
 
 class AgentHttpProxy:
@@ -56,6 +60,7 @@ class AgentHttpProxy:
         target_policy: AgentTargetPolicy | None,
         transport_profiles: tuple[TransportProfile, ...],
         client: AgentHttpClient,
+        local_bootstrap_enabled: bool = False,
     ) -> None:
         self._registry = registry
         self._availability = availability
@@ -63,6 +68,7 @@ class AgentHttpProxy:
         self._target_policy = target_policy
         self._profiles = {profile.id: profile for profile in transport_profiles}
         self._client = client
+        self._local_bootstrap_enabled = local_bootstrap_enabled
 
     def with_runtime(
         self, client: AgentHttpClient, availability: AgentAvailabilityService
@@ -74,6 +80,7 @@ class AgentHttpProxy:
             target_policy=self._target_policy,
             transport_profiles=tuple(self._profiles.values()),
             client=client,
+            local_bootstrap_enabled=self._local_bootstrap_enabled,
         )
 
     def resolve_captured_route(
@@ -84,6 +91,8 @@ class AgentHttpProxy:
         credential_ref: str,
         transport_profile_id: str,
         normalized_endpoint: str,
+        enrollment_method: EnrollmentMethod | None,
+        source: str | None,
     ) -> AgentRouteSnapshot:
         captured = self._registry.get(agent_id)
         if not _matches_capture(
@@ -92,13 +101,20 @@ class AgentHttpProxy:
             credential_ref,
             transport_profile_id,
             normalized_endpoint,
+            enrollment_method,
+            source,
         ):
             raise AgentProxyError("agent_target_changed", 409)
         profile = self._profiles.get(transport_profile_id)
         if profile is None or self._target_policy is None:
             raise AgentProxyError("agent_transport_profile_invalid", 409)
         try:
-            target = self._target_policy.resolve(normalized_endpoint, profile)
+            target = resolve_registered_target(
+                self._target_policy,
+                captured,
+                profile,
+                local_bootstrap_enabled=self._local_bootstrap_enabled,
+            )
             with self._credentials.lifecycle_lease():
                 credential = self._credentials.read(credential_ref)
         except TargetPolicyError as exc:
@@ -112,6 +128,8 @@ class AgentHttpProxy:
             credential_ref,
             transport_profile_id,
             normalized_endpoint,
+            enrollment_method,
+            source,
         ):
             raise AgentProxyError("agent_target_changed", 409)
         return AgentRouteSnapshot(target, credential)
@@ -160,13 +178,20 @@ class AgentHttpProxy:
             route_capture.credential_ref,
             route_capture.transport_profile_id,
             route_capture.normalized_endpoint,
+            route_capture.enrollment_method,
+            route_capture.source,
         ):
             raise AgentProxyError("agent_target_changed", 409)
         profile = self._profiles.get(captured.transport_profile_id)
         if profile is None or self._target_policy is None:
             raise AgentProxyError("agent_transport_profile_invalid", 409)
         try:
-            target = self._target_policy.resolve(captured.normalized_endpoint, profile)
+            target = resolve_registered_target(
+                self._target_policy,
+                captured,
+                profile,
+                local_bootstrap_enabled=self._local_bootstrap_enabled,
+            )
             with self._credentials.lifecycle_lease():
                 credential = self._credentials.read(captured.credential_ref)
         except TargetPolicyError as exc:
@@ -192,6 +217,8 @@ class AgentHttpProxy:
             captured.credential_ref,
             captured.transport_profile_id,
             captured.normalized_endpoint,
+            captured.enrollment_method,
+            captured.source,
         ):
             raise AgentProxyError(
                 "agent_target_changed",
@@ -233,19 +260,28 @@ class AgentHttpProxy:
         if not isinstance(body, dict):
             raise AgentProxyError("agent_protocol_error", 502, dispatch_state="dispatched")
         current = self._registry.get(agent_id)
-        if (
-            current is None
-            or not current.enabled
-            or current.revision != captured.revision
-            or current.normalized_endpoint != captured.normalized_endpoint
-            or current.transport_profile_id != captured.transport_profile_id
-            or current.credential_ref != captured.credential_ref
+        if not _matches_capture(
+            current,
+            captured.revision,
+            captured.credential_ref,
+            captured.transport_profile_id,
+            captured.normalized_endpoint,
+            captured.enrollment_method,
+            captured.source,
         ):
             raise AgentProxyError("agent_target_changed", 409, dispatch_state="dispatched")
         return AgentProxyResponse(response.status_code, body)
 
 
-def _matches_capture(record, revision, credential_ref, profile_id, endpoint) -> bool:
+def _matches_capture(
+    record,
+    revision,
+    credential_ref,
+    profile_id,
+    endpoint,
+    enrollment_method,
+    source,
+) -> bool:
     return (
         record is not None
         and record.enabled
@@ -253,6 +289,8 @@ def _matches_capture(record, revision, credential_ref, profile_id, endpoint) -> 
         and record.credential_ref == credential_ref
         and record.transport_profile_id == profile_id
         and record.normalized_endpoint == endpoint
+        and record.enrollment_method == enrollment_method
+        and record.source == source
     )
 
 

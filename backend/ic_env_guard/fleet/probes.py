@@ -20,6 +20,7 @@ from ic_env_guard.fleet.models import (
     RevisionConflict,
 )
 from ic_env_guard.fleet.ports import AgentStatusRepository, ManagerRegistryRepository
+from ic_env_guard.fleet.registered_target import resolve_registered_target
 from ic_env_guard.fleet.status import derive_workload_status
 from ic_env_guard.fleet.target_policy import AgentTargetPolicy, TargetPolicyError
 from ic_env_guard.fleet.transport import (
@@ -71,6 +72,7 @@ class FleetProbeService:
         clock: Callable[[], datetime] | None = None,
         legacy_availability: AgentAvailabilityService | None = None,
         allow_import_without_dynamic_allowlist: bool = False,
+        local_bootstrap_enabled: bool = False,
     ) -> None:
         self._registry = registry_repository
         self._statuses = status_repository
@@ -86,6 +88,7 @@ class FleetProbeService:
         self._allow_import_without_dynamic_allowlist = (
             allow_import_without_dynamic_allowlist
         )
+        self._local_bootstrap_enabled = local_bootstrap_enabled
         self._identity_lock = asyncio.Lock()
         self._agent_locks: dict[str, asyncio.Lock] = {}
         self._published: dict[str, AgentStatus] = {}
@@ -132,12 +135,22 @@ class FleetProbeService:
                 safety = self._target_policy.validate_legacy_import_http_safety(
                     captured.normalized_endpoint
                 )
+                profile = self._profiles[captured.transport_profile_id]
+                target = self._target_policy.resolve_validated(safety, profile)
+            elif captured.enrollment_method is EnrollmentMethod.LOCAL_SOCKET:
+                profile = self._profiles[captured.transport_profile_id]
+                target = resolve_registered_target(
+                    self._target_policy,
+                    captured,
+                    profile,
+                    local_bootstrap_enabled=self._local_bootstrap_enabled,
+                )
             else:
                 safety = self._target_policy.validate_safety(
                     captured.normalized_endpoint
                 )
-            profile = self._profiles[captured.transport_profile_id]
-            target = self._target_policy.resolve_validated(safety, profile)
+                profile = self._profiles[captured.transport_profile_id]
+                target = self._target_policy.resolve_validated(safety, profile)
             with self._credentials.lifecycle_lease():
                 credential = self._credentials.read(captured.credential_ref)
             capabilities_response = await self._client.request(

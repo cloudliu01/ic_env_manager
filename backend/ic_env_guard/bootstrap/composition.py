@@ -335,6 +335,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
     enrollment_agent_client = None
     ssh_enrollment_adapter = None
     service_key_enrollment_adapter = None
+    local_bootstrap_enabled = config.development.local_agent_bootstrap
     manager_self_addresses = {"127.0.0.1", "::1"}
     discovery_available = True
     target_policy = None
@@ -400,6 +401,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
             allow_import_without_dynamic_allowlist=(
                 not config.control_plane.allowed_agent_cidrs
             ),
+            local_bootstrap_enabled=local_bootstrap_enabled,
         )
         agent_availability.set_probe_delegate(fleet_probe_service.probe)
     enrollment_jobs = EnrollmentJobs(
@@ -413,7 +415,6 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         config.control_plane.max_outstanding_tickets,
         durable_removal_blocker=removal_repository.blocks_usage,
     )
-    local_bootstrap_enabled = config.development.local_agent_bootstrap
     local_socket_client = (
         LocalEnrollmentSocketClient(config.enrollment.manager_socket_path.parent)
         if local_bootstrap_enabled
@@ -461,6 +462,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         target_policy=target_policy,
         transport_profiles=config.control_plane.transport_profiles,
         client=agent_client,
+        local_bootstrap_enabled=local_bootstrap_enabled,
     )
     manager_enrollment_socket = (
         ManagerEnrollmentSocket(

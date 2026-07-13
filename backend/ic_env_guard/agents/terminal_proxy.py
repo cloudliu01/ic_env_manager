@@ -4,6 +4,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from ic_env_guard.fleet.models import EnrollmentMethod
+
 MAX_TERMINAL_FRAME_BYTES = 64 * 1024
 
 
@@ -16,6 +18,8 @@ class GatewayTicketReservation:
     credential_ref: str | None = None
     transport_profile_id: str | None = None
     normalized_endpoint: str | None = None
+    enrollment_method: EnrollmentMethod | None = None
+    source: str | None = None
     slot: object | None = None
 
 
@@ -32,6 +36,8 @@ class GatewayTicket:
     credential_ref: str | None = None
     transport_profile_id: str | None = None
     normalized_endpoint: str | None = None
+    enrollment_method: EnrollmentMethod | None = None
+    source: str | None = None
     slot: object | None = None
 
 
@@ -62,6 +68,8 @@ class GatewayTicketStore:
         credential_ref: str | None = None,
         transport_profile_id: str | None = None,
         normalized_endpoint: str | None = None,
+        enrollment_method: EnrollmentMethod | None = None,
+        source: str | None = None,
         slot: object | None = None,
     ) -> GatewayTicketReservation | None:
         with self._lock:
@@ -78,6 +86,8 @@ class GatewayTicketStore:
                 credential_ref=credential_ref,
                 transport_profile_id=transport_profile_id,
                 normalized_endpoint=normalized_endpoint,
+                enrollment_method=enrollment_method,
+                source=source,
                 slot=slot,
             )
             self._reservations[reservation.id] = reservation
@@ -123,6 +133,8 @@ class GatewayTicketStore:
                 credential_ref=stored.credential_ref,
                 transport_profile_id=stored.transport_profile_id,
                 normalized_endpoint=stored.normalized_endpoint,
+                enrollment_method=stored.enrollment_method,
+                source=stored.source,
                 slot=stored.slot,
             )
             self._tickets[record.ticket] = record

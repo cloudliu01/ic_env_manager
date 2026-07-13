@@ -143,14 +143,26 @@ class _LoseFirstActivationResponse(httpx.AsyncBaseTransport):
         await self._inner.aclose()
 
 
+class _RecordingTransport(httpx.AsyncBaseTransport):
+    def __init__(self, app) -> None:
+        self._inner = httpx.ASGITransport(app=app)
+        self.paths: list[str] = []
+
+    async def handle_async_request(self, request):
+        self.paths.append(request.url.path)
+        return await self._inner.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
 @pytest.mark.integration
 async def test_local_socket_bootstrap_uses_managed_credential_saga(tmp_path):
     agent, manager, agent_config, agent_admin_token, runtime = _containers(tmp_path)
     assert agent.enrollment_socket_server is not None
     agent.enrollment_socket_server.start()
-    transport_client = AgentHttpClient(
-        transport=httpx.ASGITransport(app=create_public_app(agent))
-    )
+    transport = _RecordingTransport(create_public_app(agent))
+    transport_client = AgentHttpClient(transport=transport)
     manager.enrollment_orchestrator.agent_client._client = transport_client
     real_socket_client = LocalEnrollmentSocketClient(runtime)
 
@@ -195,6 +207,13 @@ async def test_local_socket_bootstrap_uses_managed_credential_saga(tmp_path):
         assert repeated == record
         assert socket_client.calls == 1
         assert len(agent.enrollment_service.repository.list_all()) == 1
+
+        assert manager.fleet_probe_service is not None
+        manager.fleet_probe_service._client = transport_client
+        probe = await manager.fleet_probe_service.probe("local-agent")
+        assert probe.status.connection_status == "ready"
+        assert "/api/v2/capabilities" in transport.paths
+        assert "/api/v2/summary" in transport.paths
     finally:
         await transport_client.aclose()
         agent.enrollment_socket_server.stop()

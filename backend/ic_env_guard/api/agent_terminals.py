@@ -391,6 +391,8 @@ async def create_agent_terminal_connect_token(
             credential_ref=record.credential_ref,
             transport_profile_id=record.transport_profile_id,
             normalized_endpoint=record.normalized_endpoint,
+            enrollment_method=record.enrollment_method,
+            source=record.source,
         )
         reservation = tickets.reserve(
             agent_id,
@@ -398,6 +400,8 @@ async def create_agent_terminal_connect_token(
             credential_ref=record.credential_ref,
             transport_profile_id=record.transport_profile_id,
             normalized_endpoint=record.normalized_endpoint,
+            enrollment_method=record.enrollment_method,
+            source=record.source,
             slot=slot,
         )
         if reservation is None:

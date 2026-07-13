@@ -272,6 +272,8 @@ def _ticket_matches_record(ticket, record) -> bool:
         and record.credential_ref == ticket.credential_ref
         and record.transport_profile_id == ticket.transport_profile_id
         and record.normalized_endpoint == ticket.normalized_endpoint
+        and record.enrollment_method == ticket.enrollment_method
+        and record.source == ticket.source
     )
 
 
@@ -485,6 +487,8 @@ async def agent_terminal_websocket(
                         credential_ref=gateway_ticket.credential_ref,
                         transport_profile_id=gateway_ticket.transport_profile_id,
                         normalized_endpoint=gateway_ticket.normalized_endpoint,
+                        enrollment_method=gateway_ticket.enrollment_method,
+                        source=gateway_ticket.source,
                     )
                 except (AgentProxyError, TypeError):
                     audit_repo.finalize(

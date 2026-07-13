@@ -12,7 +12,7 @@ from ic_env_guard.api.agent_proxy import get_agent_http_proxy
 from ic_env_guard.config.models import AppConfig, AuthConfig, ControlPlaneConfig
 from ic_env_guard.fleet.models import AgentRecord, EnrollmentMethod
 from ic_env_guard.fleet.target_policy import AgentTargetPolicy
-from ic_env_guard.fleet.transport import SYSTEM_TLS_PROFILE
+from ic_env_guard.fleet.transport import SYSTEM_TLS_PROFILE, TrustedLanHttpProfile
 from ic_env_guard.main import create_app
 from ic_env_guard.proxy.http import AgentHttpProxy, AgentProxyError
 
@@ -82,6 +82,165 @@ def _record(agent_id, credential_ref):
         now,
         now,
     )
+
+
+def _local_record(**changes):
+    now = datetime.now(UTC)
+    record = AgentRecord(
+        "local-agent",
+        "instance-local",
+        "Local Agent",
+        "http://127.0.0.1:8766",
+        "c" * 48,
+        "remote-local",
+        "local-loopback-http",
+        EnrollmentMethod.LOCAL_SOCKET,
+        True,
+        "local_dev_bootstrap",
+        1,
+        now,
+        now,
+    )
+    return replace(record, **changes)
+
+
+def _local_profiles():
+    return (
+        TrustedLanHttpProfile(
+            id="local-loopback-http", allowed_cidrs=["127.0.0.0/8"]
+        ),
+        TrustedLanHttpProfile(
+            id="alternate-loopback-http", allowed_cidrs=["127.0.0.0/8"]
+        ),
+    )
+
+
+@pytest.mark.security
+@pytest.mark.parametrize(
+    ("capability", "path"),
+    [
+        ("observations.v2", "/api/v2/observations"),
+        ("logs.v2", "/api/v2/logs"),
+        ("services.v1", "/api/services"),
+        ("audit.v1", "/api/audit"),
+        ("terminals.v1", "/api/terminals"),
+    ],
+)
+async def test_proxy_dispatches_scoped_requests_for_committed_local_record(
+    capability, path
+):
+    record = _local_record()
+
+    class Registry:
+        def get(self, _agent_id):
+            return record
+
+    class Availability:
+        async def check_capability(self, _agent_id, _capability):
+            return CapabilityCheck(True, "not_dispatched")
+
+    class Credentials:
+        def lifecycle_lease(self):
+            return nullcontext()
+
+        def read(self, reference):
+            assert reference == record.credential_ref
+            return b"managed-secret"
+
+    class Client:
+        calls = []
+
+        async def request(self, target, credential, method, upstream_path, **_kwargs):
+            self.calls.append((str(target.pinned_address), credential, method, upstream_path))
+            return httpx.Response(200, json={"items": []})
+
+    proxy = AgentHttpProxy(
+        registry=Registry(),
+        availability=Availability(),
+        credential_store=Credentials(),
+        target_policy=AgentTargetPolicy(
+            allowed_agent_cidrs=["127.0.0.0/8"],
+            self_targets=[("127.0.0.1", 8765)],
+        ),
+        transport_profiles=_local_profiles(),
+        client=Client(),
+        local_bootstrap_enabled=True,
+    )
+
+    response = await proxy.request_json(
+        agent_id="local-agent",
+        capability=capability,
+        method="GET",
+        upstream_path=path,
+        query={},
+        correlation_id=None,
+    )
+
+    assert response.status_code == 200
+    assert Client.calls == [("127.0.0.1", b"managed-secret", "GET", path)]
+
+
+@pytest.mark.security
+@pytest.mark.parametrize(
+    ("record", "gate"),
+    [
+        (_local_record(), False),
+        (_local_record(source="manual"), True),
+        (_local_record(enrollment_method=EnrollmentMethod.SSH_AUTO), True),
+        (_local_record(transport_profile_id="alternate-loopback-http"), True),
+    ],
+    ids=["gate-disabled", "source-changed", "method-changed", "profile-changed"],
+)
+async def test_proxy_rejects_invalid_local_authority_before_credential_read(record, gate):
+    reads = []
+    dispatches = []
+
+    class Registry:
+        def get(self, _agent_id):
+            return record
+
+    class Availability:
+        async def check_capability(self, *_args):
+            raise AssertionError("invalid local authority must fail before availability")
+
+    class Credentials:
+        def lifecycle_lease(self):
+            return nullcontext()
+
+        def read(self, reference):
+            reads.append(reference)
+            raise AssertionError("invalid local authority must fail before credential read")
+
+    class Client:
+        async def request(self, *_args, **_kwargs):
+            dispatches.append(True)
+            raise AssertionError("invalid local authority must fail before dispatch")
+
+    proxy = AgentHttpProxy(
+        registry=Registry(),
+        availability=Availability(),
+        credential_store=Credentials(),
+        target_policy=AgentTargetPolicy(
+            allowed_agent_cidrs=["127.0.0.0/8"],
+            self_targets=[("127.0.0.1", 8765)],
+        ),
+        transport_profiles=_local_profiles(),
+        client=Client(),
+        local_bootstrap_enabled=gate,
+    )
+
+    with pytest.raises(AgentProxyError) as caught:
+        await proxy.get_json(
+            agent_id="local-agent",
+            capability="logs.v2",
+            upstream_path="/api/v2/logs",
+            query={},
+            correlation_id=None,
+        )
+
+    assert caught.value.code == "target_address_forbidden"
+    assert reads == []
+    assert dispatches == []
 
 
 @pytest.mark.security
