@@ -7,6 +7,7 @@ from pathlib import Path
 from ic_env_guard.config.loader import ConfigLoadError, load_config
 from ic_env_guard.enrollment.cli import CliSshRunner, run_cli_enrollment
 from ic_env_guard.enrollment.helper import run_helper
+from ic_env_guard.enrollment.local_cli import run_local_bootstrap
 
 DEFAULT_CONFIG = Path("/etc/ic-env-guard/config.yaml")
 USER_CONFIG_DIR = Path("/etc/ic-env-guard")
@@ -87,6 +88,15 @@ def build_ctl_parser() -> argparse.ArgumentParser:
     enroll.add_argument("--manager-socket", type=Path, required=True)
     enroll.add_argument("--enrollment-id", required=True)
     enroll.add_argument("--ssh", required=True)
+    local = agent_commands.add_parser("bootstrap-local")
+    local.add_argument("--manager-socket", type=Path, required=True)
+    local.add_argument("--agent-socket", type=Path, required=True)
+    local.add_argument("--base-url", required=True)
+    local.add_argument(
+        "--transport-profile", choices=("local-loopback-http",), required=True
+    )
+    local.add_argument("--agent-id", choices=("local-agent",), required=True)
+    local.add_argument("--display-name", required=True)
     return parser
 
 
@@ -94,6 +104,17 @@ def ctl_main(
     argv: list[str] | None = None, *, runner: CliSshRunner | None = None
 ) -> int:
     args = build_ctl_parser().parse_args(argv)
+    if args.agent_command == "bootstrap-local":
+        return run_local_bootstrap(
+            manager_socket=args.manager_socket,
+            agent_socket=args.agent_socket,
+            base_url=args.base_url,
+            transport_profile=args.transport_profile,
+            agent_id=args.agent_id,
+            display_name=args.display_name,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
     return run_cli_enrollment(
         manager_socket=args.manager_socket,
         enrollment_id=args.enrollment_id,

@@ -9,12 +9,14 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from ic_env_guard.enrollment.cli import CliEnrollmentError, parse_ssh_argument
 from ic_env_guard.enrollment.orchestrator import (
     AutoEnrollmentAuditContext,
     CliSubmissionClaim,
     EnrollmentOrchestrator,
+    LocalBootstrapRequest,
 )
 from ic_env_guard.fleet.transport import TrustedLanHttpProfile
 
@@ -44,6 +46,7 @@ class ManagerEnrollmentSocket:
         max_concurrency: int = 4,
         io_timeout_seconds: float = 3.0,
         result_timeout_seconds: float = 120.0,
+        local_bootstrap_enabled: bool = False,
     ) -> None:
         self.path = path
         self.mode = mode
@@ -55,6 +58,7 @@ class ManagerEnrollmentSocket:
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._io_timeout_seconds = io_timeout_seconds
         self._result_timeout_seconds = result_timeout_seconds
+        self._local_bootstrap_enabled = local_bootstrap_enabled
         self._server: asyncio.AbstractServer | None = None
         self._identity: tuple[int, int] | None = None
         self._handlers: set[asyncio.Task[None]] = set()
@@ -124,9 +128,6 @@ class ManagerEnrollmentSocket:
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        claim: CliSubmissionClaim | None = None
-        result_received = False
-        result_handled = False
         try:
             raw_socket = writer.get_extra_info("socket")
             if raw_socket is None or not self._peer_authorizer(raw_socket):
@@ -135,108 +136,195 @@ class ManagerEnrollmentSocket:
             _pid, peer_uid, _gid = self._peer_credentials(raw_socket)
             async with self._semaphore:
                 header = await self._read_object(reader, MAX_HEADER_BYTES)
-                initial_keys = {
-                    "protocol",
-                    "enrollment_id",
-                    "ssh",
-                    "pinned_address",
-                }
-                resume_keys = {*initial_keys, "resume_nonce"}
-                key_sets = {frozenset(initial_keys), frozenset(resume_keys)}
-                if (
-                    frozenset(header) not in key_sets
-                    or header["protocol"] != "manager-cli-enrollment.header.v1"
-                ):
-                    raise ManagerSocketError("invalid_request")
-                user, host, port = parse_ssh_argument(header["ssh"])
-                claim = self.orchestrator.begin_cli_submission(
-                    enrollment_id=header["enrollment_id"],
-                    ssh_user=user,
-                    ssh_host=host,
-                    ssh_port=port,
-                    pinned_address=header["pinned_address"],
-                    peer_uid=peer_uid,
-                    resume_nonce=header.get("resume_nonce"),
-                    context=AutoEnrollmentAuditContext(
-                        actor_id=f"local-cli:{peer_uid}",
-                        source_addr="local-unix",
-                        correlation_id=None,
-                    ),
-                )
-                if claim.already_accepted:
-                    await self._send(
-                        writer,
-                        {
-                            "protocol": "manager-cli-enrollment.accepted.v1",
-                            "status": "already_accepted",
-                            "enrollment_id": claim.job.enrollment_id,
-                        },
-                    )
-                    self.orchestrator.release_cli_connection(
-                        claim, result_received=True, code="already_accepted"
-                    )
-                    claim = None
+                protocol = header.get("protocol")
+                if protocol == "manager-local-bootstrap.request.v1":
+                    await self._handle_local_bootstrap(header, writer, peer_uid)
                     return
-                await self._send(
-                    writer,
-                    {
-                        "protocol": "manager-cli-enrollment.ready.v1",
-                        "manager_id": claim.job.manager_id,
-                        "enrollment_id": claim.job.enrollment_id,
-                        "input_fingerprint": claim.input_fingerprint,
-                        "nonce": claim.nonce,
-                        "expires_at": claim.job.expires_at.isoformat(),
-                        "host_key_policy": (
-                            "accept-new"
-                            if isinstance(claim.target.profile, TrustedLanHttpProfile)
-                            else "ask"
-                        ),
-                    },
-                )
-                remaining = max(
-                    0.001,
-                    (claim.job.expires_at - datetime.now(UTC)).total_seconds(),
-                )
-                result = await self._read_object(
-                    reader,
-                    MAX_RESULT_BYTES,
-                    timeout=min(remaining, self._result_timeout_seconds),
-                )
-                result_received = True
-                if set(result) != {
-                    "protocol",
-                    "input_fingerprint",
-                    "nonce",
-                    "helper",
-                } or result[
-                    "protocol"
-                ] != "manager-cli-enrollment.result.v1":
-                    raise ManagerSocketError("invalid_result")
-                helper_payload = json.dumps(
-                    result["helper"], separators=(",", ":"), sort_keys=True
-                ).encode()
-                if await asyncio.wait_for(
-                    reader.read(1), timeout=self._io_timeout_seconds
-                ) != b"":
-                    raise ManagerSocketError("trailing_request_data")
-                try:
-                    completed = await self.orchestrator.complete_cli_submission(
-                        claim,
-                        helper_payload=helper_payload,
-                        input_fingerprint=result["input_fingerprint"],
-                        nonce=result["nonce"],
-                    )
-                finally:
-                    result_handled = True
-                await self._send(
-                    writer,
-                    {"status": "verified", "enrollment_id": completed.job.enrollment_id},
-                )
-                claim = None
+                if protocol != "manager-cli-enrollment.header.v1":
+                    raise ManagerSocketError("invalid_request")
+                await self._handle_ssh_cli(header, reader, writer, peer_uid)
         except (ManagerSocketError, CliEnrollmentError, TypeError, ValueError):
             await self._send(writer, {"error": "invalid_request"})
         except Exception:
             await self._send(writer, {"error": "enrollment_rejected"})
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def _handle_local_bootstrap(
+        self,
+        header: dict[str, Any],
+        writer: asyncio.StreamWriter,
+        peer_uid: int,
+    ) -> None:
+        if peer_uid != self.allowed_uid:
+            await self._send(writer, {"error": "unauthorized_peer"})
+            return
+        expected_keys = {
+            "protocol",
+            "agent_id",
+            "display_name",
+            "base_url",
+            "transport_profile_id",
+            "agent_socket_path",
+        }
+        if not self._local_bootstrap_enabled or set(header) != expected_keys:
+            raise ManagerSocketError("invalid_request")
+        if any(type(header[key]) is not str for key in expected_keys):
+            raise ManagerSocketError("invalid_request")
+        if (
+            header["agent_id"] != "local-agent"
+            or not header["display_name"]
+            or header["transport_profile_id"] != "local-loopback-http"
+            or not _is_local_bootstrap_url(header["base_url"])
+        ):
+            raise ManagerSocketError("invalid_request")
+        agent_socket_path = Path(header["agent_socket_path"])
+        try:
+            socket_parent = agent_socket_path.parent.resolve(strict=True)
+            manager_parent = self.path.parent.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            raise ManagerSocketError("invalid_request") from None
+        if (
+            not agent_socket_path.is_absolute()
+            or ".." in agent_socket_path.parts
+            or socket_parent != manager_parent
+        ):
+            raise ManagerSocketError("invalid_request")
+        record = await asyncio.wait_for(
+            self.orchestrator.bootstrap_local(
+                LocalBootstrapRequest(
+                    agent_id=header["agent_id"],
+                    display_name=header["display_name"],
+                    base_url=header["base_url"],
+                    transport_profile_id=header["transport_profile_id"],
+                    agent_socket_path=agent_socket_path,
+                ),
+                AutoEnrollmentAuditContext(
+                    actor_id=f"local-cli:{peer_uid}",
+                    source_addr="local-unix",
+                    correlation_id=None,
+                ),
+            ),
+            timeout=self._result_timeout_seconds,
+        )
+        await self._send(
+            writer,
+            {
+                "protocol": "manager-local-bootstrap.result.v1",
+                "status": "enrolled",
+                "agent_id": record.agent_id,
+                "revision": record.revision,
+            },
+        )
+
+    async def _handle_ssh_cli(
+        self,
+        header: dict[str, Any],
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        peer_uid: int,
+    ) -> None:
+        claim: CliSubmissionClaim | None = None
+        result_received = False
+        result_handled = False
+        try:
+            initial_keys = {
+                "protocol",
+                "enrollment_id",
+                "ssh",
+                "pinned_address",
+            }
+            resume_keys = {*initial_keys, "resume_nonce"}
+            key_sets = {frozenset(initial_keys), frozenset(resume_keys)}
+            if frozenset(header) not in key_sets:
+                raise ManagerSocketError("invalid_request")
+            user, host, port = parse_ssh_argument(header["ssh"])
+            claim = self.orchestrator.begin_cli_submission(
+                enrollment_id=header["enrollment_id"],
+                ssh_user=user,
+                ssh_host=host,
+                ssh_port=port,
+                pinned_address=header["pinned_address"],
+                peer_uid=peer_uid,
+                resume_nonce=header.get("resume_nonce"),
+                context=AutoEnrollmentAuditContext(
+                    actor_id=f"local-cli:{peer_uid}",
+                    source_addr="local-unix",
+                    correlation_id=None,
+                ),
+            )
+            if claim.already_accepted:
+                await self._send(
+                    writer,
+                    {
+                        "protocol": "manager-cli-enrollment.accepted.v1",
+                        "status": "already_accepted",
+                        "enrollment_id": claim.job.enrollment_id,
+                    },
+                )
+                self.orchestrator.release_cli_connection(
+                    claim, result_received=True, code="already_accepted"
+                )
+                claim = None
+                return
+            await self._send(
+                writer,
+                {
+                    "protocol": "manager-cli-enrollment.ready.v1",
+                    "manager_id": claim.job.manager_id,
+                    "enrollment_id": claim.job.enrollment_id,
+                    "input_fingerprint": claim.input_fingerprint,
+                    "nonce": claim.nonce,
+                    "expires_at": claim.job.expires_at.isoformat(),
+                    "host_key_policy": (
+                        "accept-new"
+                        if isinstance(claim.target.profile, TrustedLanHttpProfile)
+                        else "ask"
+                    ),
+                },
+            )
+            remaining = max(
+                0.001,
+                (claim.job.expires_at - datetime.now(UTC)).total_seconds(),
+            )
+            result = await self._read_object(
+                reader,
+                MAX_RESULT_BYTES,
+                timeout=min(remaining, self._result_timeout_seconds),
+            )
+            result_received = True
+            if set(result) != {
+                "protocol",
+                "input_fingerprint",
+                "nonce",
+                "helper",
+            } or result["protocol"] != "manager-cli-enrollment.result.v1":
+                raise ManagerSocketError("invalid_result")
+            helper_payload = json.dumps(
+                result["helper"], separators=(",", ":"), sort_keys=True
+            ).encode()
+            if (
+                await asyncio.wait_for(
+                    reader.read(1), timeout=self._io_timeout_seconds
+                )
+                != b""
+            ):
+                raise ManagerSocketError("trailing_request_data")
+            try:
+                completed = await self.orchestrator.complete_cli_submission(
+                    claim,
+                    helper_payload=helper_payload,
+                    input_fingerprint=result["input_fingerprint"],
+                    nonce=result["nonce"],
+                )
+            finally:
+                result_handled = True
+            await self._send(
+                writer,
+                {"status": "verified", "enrollment_id": completed.job.enrollment_id},
+            )
+            claim = None
         finally:
             if claim is not None and not result_handled:
                 self.orchestrator.release_cli_connection(
@@ -248,8 +336,6 @@ class ManagerEnrollmentSocket:
                         else "cli_submission_interrupted"
                     ),
                 )
-            writer.close()
-            await writer.wait_closed()
 
     async def _read_object(
         self,
@@ -274,12 +360,15 @@ class ManagerEnrollmentSocket:
             raise ManagerSocketError("invalid_request")
         return value
 
-    @staticmethod
-    async def _send(writer: asyncio.StreamWriter, value: dict[str, Any]) -> None:
+    async def _send(
+        self, writer: asyncio.StreamWriter, value: dict[str, Any]
+    ) -> None:
         writer.write(json.dumps(value, separators=(",", ":")).encode() + b"\n")
         try:
-            await writer.drain()
-        except (BrokenPipeError, ConnectionResetError):
+            await asyncio.wait_for(
+                writer.drain(), timeout=self._io_timeout_seconds
+            )
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
             return
 
     def _authorize_peer(self, connection: socket.socket) -> bool:
@@ -344,3 +433,22 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise ValueError
         value[key] = item
     return value
+
+
+def _is_local_bootstrap_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "http"
+        and parsed.hostname == "127.0.0.1"
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path == ""
+        and parsed.query == ""
+        and parsed.fragment == ""
+        and port is not None
+        and parsed.netloc == f"127.0.0.1:{port}"
+    )

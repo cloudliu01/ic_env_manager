@@ -38,6 +38,7 @@ from ic_env_guard.enrollment.agent_client import EnrollmentAgentClient
 from ic_env_guard.enrollment.audit import AgentEnrollmentAudit, ManagerAutoEnrollmentAudit
 from ic_env_guard.enrollment.credential_store import CredentialStore
 from ic_env_guard.enrollment.jobs import EnrollmentJobs
+from ic_env_guard.enrollment.local_socket import LocalEnrollmentSocketClient
 from ic_env_guard.enrollment.manager_socket import ManagerEnrollmentSocket
 from ic_env_guard.enrollment.orchestrator import EnrollmentOrchestrator
 from ic_env_guard.enrollment.service import EnrollmentService
@@ -412,6 +413,13 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         config.control_plane.max_outstanding_tickets,
         durable_removal_blocker=removal_repository.blocks_usage,
     )
+    local_bootstrap_enabled = config.development.local_agent_bootstrap
+    local_socket_client = (
+        LocalEnrollmentSocketClient(config.enrollment.manager_socket_path.parent)
+        if local_bootstrap_enabled
+        and config.enrollment.manager_socket_path is not None
+        else None
+    )
     enrollment_orchestrator = EnrollmentOrchestrator(
         jobs=enrollment_jobs,
         journal=enrollment_journal_repository,
@@ -428,6 +436,8 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         removal_repository=removal_repository,
         terminal_usage=gateway_ticket_store,
         manager_socket_path=config.enrollment.manager_socket_path,
+        local_socket_client=local_socket_client,
+        local_bootstrap_enabled=local_bootstrap_enabled,
     )
     discovery_service = DiscoveryService(
         config=config.control_plane.discovery,
@@ -459,6 +469,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
             orchestrator=enrollment_orchestrator,
             allowed_uid=os.geteuid(),
             allowed_gid=config.enrollment.manager_socket_gid,
+            local_bootstrap_enabled=local_bootstrap_enabled,
         )
         if config.enrollment.manager_socket_path is not None
         else None

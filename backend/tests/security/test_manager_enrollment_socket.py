@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from ic_env_guard.enrollment.manager_socket import (
+    MAX_HEADER_BYTES,
     ManagerEnrollmentSocket,
     ManagerSocketError,
 )
@@ -22,6 +23,7 @@ class Orchestrator:
         self.begins = []
         self.completes = []
         self.aborts = []
+        self.local_bootstraps = []
 
     def begin_cli_submission(self, **kwargs):
         self.begins.append(kwargs)
@@ -45,6 +47,10 @@ class Orchestrator:
     def release_cli_connection(self, claim, *, result_received, code):
         self.aborts.append((claim, result_received, code))
 
+    async def bootstrap_local(self, request, context):
+        self.local_bootstraps.append((request, context))
+        return SimpleNamespace(agent_id=request.agent_id, revision=1)
+
 
 @pytest.fixture
 def socket_dir():
@@ -58,6 +64,192 @@ def socket_dir():
 
 async def _line(reader):
     return json.loads(await reader.readline())
+
+
+def _local_request(socket_dir):
+    return {
+        "protocol": "manager-local-bootstrap.request.v1",
+        "agent_id": "local-agent",
+        "display_name": "Local development agent",
+        "base_url": "http://127.0.0.1:8766",
+        "transport_profile_id": "local-loopback-http",
+        "agent_socket_path": str(socket_dir / "agent-enrollment.sock"),
+    }
+
+
+async def _send_local_frame(server, payload):
+    reader, writer = await asyncio.open_unix_connection(server.path)
+    writer.write(payload)
+    await writer.drain()
+    writer.write_eof()
+    response = await _line(reader)
+    assert await reader.read() == b""
+    writer.close()
+    await writer.wait_closed()
+    return response
+
+
+@pytest.mark.security
+async def test_manager_socket_owner_can_bootstrap_local_agent(socket_dir):
+    orchestrator = Orchestrator()
+    server = ManagerEnrollmentSocket(
+        path=socket_dir / "manager.sock",
+        mode=0o600,
+        orchestrator=orchestrator,
+        allowed_uid=os.geteuid(),
+        peer_authorizer=lambda _socket: True,
+        local_bootstrap_enabled=True,
+    )
+    await server.start()
+    request = _local_request(socket_dir)
+    try:
+        response = await _send_local_frame(
+            server,
+            json.dumps(request, separators=(",", ":")).encode() + b"\n",
+        )
+    finally:
+        await server.stop()
+
+    assert response == {
+        "protocol": "manager-local-bootstrap.result.v1",
+        "status": "enrolled",
+        "agent_id": "local-agent",
+        "revision": 1,
+    }
+    assert len(orchestrator.local_bootstraps) == 1
+    submitted, context = orchestrator.local_bootstraps[0]
+    assert vars(submitted) == {
+        "agent_id": "local-agent",
+        "display_name": "Local development agent",
+        "base_url": "http://127.0.0.1:8766",
+        "transport_profile_id": "local-loopback-http",
+        "agent_socket_path": socket_dir / "agent-enrollment.sock",
+    }
+    assert context.actor_id == f"local-cli:{os.geteuid()}"
+    assert context.source_addr == "local-unix"
+
+
+@pytest.mark.security
+@pytest.mark.parametrize(
+    "payload_mutator",
+    (
+        lambda request, _root: {**request, "unexpected": "value"},
+        lambda request, root: {
+            **request,
+            "agent_socket_path": str(root.parent / "outside" / "agent.sock"),
+        },
+        lambda request, _root: {
+            **request,
+            "base_url": "http://192.0.2.10:8766",
+        },
+    ),
+    ids=("extra-key", "outside-socket-root", "non-loopback-url"),
+)
+async def test_manager_local_bootstrap_rejects_invalid_request_without_dispatch(
+    socket_dir, payload_mutator
+):
+    orchestrator = Orchestrator()
+    server = ManagerEnrollmentSocket(
+        path=socket_dir / "manager.sock",
+        mode=0o600,
+        orchestrator=orchestrator,
+        allowed_uid=os.geteuid(),
+        peer_authorizer=lambda _socket: True,
+        local_bootstrap_enabled=True,
+    )
+    await server.start()
+    request = payload_mutator(_local_request(socket_dir), socket_dir)
+    try:
+        response = await _send_local_frame(
+            server,
+            json.dumps(request, separators=(",", ":")).encode() + b"\n",
+        )
+    finally:
+        await server.stop()
+
+    assert response == {"error": "invalid_request"}
+    assert orchestrator.local_bootstraps == []
+
+
+@pytest.mark.security
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'{"protocol":"manager-local-bootstrap.request.v1",'
+        b'"agent_id":"local-agent","agent_id":"other"}\n',
+        b"{" + (b"x" * MAX_HEADER_BYTES) + b"}\n",
+    ),
+    ids=("duplicate-key", "oversized-frame"),
+)
+async def test_manager_local_bootstrap_rejects_unsafe_frame_without_dispatch(
+    socket_dir, payload
+):
+    orchestrator = Orchestrator()
+    server = ManagerEnrollmentSocket(
+        path=socket_dir / "manager.sock",
+        mode=0o600,
+        orchestrator=orchestrator,
+        allowed_uid=os.geteuid(),
+        peer_authorizer=lambda _socket: True,
+        local_bootstrap_enabled=True,
+    )
+    await server.start()
+    try:
+        response = await _send_local_frame(server, payload)
+    finally:
+        await server.stop()
+
+    assert response == {"error": "invalid_request"}
+    assert orchestrator.local_bootstraps == []
+
+
+@pytest.mark.security
+async def test_manager_local_bootstrap_disabled_gate_does_not_dispatch(socket_dir):
+    orchestrator = Orchestrator()
+    server = ManagerEnrollmentSocket(
+        path=socket_dir / "manager.sock",
+        mode=0o600,
+        orchestrator=orchestrator,
+        allowed_uid=os.geteuid(),
+        peer_authorizer=lambda _socket: True,
+        local_bootstrap_enabled=False,
+    )
+    await server.start()
+    try:
+        response = await _send_local_frame(
+            server,
+            json.dumps(_local_request(socket_dir)).encode() + b"\n",
+        )
+    finally:
+        await server.stop()
+
+    assert response == {"error": "invalid_request"}
+    assert orchestrator.local_bootstraps == []
+
+
+@pytest.mark.security
+async def test_manager_local_bootstrap_rejects_group_only_peer(socket_dir):
+    orchestrator = Orchestrator()
+    server = ManagerEnrollmentSocket(
+        path=socket_dir / "manager.sock",
+        mode=0o660,
+        orchestrator=orchestrator,
+        allowed_uid=os.geteuid(),
+        allowed_gid=os.getegid(),
+        peer_credentials=lambda _socket: (123, os.geteuid() + 1, os.getegid()),
+        local_bootstrap_enabled=True,
+    )
+    await server.start()
+    try:
+        response = await _send_local_frame(
+            server,
+            json.dumps(_local_request(socket_dir)).encode() + b"\n",
+        )
+    finally:
+        await server.stop()
+
+    assert response == {"error": "unauthorized_peer"}
+    assert orchestrator.local_bootstraps == []
 
 
 @pytest.mark.security
