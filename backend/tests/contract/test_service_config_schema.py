@@ -6,6 +6,8 @@ from jsonschema import Draft202012Validator
 
 SCHEMA_PATH = (
     Path(__file__).resolve().parents[3]
+    / "docs"
+    / "development"
     / "specs"
     / "001-linux-host-agent"
     / "contracts"
