@@ -33,7 +33,7 @@ class LocalEnrollmentSocketClient:
         resolved_root = None
         try:
             resolved_root = allowed_root.resolve(strict=True)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             pass
         if resolved_root is None:
             raise LocalEnrollmentSocketError("local_socket_path_rejected")
@@ -120,7 +120,13 @@ class LocalEnrollmentSocketClient:
         remaining = deadline - monotonic()
         if remaining <= 0:
             raise TimeoutError
-        client.settimeout(remaining)
+        timeout_invalid = False
+        try:
+            client.settimeout(remaining)
+        except (OverflowError, ValueError):
+            timeout_invalid = True
+        if timeout_invalid:
+            raise TimeoutError
 
     def _validate_socket_path(self, socket_path: Path) -> None:
         path_error = False
@@ -128,7 +134,7 @@ class LocalEnrollmentSocketClient:
             parent = socket_path.parent.resolve(strict=True)
             root_metadata = self._allowed_root.lstat()
             socket_metadata = socket_path.lstat()
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             path_error = True
         if path_error:
             raise LocalEnrollmentSocketError("local_socket_path_rejected")

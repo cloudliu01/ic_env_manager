@@ -143,6 +143,22 @@ def test_local_client_constructor_maps_root_resolution_failures_without_path_lea
 
 
 @pytest.mark.security
+def test_local_client_constructor_maps_embedded_nul_without_path_leaks(tmp_path):
+    path_fragment = "private-nul-root"
+    configured_root = tmp_path / f"{path_fragment}\x00tail"
+
+    with pytest.raises(LocalEnrollmentSocketError) as caught:
+        LocalEnrollmentSocketClient(configured_root)
+
+    _assert_safe_error(
+        caught.value,
+        "local_socket_path_rejected",
+        path_fragment,
+        tmp_path,
+    )
+
+
+@pytest.mark.security
 async def test_local_client_maps_invalid_request_without_retaining_validation_error(
     socket_dir,
 ):
@@ -177,6 +193,22 @@ async def test_local_client_maps_missing_socket_without_retaining_path_error(soc
         )
 
     _assert_safe_error(caught.value, "local_socket_path_rejected", socket_path)
+
+
+@pytest.mark.security
+async def test_local_client_maps_embedded_nul_socket_without_path_leaks(socket_dir):
+    path_fragment = "private-nul-socket"
+    socket_path = socket_dir / f"{path_fragment}\x00tail"
+
+    with pytest.raises(LocalEnrollmentSocketError) as caught:
+        await LocalEnrollmentSocketClient(socket_dir).issue(
+            socket_path=socket_path,
+            manager_id=MANAGER_ID,
+            enrollment_id="local-agent",
+            validation_target=_local_target(),
+        )
+
+    _assert_safe_error(caught.value, "local_socket_path_rejected", path_fragment)
 
 
 @pytest.mark.security
@@ -333,6 +365,55 @@ async def test_local_client_times_out_with_a_stable_safe_error(socket_dir):
     server.join(timeout=2)
 
     _assert_safe_error(caught.value, "local_socket_timeout", str(socket_path))
+
+
+@pytest.mark.security
+async def test_local_client_maps_unrepresentable_socket_timeout_to_safe_code(
+    socket_dir, monkeypatch
+):
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    socket_path = socket_dir / "enrollment.sock"
+    listener.bind(str(socket_path))
+    socket_path.chmod(0o600)
+    real_socket = socket.socket
+    private_detail = "private-timeout-overflow"
+
+    class OverflowingTimeoutSocket:
+        def __init__(self, *args, **kwargs):
+            self._socket = real_socket(*args, **kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self._socket.close()
+
+        def __getattr__(self, name):
+            return getattr(self._socket, name)
+
+        def settimeout(self, _timeout):
+            raise OverflowError(private_detail)
+
+    monkeypatch.setattr(
+        local_socket_module.socket, "socket", OverflowingTimeoutSocket
+    )
+    try:
+        with pytest.raises(LocalEnrollmentSocketError) as caught:
+            await LocalEnrollmentSocketClient(socket_dir).issue(
+                socket_path=socket_path,
+                manager_id=MANAGER_ID,
+                enrollment_id="local-agent",
+                validation_target=_local_target(),
+            )
+    finally:
+        listener.close()
+
+    _assert_safe_error(
+        caught.value,
+        "local_socket_timeout",
+        private_detail,
+        socket_path,
+    )
 
 
 @pytest.mark.security
