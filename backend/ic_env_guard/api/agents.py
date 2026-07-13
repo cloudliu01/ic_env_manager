@@ -5,7 +5,6 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from ic_env_guard.agents.availability import AgentAvailabilityService
-from ic_env_guard.agents.client import AgentClientError, AgentHttpClient
 from ic_env_guard.agents.models import CapabilityResponse
 from ic_env_guard.agents.registry import (
     AgentInvalidConfigurationError,
@@ -15,8 +14,9 @@ from ic_env_guard.agents.registry import (
 from ic_env_guard.api.agent_http import (
     ERROR_STATUS,
     augment_upstream_error_body,
-    get_agent_http_client,
+    failure_category_for_client_error,
 )
+from ic_env_guard.api.agent_proxy import get_agent_http_proxy
 from ic_env_guard.api.audit_health import (
     AuditStorageHealth,
     commit_audit_intent,
@@ -30,6 +30,7 @@ from ic_env_guard.db.control_plane_audit import (
     ControlPlaneAuditEventCreate,
     ControlPlaneAuditRepository,
 )
+from ic_env_guard.proxy.http import AgentHttpProxy, AgentProxyError
 
 local_capabilities_router = APIRouter(prefix="/api", tags=["capabilities"])
 control_plane_agents_router = APIRouter(prefix="/api/agents", tags=["agents"])
@@ -52,7 +53,7 @@ async def _proxy_agent_status(
     agent_id: str,
     upstream_path: str,
     registry: AgentRegistry,
-    client: AgentHttpClient,
+    proxy: AgentHttpProxy,
     request: Request,
     actor: AuthContext,
     audit_repo: ControlPlaneAuditRepository,
@@ -91,22 +92,32 @@ async def _proxy_agent_status(
         audit_repo, audit_health, actor, source_addr, agent_id, operation, correlation_id
     )
     try:
-        response = await client.request(
-            agent,
-            "GET",
-            upstream_path,
+        response = await proxy.request_json(
+            agent_id=agent_id,
+            capability=None,
+            method="GET",
+            upstream_path=upstream_path,
+            query={},
             correlation_id=correlation_id,
         )
-    except AgentClientError as exc:
+    except AgentProxyError as exc:
+        failure_category = failure_category_for_client_error("GET", exc.code)
         audit_repo.finalize(
             audit.id,
             result="failed",
             dispatch_state=exc.dispatch_state,
-            failure_category=exc.category,
+            upstream_status=exc.upstream_status,
+            failure_category=failure_category,
         )
         commit_audit_outcome(audit_repo, audit_health)
         raise ApiError(
-            ERROR_STATUS.get(exc.category, 502), exc.category, "agent request failed"
+            (
+                502
+                if failure_category == "agent_auth_error"
+                else ERROR_STATUS.get(failure_category, exc.status_code)
+            ),
+            failure_category,
+            "agent request failed",
         ) from exc
     audit_repo.finalize(
         audit.id,
@@ -120,7 +131,7 @@ async def _proxy_agent_status(
     return JSONResponse(
         status_code=response.status_code,
         content=augment_upstream_error_body(
-            response.json(),
+            response.body,
             agent_id=agent_id,
             correlation_id=correlation_id,
             status_code=response.status_code,
@@ -303,7 +314,7 @@ async def get_agent_healthz(
     request: Request,
     actor: Annotated[AuthContext, Depends(require_auth)],
     registry: Annotated[AgentRegistry, Depends(get_agent_registry)],
-    client: Annotated[AgentHttpClient, Depends(get_agent_http_client)],
+    proxy: Annotated[AgentHttpProxy, Depends(get_agent_http_proxy)],
     audit_repo: Annotated[ControlPlaneAuditRepository, Depends(get_control_plane_audit_repository)],
     audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
 ) -> Response:
@@ -311,7 +322,7 @@ async def get_agent_healthz(
         agent_id=agent_id,
         upstream_path="/healthz",
         registry=registry,
-        client=client,
+        proxy=proxy,
         request=request,
         actor=actor,
         audit_repo=audit_repo,
@@ -326,7 +337,7 @@ async def get_agent_readyz(
     request: Request,
     actor: Annotated[AuthContext, Depends(require_auth)],
     registry: Annotated[AgentRegistry, Depends(get_agent_registry)],
-    client: Annotated[AgentHttpClient, Depends(get_agent_http_client)],
+    proxy: Annotated[AgentHttpProxy, Depends(get_agent_http_proxy)],
     audit_repo: Annotated[ControlPlaneAuditRepository, Depends(get_control_plane_audit_repository)],
     audit_health: Annotated[AuditStorageHealth, Depends(get_audit_storage_health)],
 ) -> Response:
@@ -334,7 +345,7 @@ async def get_agent_readyz(
         agent_id=agent_id,
         upstream_path="/readyz",
         registry=registry,
-        client=client,
+        proxy=proxy,
         request=request,
         actor=actor,
         audit_repo=audit_repo,

@@ -1,9 +1,13 @@
+from datetime import UTC, datetime
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from ic_env_guard.api.agent_http import get_agent_http_client
+from ic_env_guard.api.agent_proxy import get_agent_http_proxy
 from ic_env_guard.config.models import AgentConfig, AppConfig, AuthConfig, ControlPlaneConfig
+from ic_env_guard.fleet.models import AgentRecord, EnrollmentMethod
 from ic_env_guard.main import create_app
 
 
@@ -14,14 +18,201 @@ def _token_file(tmp_path, name="token", value="secret-token"):
     return token_file
 
 
-def _agent(tmp_path, agent_id="lab-01", enabled=True):
+def _agent(tmp_path, agent_id="lab-01", enabled=True, endpoint=None):
     return AgentConfig(
         id=agent_id,
         name=f"Agent {agent_id}",
-        base_url=f"https://{agent_id}.example",
+        base_url=endpoint or f"https://{agent_id}.example",
         token_file=_token_file(tmp_path, f"{agent_id}.token", "agent-secret-token"),
         enabled=enabled,
     )
+
+
+def _local_route_app(tmp_path, handler, *, gate=True, mutation=None, manager_target=False):
+    config = AppConfig.model_validate(
+        {
+            "mode": "control-plane",
+            "auth": {"token_file": _token_file(tmp_path)},
+            "development": {
+                "allow_insecure_http": True,
+                "local_agent_bootstrap": gate,
+            },
+            "enrollment": {"manager_socket_path": tmp_path / "manager.sock"},
+            "control_plane": {
+                "audit_database": tmp_path / "control-plane.db",
+                "allowed_agent_cidrs": ["127.0.0.0/8"],
+                "transport_profiles": [
+                    {
+                        "id": "local-loopback-http",
+                        "type": "trusted_lan_http",
+                        "allowed_cidrs": ["127.0.0.0/8"],
+                    },
+                    {
+                        "id": "alternate-loopback-http",
+                        "type": "trusted_lan_http",
+                        "allowed_cidrs": ["127.0.0.0/8"],
+                    },
+                ],
+            },
+        }
+    )
+    app = create_app(config=config)
+    container = app.state.container
+    with container.credential_store.lifecycle_lease():
+        credential_ref = container.credential_store.put(b"managed-route-token")
+    now = datetime.now(UTC)
+    container.registry_repository.create(
+        AgentRecord(
+            agent_id="local-agent",
+            instance_id="11111111-1111-4111-8111-111111111111",
+            display_name="Local Agent",
+            normalized_endpoint=(
+                "http://127.0.0.1:8765"
+                if manager_target
+                else "http://127.0.0.1:8766"
+            ),
+            credential_ref=credential_ref,
+            remote_credential_id="22222222-2222-4222-8222-222222222222",
+            transport_profile_id="local-loopback-http",
+            enrollment_method=EnrollmentMethod.LOCAL_SOCKET,
+            enabled=True,
+            source="local_dev_bootstrap",
+            revision=1,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    if mutation is not None:
+        field, value = mutation
+        with container.database_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f"UPDATE agents SET {field}=? WHERE agent_id='local-agent'", (value,)
+            )
+    runtime_client = container.agent_client.clone_with_transport(
+        httpx.MockTransport(handler)
+    )
+    app.dependency_overrides[get_agent_http_client] = lambda: runtime_client
+    app.dependency_overrides[get_agent_http_proxy] = lambda: (
+        container.agent_http_proxy.with_runtime(
+            runtime_client, container.agent_availability
+        )
+    )
+    return app, credential_ref
+
+
+@pytest.mark.contract
+def test_local_agent_health_and_ready_use_managed_record_route(tmp_path, monkeypatch):
+    dispatched = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        dispatched.append((request.url.path, request.headers.get("authorization")))
+        if request.url.path == "/healthz":
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(503, json={"status": "degraded"})
+
+    app, credential_ref = _local_route_app(tmp_path, handler)
+    reads = []
+    original_read = app.state.container.credential_store.read
+
+    def tracked_read(reference):
+        reads.append(reference)
+        return original_read(reference)
+
+    monkeypatch.setattr(app.state.container.credential_store, "read", tracked_read)
+    client = TestClient(app)
+    headers = {"Authorization": "Bearer secret-token"}
+    health = client.get("/api/agents/local-agent/healthz", headers=headers)
+    ready = client.get("/api/agents/local-agent/readyz", headers=headers)
+    client.close()
+
+    assert health.status_code == 200
+    assert health.json() == {"status": "ok"}
+    assert ready.status_code == 503
+    assert ready.json() == {"status": "degraded"}
+    assert reads == [credential_ref, credential_ref]
+    assert dispatched == [
+        ("/healthz", "Bearer managed-route-token"),
+        ("/readyz", "Bearer managed-route-token"),
+    ]
+
+
+@pytest.mark.contract
+@pytest.mark.parametrize("route", ["healthz", "readyz"])
+@pytest.mark.parametrize(
+    ("gate", "mutation"),
+    [
+        (False, None),
+        (True, ("source", "manual")),
+        (True, ("enrollment_method", "ssh_auto")),
+        (True, ("transport_profile_id", "alternate-loopback-http")),
+    ],
+    ids=["gate-disabled", "source-mismatch", "method-mismatch", "profile-mismatch"],
+)
+def test_local_agent_status_route_rejects_invalid_authority_before_access(
+    tmp_path, monkeypatch, route, gate, mutation
+):
+    dispatched = []
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        dispatched.append(True)
+        return httpx.Response(200, json={"status": "ok"})
+
+    app, _credential_ref = _local_route_app(
+        tmp_path, handler, gate=gate, mutation=mutation
+    )
+    reads = []
+    original_read = app.state.container.credential_store.read
+
+    def tracked_read(reference):
+        reads.append(reference)
+        return original_read(reference)
+
+    monkeypatch.setattr(app.state.container.credential_store, "read", tracked_read)
+    client = TestClient(app)
+    response = client.get(
+        f"/api/agents/local-agent/{route}",
+        headers={"Authorization": "Bearer secret-token"},
+    )
+    client.close()
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "target_address_forbidden"
+    assert reads == []
+    assert dispatched == []
+
+
+@pytest.mark.contract
+def test_local_agent_status_route_rejects_manager_self_target_before_access(
+    tmp_path, monkeypatch
+):
+    dispatched = []
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        dispatched.append(True)
+        return httpx.Response(200, json={"status": "ok"})
+
+    app, _credential_ref = _local_route_app(
+        tmp_path, handler, manager_target=True
+    )
+    reads = []
+    original_read = app.state.container.credential_store.read
+
+    def tracked_read(reference):
+        reads.append(reference)
+        return original_read(reference)
+
+    monkeypatch.setattr(app.state.container.credential_store, "read", tracked_read)
+    client = TestClient(app)
+    response = client.get(
+        "/api/agents/local-agent/healthz",
+        headers={"Authorization": "Bearer secret-token"},
+    )
+    client.close()
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "target_is_manager"
+    assert reads == []
+    assert dispatched == []
 
 
 @pytest.mark.contract
@@ -177,12 +368,25 @@ def test_control_plane_agent_health_and_ready_proxy_selected_agent(tmp_path):
     config = AppConfig(
         auth=AuthConfig(token_file=_token_file(tmp_path)),
         mode="control-plane",
-        control_plane=ControlPlaneConfig(audit_database=tmp_path / "control-plane.db"),
-        agents=[_agent(tmp_path, "lab-01")],
+        control_plane=ControlPlaneConfig(
+            audit_database=tmp_path / "control-plane.db",
+            allowed_agent_cidrs=["10.20.30.0/24"],
+        ),
+        agents=[
+            _agent(
+                tmp_path, "lab-01", endpoint="https://10.20.30.1:8765"
+            )
+        ],
     )
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = (
-        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
+    runtime_client = app.state.container.agent_client.clone_with_transport(
+        httpx.MockTransport(handler)
+    )
+    app.dependency_overrides[get_agent_http_client] = lambda: runtime_client
+    app.dependency_overrides[get_agent_http_proxy] = lambda: (
+        app.state.container.agent_http_proxy.with_runtime(
+            runtime_client, app.state.container.agent_availability
+        )
     )
 
     with TestClient(app) as client:
@@ -219,12 +423,25 @@ def test_control_plane_agent_health_error_body_includes_agent_and_correlation(tm
     config = AppConfig(
         auth=AuthConfig(token_file=_token_file(tmp_path)),
         mode="control-plane",
-        control_plane=ControlPlaneConfig(audit_database=tmp_path / "control-plane.db"),
-        agents=[_agent(tmp_path, "lab-01")],
+        control_plane=ControlPlaneConfig(
+            audit_database=tmp_path / "control-plane.db",
+            allowed_agent_cidrs=["10.20.30.0/24"],
+        ),
+        agents=[
+            _agent(
+                tmp_path, "lab-01", endpoint="https://10.20.30.1:8765"
+            )
+        ],
     )
     app = create_app(config=config)
-    app.dependency_overrides[get_agent_http_client] = (
-        lambda: app.state.container.agent_client.clone_with_transport(httpx.MockTransport(handler))
+    runtime_client = app.state.container.agent_client.clone_with_transport(
+        httpx.MockTransport(handler)
+    )
+    app.dependency_overrides[get_agent_http_client] = lambda: runtime_client
+    app.dependency_overrides[get_agent_http_proxy] = lambda: (
+        app.state.container.agent_http_proxy.with_runtime(
+            runtime_client, app.state.container.agent_availability
+        )
     )
 
     with TestClient(app) as client:

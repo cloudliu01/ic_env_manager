@@ -158,7 +158,7 @@ class AgentHttpProxy:
         self,
         *,
         agent_id: str,
-        capability: str,
+        capability: str | None,
         method: str,
         upstream_path: str,
         query: Mapping[str, str | int],
@@ -199,18 +199,23 @@ class AgentHttpProxy:
         except CredentialStoreError as exc:
             raise AgentProxyError("agent_auth_error", 503) from exc
 
-        try:
-            capability_check = await self._availability.check_capability(agent_id, capability)
-        except Exception as exc:
-            code = getattr(exc, "code", "agent_unavailable")
-            dispatch = getattr(exc, "dispatch_state", "unknown")
-            raise AgentProxyError(code, 503, dispatch_state=dispatch) from exc
-        if not capability_check.supported:
-            raise AgentProxyError(
-                "agent_capability_missing",
-                409,
-                dispatch_state=capability_check.dispatch_state,
-            )
+        capability_dispatch_state = "not_dispatched"
+        if capability is not None:
+            try:
+                capability_check = await self._availability.check_capability(
+                    agent_id, capability
+                )
+            except Exception as exc:
+                code = getattr(exc, "code", "agent_unavailable")
+                dispatch = getattr(exc, "dispatch_state", "unknown")
+                raise AgentProxyError(code, 503, dispatch_state=dispatch) from exc
+            capability_dispatch_state = capability_check.dispatch_state
+            if not capability_check.supported:
+                raise AgentProxyError(
+                    "agent_capability_missing",
+                    409,
+                    dispatch_state=capability_dispatch_state,
+                )
         if not _matches_capture(
             self._registry.get(agent_id),
             captured.revision,
@@ -223,7 +228,7 @@ class AgentHttpProxy:
             raise AgentProxyError(
                 "agent_target_changed",
                 409,
-                dispatch_state=capability_check.dispatch_state,
+                dispatch_state=capability_dispatch_state,
             )
         try:
             response = (
@@ -252,7 +257,7 @@ class AgentHttpProxy:
                 exc.category,
                 503 if exc.category == "agent_network_error" else 502,
                 dispatch_state=_combined_dispatch_state(
-                    capability_check.dispatch_state, exc.dispatch_state
+                    capability_dispatch_state, exc.dispatch_state
                 ),
             ) from exc
         except (TypeError, ValueError) as exc:
