@@ -467,42 +467,91 @@ close_lifecycle_lock_io() {
   fi
 }
 
+wait_for_lifecycle_lock_keeper_exit() {
+  local pid="$1"
+  local process_state
+  for _ in $(seq 1 "${lifecycle_lock_cleanup_attempts:-20}"); do
+    if ! kill -0 "${pid}" >/dev/null 2>&1; then
+      return
+    fi
+    process_state="$(ps -ww -o stat= -p "${pid}" 2>/dev/null || true)"
+    if [[ "${process_state}" == Z* ]]; then
+      return
+    fi
+    sleep "${lifecycle_lock_cleanup_interval:-0.05}"
+  done
+  return 1
+}
+
+cleanup_lifecycle_lock_keeper() {
+  local cleanup_status=0
+  local pid="${lifecycle_lock_pid}"
+
+  close_lifecycle_lock_io
+  if [[ -n "${pid}" ]]; then
+    if ! wait_for_lifecycle_lock_keeper_exit "${pid}"; then
+      kill -TERM "${pid}" >/dev/null 2>&1 || true
+      if ! wait_for_lifecycle_lock_keeper_exit "${pid}"; then
+        kill -KILL "${pid}" >/dev/null 2>&1 || true
+        if ! wait_for_lifecycle_lock_keeper_exit "${pid}"; then
+          cleanup_status=1
+        fi
+      fi
+    fi
+    if [[ "${cleanup_status}" == "0" ]]; then
+      wait "${pid}" >/dev/null 2>&1 || true
+    fi
+  fi
+  lifecycle_lock_pid=""
+  lifecycle_lock_held=0
+  lifecycle_lock_fds_open=0
+  lifecycle_lock_io_dir=""
+  return "${cleanup_status}"
+}
+
 acquire_lifecycle_lock() {
   local ready
   if [[ "${lifecycle_lock_held}" == "1" ]]; then
     return
   fi
 
-  lifecycle_lock_io_dir="$(mktemp -d "${DEV_DIR}/.start-all-lock.XXXXXX")"
-  chmod 0700 "${lifecycle_lock_io_dir}"
-  mkfifo \
-    "${lifecycle_lock_io_dir}/control" \
-    "${lifecycle_lock_io_dir}/status"
-  chmod 0600 \
-    "${lifecycle_lock_io_dir}/control" \
-    "${lifecycle_lock_io_dir}/status"
-  lifecycle_lock_keeper &
-  lifecycle_lock_pid="$!"
-  exec 8>"${lifecycle_lock_io_dir}/control"
-  exec 9<"${lifecycle_lock_io_dir}/status"
+  if ! lifecycle_lock_io_dir="$(
+    mktemp -d "${DEV_DIR}/.start-all-lock.XXXXXX"
+  )"; then
+    echo "could not acquire development lifecycle lock" >&2
+    return 1
+  fi
+  if ! chmod 0700 "${lifecycle_lock_io_dir}" \
+    || ! mkfifo \
+      "${lifecycle_lock_io_dir}/control" \
+      "${lifecycle_lock_io_dir}/status" \
+    || ! chmod 0600 \
+      "${lifecycle_lock_io_dir}/control" \
+      "${lifecycle_lock_io_dir}/status"; then
+    cleanup_lifecycle_lock_keeper || true
+    echo "could not acquire development lifecycle lock" >&2
+    return 1
+  fi
+  if ! exec 8<>"${lifecycle_lock_io_dir}/control"; then
+    cleanup_lifecycle_lock_keeper || true
+    echo "could not acquire development lifecycle lock" >&2
+    return 1
+  fi
   lifecycle_lock_fds_open=1
-  if ! IFS= read -r -t 121 ready <&9; then
-    exec 8>&-
-    lifecycle_lock_fds_open=0
-    wait "${lifecycle_lock_pid}" >/dev/null 2>&1 || true
-    exec 9>&-
-    close_lifecycle_lock_io
-    lifecycle_lock_pid=""
+  if ! exec 9<>"${lifecycle_lock_io_dir}/status"; then
+    cleanup_lifecycle_lock_keeper || true
+    echo "could not acquire development lifecycle lock" >&2
+    return 1
+  fi
+  lifecycle_lock_keeper 8>&- 9>&- &
+  lifecycle_lock_pid="$!"
+  if ! IFS= read -r -t "${lifecycle_lock_acquire_timeout:-121}" ready <&9; then
+    cleanup_lifecycle_lock_keeper || true
     echo "could not acquire development lifecycle lock" >&2
     return 1
   fi
   if [[ "${ready}" != "locked" ]]; then
-    exec 8>&-
-    lifecycle_lock_fds_open=0
-    wait "${lifecycle_lock_pid}" >/dev/null 2>&1 || true
-    exec 9>&-
-    close_lifecycle_lock_io
-    lifecycle_lock_pid=""
+    cleanup_lifecycle_lock_keeper || true
     echo "could not acquire development lifecycle lock" >&2
     return 1
   fi
@@ -511,21 +560,20 @@ acquire_lifecycle_lock() {
 
 release_lifecycle_lock() {
   local released
+  local release_status=0
   if [[ "${lifecycle_lock_held}" != "1" ]]; then
     return
   fi
   exec 8>&-
-  lifecycle_lock_fds_open=0
-  if ! IFS= read -r -t 2 released <&9 \
+  if ! IFS= read -r -t "${lifecycle_lock_release_timeout:-2}" released <&9 \
     || [[ "${released}" != "released" ]]; then
     echo "could not release development lifecycle lock" >&2
-    return 1
+    release_status=1
   fi
-  wait "${lifecycle_lock_pid}"
-  exec 9>&-
-  close_lifecycle_lock_io
-  lifecycle_lock_pid=""
-  lifecycle_lock_held=0
+  if ! cleanup_lifecycle_lock_keeper; then
+    release_status=1
+  fi
+  return "${release_status}"
 }
 
 recorded_process_matches() {

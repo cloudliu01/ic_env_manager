@@ -526,6 +526,170 @@ def test_start_all_rejects_symlink_lifecycle_lock_without_following_target(tmp_p
     assert target.read_text(encoding="utf-8") == "unchanged"
 
 
+def _run_lifecycle_lock_scenario(
+    dev_dir: Path, scenario: str, *, timeout: float = 3
+) -> subprocess.CompletedProcess:
+    use_original = dev_dir / "use-original-keeper"
+    keeper_pid = dev_dir / "keeper.pid"
+    script = f"""
+source {str(PROJECT_ROOT / 'start.sh')!r} help >/dev/null
+lifecycle_lock_pid=""
+lifecycle_lock_io_dir=""
+lifecycle_lock_fds_open=0
+lifecycle_lock_held=0
+lifecycle_lock_acquire_timeout=1
+lifecycle_lock_release_timeout=1
+lifecycle_lock_cleanup_attempts=10
+lifecycle_lock_cleanup_interval=0.01
+eval "$(
+  declare -f lifecycle_lock_keeper \
+    | sed '1s/lifecycle_lock_keeper/original_lifecycle_lock_keeper/'
+)"
+
+assert_lock_is_reset() {{
+  [[ "$lifecycle_lock_pid" == "" ]]
+  [[ "$lifecycle_lock_io_dir" == "" ]]
+  [[ "$lifecycle_lock_fds_open" == "0" ]]
+  [[ "$lifecycle_lock_held" == "0" ]]
+  ! compgen -G "$DEV_DIR/.start-all-lock.*" >/dev/null
+}}
+
+retry_lock() {{
+  : > {str(use_original)!r}
+  acquire_lifecycle_lock
+  release_lifecycle_lock
+  assert_lock_is_reset
+}}
+
+SCENARIO={scenario!r}
+KEEPER_PID_FILE={str(keeper_pid)!r}
+USE_ORIGINAL={str(use_original)!r}
+
+case "$SCENARIO" in
+  peer-open-failure)
+    lifecycle_lock_keeper() {{
+      if [[ -e "$USE_ORIGINAL" ]]; then
+        original_lifecycle_lock_keeper
+      else
+        return 17
+      fi
+    }}
+    if acquire_lifecycle_lock; then
+      echo "peer-open failure unexpectedly acquired the lock" >&2
+      exit 1
+    fi
+    assert_lock_is_reset
+    retry_lock
+    ;;
+  acquire-hang|acquire-crash)
+    lifecycle_lock_keeper() {{
+      if [[ -e "$USE_ORIGINAL" ]]; then
+        original_lifecycle_lock_keeper
+        return
+      fi
+      exec 3<"$lifecycle_lock_io_dir/control"
+      exec 4>"$lifecycle_lock_io_dir/status"
+      python -c 'import os,sys; open(sys.argv[1], "w").write(str(os.getppid()))' \
+        "$KEEPER_PID_FILE"
+      if [[ "$SCENARIO" == "acquire-crash" ]]; then
+        return 17
+      fi
+      trap '' TERM
+      while :; do sleep 1; done
+    }}
+    if acquire_lifecycle_lock; then
+      echo "broken acquire handshake unexpectedly acquired the lock" >&2
+      exit 1
+    fi
+    failed_pid="$(cat "$KEEPER_PID_FILE")"
+    ! kill -0 "$failed_pid" 2>/dev/null
+    assert_lock_is_reset
+    retry_lock
+    ;;
+  release-no-ack)
+    lifecycle_lock_keeper() {{
+      if [[ -e "$USE_ORIGINAL" ]]; then
+        original_lifecycle_lock_keeper
+        return
+      fi
+      exec 3<"$lifecycle_lock_io_dir/control"
+      exec 4>"$lifecycle_lock_io_dir/status"
+      python -c 'import os,sys; open(sys.argv[1], "w").write(str(os.getppid()))' \
+        "$KEEPER_PID_FILE"
+      printf 'locked\n' >&4
+      while IFS= read -r -n 1 <&3; do :; done
+      trap '' TERM
+      while :; do sleep 1; done
+    }}
+    acquire_lifecycle_lock
+    failed_pid="$lifecycle_lock_pid"
+    if release_lifecycle_lock; then
+      echo "missing release ACK unexpectedly succeeded" >&2
+      exit 1
+    fi
+    ! kill -0 "$failed_pid" 2>/dev/null
+    assert_lock_is_reset
+    retry_lock
+    ;;
+  release-stopped)
+    lifecycle_lock_keeper() {{ original_lifecycle_lock_keeper; }}
+    acquire_lifecycle_lock
+    failed_pid="$lifecycle_lock_pid"
+    kill -STOP "$failed_pid"
+    if release_lifecycle_lock; then
+      echo "stopped keeper unexpectedly released the lock" >&2
+      exit 1
+    fi
+    ! kill -0 "$failed_pid" 2>/dev/null
+    assert_lock_is_reset
+    retry_lock
+    ;;
+esac
+"""
+    process = subprocess.Popen(
+        ["bash", "-c", script],
+        cwd=PROJECT_ROOT,
+        env=os.environ | {"IC_ENV_GUARD_DEV_DIR": str(dev_dir)},
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        stdout, stderr = process.communicate(timeout=1)
+        pytest.fail(
+            f"lifecycle lock scenario was not bounded: {scenario}\n{stdout}{stderr}"
+        )
+    return subprocess.CompletedProcess(
+        process.args, process.returncode, stdout=stdout, stderr=stderr
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "peer-open-failure",
+        "acquire-hang",
+        "acquire-crash",
+        "release-no-ack",
+        "release-stopped",
+    ],
+)
+def test_lifecycle_lock_keeper_failures_are_bounded_clean_and_retryable(
+    tmp_path, scenario
+):
+    dev_dir = (tmp_path / "development").resolve()
+    dev_dir.mkdir(mode=0o700)
+
+    result = _run_lifecycle_lock_scenario(dev_dir, scenario)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.integration
 def test_recorded_process_identity_change_before_kill_fails_closed():
     dev_dir = Path(mkdtemp(prefix="ieg-reused-process-", dir="/tmp")).resolve()
