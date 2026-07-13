@@ -84,8 +84,12 @@ command="ic-env-guard agent enroll-manager",restrict,no-pty,no-agent-forwarding,
   or `known_hosts`; the flow safely falls back to the displayed CLI.
 - `ssh_host_key_unknown` / `ssh_host_key_changed`: verify the fingerprint out
   of band, then update the Manager user's `known_hosts`; never disable checks.
-- `enrollment_expired`: start a new enrollment; do not reuse the old command.
-- `enrollment_replayed` or `enrollment_already_submitted`: the one-time result
-  was already consumed; inspect Manager audit before starting again.
-- `manager_socket_unavailable`: verify the absolute path, running Manager,
-  `/run/ic-env-guard` ownership, and socket mode.
+- `agent_enrollment_expired`: start a new enrollment; do not reuse the old
+  command.
+- `agent_enrollment_consumed` or `agent_enrollment_input_changed`: the job was
+  already consumed or its immutable connection input no longer matches; inspect
+  Manager audit before starting again.
+- `enrollment_rejected`: the local socket deliberately returns one generic
+  rejection for an invalid, expired, replayed, or unauthorized submission.
+  Verify the absolute socket path, running Manager, `/run/ic-env-guard`
+  ownership, socket mode, and enrollment ID before starting a new job.

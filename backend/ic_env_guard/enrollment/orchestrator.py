@@ -62,6 +62,40 @@ _PUBLIC_STATE = {
 }
 
 
+def _failure_phase(code: str | None) -> str:
+    value = code or ""
+    if value.startswith("ssh_"):
+        return "ssh"
+    if value.startswith("transport_") or "tls" in value:
+        return "transport"
+    if value.startswith("agent_auth") or "credential" in value:
+        return "authentication"
+    if "protocol" in value or "version" in value:
+        return "protocol"
+    if "identity" in value:
+        return "identity"
+    if "capabil" in value:
+        return "capabilities"
+    if "readiness" in value:
+        return "readiness"
+    return "network"
+
+
+def _progress_index(job: EnrollmentJob) -> int:
+    if job.state in {EnrollmentState.RUNNING, EnrollmentState.AWAITING_CLI}:
+        return 1
+    if job.state in {EnrollmentState.CREDENTIAL_ISSUED, EnrollmentState.VERIFYING}:
+        return 2
+    if job.state in {
+        EnrollmentState.VERIFIED,
+        EnrollmentState.ACTIVATION_REQUESTED,
+        EnrollmentState.ACTIVATED,
+        EnrollmentState.CONSUMED,
+    }:
+        return len(PHASES)
+    return 0
+
+
 @dataclass(frozen=True)
 class LegacyValidationRequest:
     base_url: str
@@ -96,10 +130,30 @@ class EnrollmentPublicResult:
         validation = self.validation
         state = self.job.state
         phases: dict[str, dict[str, str | None]] = {}
-        for name in PHASES:
-            status = "pending"
+        failure_code = self.job.last_error_code
+        if state is EnrollmentState.EXPIRED and not failure_code:
+            failure_code = "agent_enrollment_expired"
+        elif state is EnrollmentState.CANCELLED and not failure_code:
+            failure_code = "agent_enrollment_cancelled"
+        terminal_failure = state in {
+            EnrollmentState.CANCELLED,
+            EnrollmentState.EXPIRED,
+            EnrollmentState.FAILED,
+        }
+        failed_phase = _failure_phase(failure_code) if terminal_failure else None
+        failed_index = PHASES.index(failed_phase) if failed_phase else -1
+        progress_index = _progress_index(self.job)
+        for index, name in enumerate(PHASES):
+            status = "success" if index < progress_index else "pending"
             code = None
-            if validation is not None:
+            if terminal_failure:
+                if index < failed_index:
+                    status = "success"
+                elif index == failed_index:
+                    status, code = "failure", failure_code
+                else:
+                    status = "skipped"
+            elif validation is not None:
                 status = "success"
                 if (
                     name == "ssh"
@@ -110,12 +164,12 @@ class EnrollmentPublicResult:
                     status, code = "warning", "legacy_identity_unavailable"
                 elif name == "readiness" and validation.readiness_warning:
                     status, code = "warning", validation.readiness_warning
-            elif state in {
-                EnrollmentState.CANCELLED,
-                EnrollmentState.EXPIRED,
-                EnrollmentState.FAILED,
-            }:
-                status = "skipped"
+            elif (
+                state is EnrollmentState.AWAITING_CLI
+                and name == "ssh"
+                and failure_code == "ssh_unavailable"
+            ):
+                status, code = "warning", failure_code
             phases[name] = {"status": status, "code": code}
         agent = None
         if validation is not None:
@@ -465,6 +519,7 @@ class EnrollmentOrchestrator:
         enabled: bool | None = None,
         base_url: str | None = None,
         transport_profile_id: str | None = None,
+        legacy_token: str | None = None,
     ) -> AgentRecord:
         current = self.registry.get(agent_id)
         if current is None:
@@ -475,43 +530,69 @@ class EnrollmentOrchestrator:
             endpoint != current.normalized_endpoint
             or profile != current.transport_profile_id
         )
+        new_credential_ref: str | None = None
         if target_changed:
             if current.instance_id is None:
-                raise EnrollmentConflict("legacy_revalidation_required")
-            if self.agent_client is None:
+                if not legacy_token:
+                    raise EnrollmentConflict("legacy_revalidation_required")
+                if self.agent_client is None:
+                    raise EnrollmentConflict("agent_validation_unavailable")
+                try:
+                    target = self.agent_client.prepare(endpoint, profile)
+                    validation = await self.agent_client.validate_legacy(
+                        target, legacy_token.encode()
+                    )
+                    new_credential_ref = self.credential_store.put(
+                        legacy_token.encode()
+                    )
+                except EnrollmentValidationError as exc:
+                    raise MutationSagaError(
+                        exc.code, dispatch_state=exc.dispatch_state
+                    ) from exc
+                except CredentialStoreError as exc:
+                    raise MutationSagaError(
+                        "agent_credential_unavailable",
+                        dispatch_state="dispatched",
+                    ) from exc
+                endpoint = validation.normalized_endpoint
+            elif self.agent_client is None:
                 raise EnrollmentConflict("agent_validation_unavailable")
-            try:
-                target = self.agent_client.prepare(endpoint, profile)
-                token = self.credential_store.read(current.credential_ref)
-                validation = await self.agent_client.validate_pending(
-                    target, token, helper_instance_id=current.instance_id
-                )
-            except EnrollmentValidationError as exc:
-                raise MutationSagaError(
-                    exc.code, dispatch_state=exc.dispatch_state
-                ) from exc
-            except CredentialStoreError as exc:
-                raise MutationSagaError(
-                    "agent_credential_unavailable", dispatch_state="not_dispatched"
-                ) from exc
-            if validation.instance_id != current.instance_id:
-                raise MutationSagaError(
-                    "agent_identity_changed", dispatch_state="dispatched"
-                )
-            endpoint = validation.normalized_endpoint
+            else:
+                try:
+                    target = self.agent_client.prepare(endpoint, profile)
+                    token = self.credential_store.read(current.credential_ref)
+                    validation = await self.agent_client.validate_pending(
+                        target, token, helper_instance_id=current.instance_id
+                    )
+                except EnrollmentValidationError as exc:
+                    raise MutationSagaError(
+                        exc.code, dispatch_state=exc.dispatch_state
+                    ) from exc
+                except CredentialStoreError as exc:
+                    raise MutationSagaError(
+                        "agent_credential_unavailable", dispatch_state="not_dispatched"
+                    ) from exc
+                if validation.instance_id != current.instance_id:
+                    raise MutationSagaError(
+                        "agent_identity_changed", dispatch_state="dispatched"
+                    )
+                endpoint = validation.normalized_endpoint
         candidate = replace(
             current,
             display_name=display_name or current.display_name,
             enabled=current.enabled if enabled is None else enabled,
             normalized_endpoint=endpoint,
             transport_profile_id=profile,
+            credential_ref=new_credential_ref or current.credential_ref,
         )
+        committed = False
         try:
-            return self.registry.update_and_reset_status(
+            updated = self.registry.update_and_reset_status(
                 candidate,
                 expected_revision=current.revision,
                 now=self._clock(),
             )
+            committed = True
         except RevisionConflict as exc:
             raise MutationSagaError(
                 "agent_changed",
@@ -531,6 +612,18 @@ class EnrollmentOrchestrator:
                 "agent_registry_unavailable",
                 dispatch_state="dispatched" if target_changed else "not_dispatched",
             ) from exc
+        finally:
+            if new_credential_ref is not None and not committed:
+                try:
+                    self.credential_store.delete_if_exists(new_credential_ref)
+                except CredentialStoreError:
+                    pass
+        if new_credential_ref is not None:
+            try:
+                self.credential_store.delete_if_exists(current.credential_ref)
+            except CredentialStoreError:
+                pass
+        return updated
 
     async def remove_agent(
         self,

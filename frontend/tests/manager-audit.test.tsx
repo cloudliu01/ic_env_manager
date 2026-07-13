@@ -30,7 +30,10 @@ describe('Manager control-plane audit', () => {
     expect(await screen.findByRole('heading', { name: 'Control-plane Audit' })).toBeTruthy();
     expect(await screen.findByText('agents.v2.probe')).toBeTruthy();
     expect(screen.getByText('corr-safe')).toBeTruthy();
-    expect(screen.getByRole('link', { name: 'agent-a' }).getAttribute('href')).toBe('/agents/agent-a/audit');
+    expect(screen.getByRole('link', { name: 'agent-a' }).getAttribute('href')).toBe('/audit?agent_id=agent-a');
+    expect(screen.getByRole('option', { name: 'Pending' })).toBeTruthy();
+    expect(screen.getByRole('option', { name: 'Failure' })).toBeTruthy();
+    expect(screen.getByRole('option', { name: 'Denied' })).toBeTruthy();
     expect(screen.queryByText(/route is ready/i)).toBeNull();
   });
 

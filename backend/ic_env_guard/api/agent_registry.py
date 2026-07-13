@@ -1,7 +1,7 @@
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, TypeAdapter, model_validator
 
 from ic_env_guard.agents.registry import (
     AgentInvalidConfigurationError,
@@ -76,6 +76,7 @@ class UpdateAgentRequest(BaseModel):
     enabled: bool | None = None
     base_url: str | None = Field(default=None, min_length=1, max_length=2048)
     transport_profile_id: str | None = Field(default=None, min_length=1, max_length=64)
+    legacy_token: SecretStr | None = Field(default=None, min_length=1, max_length=4096)
 
     @model_validator(mode="after")
     def require_change(self) -> "UpdateAgentRequest":
@@ -329,6 +330,9 @@ async def update_agent(
             enabled=body.enabled,
             base_url=body.base_url,
             transport_profile_id=body.transport_profile_id,
+            legacy_token=(
+                body.legacy_token.get_secret_value() if body.legacy_token else None
+            ),
         )
     except MutationSagaError as exc:
         _failure(

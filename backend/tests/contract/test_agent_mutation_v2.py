@@ -3,11 +3,13 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
 from threading import Event
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from ic_env_guard.config.models import AppConfig, AuthConfig, ControlPlaneConfig
+from ic_env_guard.enrollment.agent_client import EnrollmentValidation
 from ic_env_guard.enrollment.credential_store import CredentialStoreError
 from ic_env_guard.enrollment.jobs import EnrollmentJobRequest
 from ic_env_guard.enrollment.orchestrator import MutationSagaError
@@ -127,6 +129,54 @@ def test_update_agent_rejects_unknown_agent_with_stable_error(tmp_path):
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "agent_not_found"
+
+
+@pytest.mark.contract
+def test_legacy_target_update_accepts_write_only_revalidation_token(tmp_path):
+    client = manager_client(tmp_path)
+    old_reference = add_managed_agent(client)
+    container = client.app.state.container
+    with container.database_engine.begin() as connection:
+        connection.exec_driver_sql(
+            "UPDATE agents SET instance_id=NULL, enrollment_method='legacy_admin_token', "
+            "remote_credential_id=NULL WHERE agent_id='alpha'"
+        )
+
+    class LegacyClient:
+        def prepare(self, endpoint, _profile):
+            return SimpleNamespace(normalized_endpoint=endpoint)
+
+        async def validate_legacy(self, target, token):
+            assert token == b"write-only-revalidation-token"
+            return EnrollmentValidation(
+                normalized_endpoint=target.normalized_endpoint,
+                api_version="1",
+                agent_version="1.0.0",
+                capabilities=("terminal",),
+                instance_id=None,
+                summary=None,
+                readiness_warning="legacy_readiness_unavailable",
+            )
+
+    container.enrollment_orchestrator.agent_client = LegacyClient()
+    response = client.put(
+        "/api/v2/agents/alpha",
+        headers=AUTH,
+        json={
+            "base_url": "https://10.0.0.12:8765",
+            "legacy_token": "write-only-revalidation-token",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["agent"]["endpoint"] == "https://10.0.0.12:8765"
+    assert "write-only-revalidation-token" not in response.text
+    updated = container.registry_repository.get("alpha")
+    assert updated is not None
+    assert updated.credential_ref != old_reference
+    assert container.credential_store.read(updated.credential_ref) == (
+        b"write-only-revalidation-token"
+    )
 
 
 @pytest.mark.contract

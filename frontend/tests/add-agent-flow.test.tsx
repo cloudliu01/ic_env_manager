@@ -5,6 +5,7 @@ import { App } from '../src/app/App';
 import type { EnrollmentJob } from '../src/features/agent-registry/enrollment-api';
 
 const apiRequest = vi.hoisted(() => vi.fn());
+const MANAGER_CAPABILITIES = ['agent-registry.v2', 'ssh-enrollment.auto.v1'];
 
 vi.mock('../src/shared/api/client', () => ({ apiClient: { request: apiRequest, setToken: vi.fn(), setUnauthorizedHandler: vi.fn() } }));
 
@@ -24,7 +25,7 @@ describe('Add agent flow', () => {
     window.history.replaceState({}, '', '/agents/new');
     apiRequest.mockReset();
     apiRequest.mockImplementation(async (path: string, init?: RequestInit) => {
-      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: MANAGER_CAPABILITIES };
       if (path === '/api/v2/transport-profiles') return { profiles: [
         { id: 'system-tls', type: 'verified_tls', security_label: 'Verified TLS', warning: null },
         { id: 'lab-http', type: 'trusted_lan_http', security_label: 'Trusted-LAN HTTP', warning: 'trusted_lan_http_unencrypted' },
@@ -46,7 +47,7 @@ describe('Add agent flow', () => {
     await user.type(await screen.findByLabelText('Display name'), 'Alpha');
     await user.type(await screen.findByLabelText('Agent URL'), 'https://10.0.0.4:8765');
     await user.type(screen.getByLabelText('SSH user'), 'edaops');
-    await user.type(screen.getByLabelText('SSH host'), '10.0.0.4');
+    expect((screen.getByLabelText('SSH host') as HTMLInputElement).value).toBe('10.0.0.4');
     await user.click(screen.getByRole('button', { name: 'Start enrollment' }));
 
     expect(await screen.findByText('Waiting for CLI')).toBeTruthy();
@@ -57,7 +58,7 @@ describe('Add agent flow', () => {
 
   it('shows automatic progress without an unusable CLI instruction while SSH is running', async () => {
     apiRequest.mockImplementation(async (path: string, init?: RequestInit) => {
-      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: MANAGER_CAPABILITIES };
       if (path === '/api/v2/agent-enrollments' && init?.method === 'POST') return { ...job, state: 'running', cli: undefined };
       if (path === '/api/v2/agent-enrollments/job-opaque-1') return { ...job, state: 'running', cli: undefined };
       throw new Error(`Unexpected request: ${path}`);
@@ -66,11 +67,45 @@ describe('Add agent flow', () => {
     render(<App />);
     await user.type(await screen.findByLabelText('Agent URL'), 'https://10.0.0.4:8765');
     await user.type(screen.getByLabelText('SSH user'), 'edaops');
-    await user.type(screen.getByLabelText('SSH host'), '10.0.0.4');
+    expect((screen.getByLabelText('SSH host') as HTMLInputElement).value).toBe('10.0.0.4');
     await user.click(screen.getByRole('button', { name: 'Start enrollment' }));
 
     expect(await screen.findByText('Automatic SSH enrollment')).toBeTruthy();
     expect(screen.queryByText(/ic-env-guardctl agent enroll/)).toBeNull();
+  });
+
+  it('shows a stable failed phase and lets the user retry without cancelling a terminal job', async () => {
+    window.history.replaceState({}, '', '/agents/new?enrollment=job-opaque-1');
+    const failed = {
+      ...job,
+      state: 'failed',
+      last_error_code: 'ssh_auth_failed',
+      cli: undefined,
+      preview: {
+        phases: {
+          network: { status: 'success', code: null },
+          ssh: { status: 'failure', code: 'ssh_auth_failed' },
+          transport: { status: 'skipped', code: null },
+        },
+      },
+    };
+    apiRequest.mockImplementation(async (path: string) => {
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: MANAGER_CAPABILITIES };
+      if (path === '/api/v2/transport-profiles') return { profiles: [{ id: 'system-tls', type: 'verified_tls', security_label: 'Verified TLS', warning: null }] };
+      if (path === '/api/v2/agent-enrollments/job-opaque-1') return failed;
+      if (path.endsWith('/cancel')) throw new Error('terminal jobs must not be cancelled');
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText('ssh: failure (ssh_auth_failed)')).toBeTruthy();
+    expect(screen.getByRole('alert').textContent).toContain('ssh_auth_failed');
+    await user.click(screen.getByRole('button', { name: 'Retry enrollment' }));
+
+    await waitFor(() => expect(window.location.search).not.toContain('enrollment='));
+    expect(screen.getByRole('button', { name: 'Start enrollment' }).hasAttribute('disabled')).toBe(false);
+    expect(apiRequest).not.toHaveBeenCalledWith('/api/v2/agent-enrollments/job-opaque-1/cancel', expect.anything());
   });
 
   it('cancels and clears a prior job when a Step 1 field changes', async () => {
@@ -101,10 +136,24 @@ describe('Add agent flow', () => {
     expect((screen.getByLabelText('Legacy admin token') as HTMLInputElement).type).toBe('password');
   });
 
+  it('exposes only legacy recovery when the Manager advertises no SSH enrollment path', async () => {
+    apiRequest.mockImplementation(async (path: string) => {
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
+      if (path === '/api/v2/transport-profiles') return { profiles: [{ id: 'system-tls', type: 'verified_tls', security_label: 'Verified TLS', warning: null }] };
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    render(<App />);
+
+    expect(await screen.findByText(/SSH enrollment is unavailable/)).toBeTruthy();
+    expect(screen.queryByLabelText('SSH user')).toBeNull();
+    expect(screen.getByLabelText('Legacy admin token')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Start enrollment' })).toBeNull();
+  });
+
   it('rehydrates a discovery candidate from its opaque URL id after refresh', async () => {
     window.history.replaceState({}, '', '/agents/new?discoveryResult=result-opaque');
     apiRequest.mockImplementation(async (path: string) => {
-      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: MANAGER_CAPABILITIES };
       if (path === '/api/v2/discovery/results/result-opaque') return { result: { result_id: 'result-opaque', candidate_url: 'http://10.0.0.4:8765', ip: '10.0.0.4', port: 8765, transport_profile_id: 'eda-http', status: 'new', enrollment_status: 'enrollment_required' } };
       throw new Error(`Unexpected request: ${path}`);
     });
@@ -113,6 +162,20 @@ describe('Add agent flow', () => {
     await waitFor(() => expect((screen.getByLabelText('Agent URL') as HTMLInputElement).value).toBe('http://10.0.0.4:8765'));
     expect((screen.getByLabelText('SSH host') as HTMLInputElement).value).toBe('10.0.0.4');
     expect((screen.getByLabelText('SSH user') as HTMLInputElement).value).toBe('');
+  });
+
+  it('keeps a discovered trusted-LAN warning visible and blocks an unknown profile when metadata fails', async () => {
+    window.history.replaceState({}, '', '/agents/new?discoveryResult=result-opaque');
+    apiRequest.mockImplementation(async (path: string) => {
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: MANAGER_CAPABILITIES };
+      if (path === '/api/v2/discovery/results/result-opaque') return { result: { result_id: 'result-opaque', candidate_url: 'http://10.0.0.4:8765', ip: '10.0.0.4', port: 8765, transport_profile_id: 'eda-http', status: 'new', enrollment_status: 'enrollment_required' } };
+      if (path === '/api/v2/transport-profiles') throw new Error('profile metadata unavailable');
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    render(<App />);
+
+    expect(await screen.findByText(/Trusted-LAN connection is unencrypted/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Start enrollment' }).hasAttribute('disabled')).toBe(true);
   });
 
   it('renders the verified identity preview and defaults an omitted display name from the Agent', async () => {
@@ -132,7 +195,7 @@ describe('Add agent flow', () => {
       },
     };
     apiRequest.mockImplementation(async (path: string, init?: RequestInit) => {
-      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: MANAGER_CAPABILITIES };
       if (path === '/api/v2/agent-enrollments/job-opaque-1') return verified;
       if (path === '/api/v2/agents' && init?.method === 'POST') return { agent: { agent_id: 'alpha' } };
       if (path.endsWith('/cancel')) throw new Error('verified jobs must not be cancelled');
@@ -155,7 +218,7 @@ describe('Add agent flow', () => {
 
   it.each(['success', 'failure'])('clears legacy token state and removes its password input after %s', async (outcome) => {
     apiRequest.mockImplementation(async (path: string) => {
-      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: MANAGER_CAPABILITIES };
       if (path === '/api/v2/agents/validate') {
         if (outcome === 'failure') throw new Error('validation failed');
         return { ...job, state: 'verified' };
@@ -167,11 +230,11 @@ describe('Add agent flow', () => {
     render(<App />);
     await user.type(await screen.findByLabelText('Display name'), 'Alpha');
     await user.type(screen.getByLabelText('Agent URL'), 'https://10.0.0.4:8765');
-    await user.type(screen.getByLabelText('SSH user'), 'edaops');
-    await user.type(screen.getByLabelText('SSH host'), '10.0.0.4');
     await user.click(screen.getByRole('button', { name: 'Use legacy token instead' }));
+    expect(screen.queryByLabelText('SSH user')).toBeNull();
     await user.type(screen.getByLabelText('Legacy admin token'), 'legacy-secret-never-rendered');
     await user.click(screen.getByRole('button', { name: 'Validate legacy token' }));
+    await waitFor(() => expect(apiRequest).toHaveBeenCalledWith('/api/v2/agents/validate', expect.objectContaining({ method: 'POST', body: JSON.stringify({ base_url: 'https://10.0.0.4:8765', transport_profile_id: 'system-tls', token: 'legacy-secret-never-rendered' }) })));
     await waitFor(() => expect(screen.queryByLabelText('Legacy admin token')).toBeNull());
     expect(document.body.textContent).not.toContain('legacy-secret-never-rendered');
   });
@@ -181,7 +244,7 @@ describe('Add agent flow', () => {
     let resolveJob: (value: EnrollmentJob) => void = () => undefined;
     const delayedJob = new Promise<EnrollmentJob>((resolve) => { resolveJob = resolve; });
     apiRequest.mockImplementation(async (path: string, init?: RequestInit) => {
-      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: MANAGER_CAPABILITIES };
       if (path === '/api/v2/agent-enrollments/job-opaque-1') return delayedJob;
       if (path === '/api/v2/agents' && init?.method === 'POST') return { agent: { agent_id: 'alpha' } };
       if (path.endsWith('/cancel')) throw new Error('name edits must not cancel a resolving job');
@@ -201,7 +264,7 @@ describe('Add agent flow', () => {
   it('cancels and clears a verified job when a target field changes', async () => {
     window.history.replaceState({}, '', '/agents/new?enrollment=job-opaque-1');
     apiRequest.mockImplementation(async (path: string) => {
-      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: MANAGER_CAPABILITIES };
       if (path === '/api/v2/agent-enrollments/job-opaque-1') return { ...job, state: 'verified' };
       if (path.endsWith('/cancel')) return { ...job, state: 'cancelled' };
       throw new Error(`Unexpected request: ${path}`);

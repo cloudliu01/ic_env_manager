@@ -53,7 +53,7 @@ export function validateLegacyAgent(input: Pick<EnrollmentInput, 'base_url' | 't
   return apiClient.request<EnrollmentJob>('/api/v2/agents/validate', { method: 'POST', body: JSON.stringify(input) });
 }
 
-export function updateAgent(agentId: string, body: Partial<Pick<Agent, 'display_name' | 'enabled'>> & { base_url?: string; transport_profile_id?: string }) {
+export function updateAgent(agentId: string, body: Partial<Pick<Agent, 'display_name' | 'enabled'>> & { base_url?: string; transport_profile_id?: string; legacy_token?: string }) {
   return apiClient.request<{ agent: Agent }>(`/api/v2/agents/${encodeURIComponent(agentId)}`, { method: 'PUT', body: JSON.stringify(body) });
 }
 

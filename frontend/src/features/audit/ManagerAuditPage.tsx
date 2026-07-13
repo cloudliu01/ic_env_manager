@@ -28,7 +28,7 @@ export function ManagerAuditPage() {
     <div className="fleet-filters" aria-label="Control-plane audit filters">
       <label>Agent filter<input value={filters.agentId ?? ''} onChange={updateFilter('agent_id')} /></label>
       <label>Operation filter<input value={filters.operation ?? ''} onChange={updateFilter('operation')} /></label>
-      <label>Result filter<select value={filters.result ?? ''} onChange={updateFilter('result')}><option value="">All results</option><option value="success">Success</option><option value="failed">Failed</option></select></label>
+      <label>Result filter<select value={filters.result ?? ''} onChange={updateFilter('result')}><option value="">All results</option><option value="pending">Pending</option><option value="success">Success</option><option value="failed">Failed</option><option value="failure">Failure</option><option value="denied">Denied</option></select></label>
       <label>Correlation ID filter<input value={filters.correlationId ?? ''} onChange={updateFilter('correlation_id')} /></label>
     </div>
     {audit.isPending ? <p role="status">Loading control-plane audit events…</p> : null}
@@ -38,7 +38,7 @@ export function ManagerAuditPage() {
       <thead><tr><th>Time</th><th>Operation</th><th>Agent</th><th>Target</th><th>Result</th><th>Dispatch</th><th>Upstream</th><th>Correlation ID</th></tr></thead>
       <tbody>{audit.data.events.map((event) => <tr key={event.id}>
         <td>{event.timestamp}</td><td>{event.operation}</td>
-        <td>{event.agent_id ? <Link to={`/agents/${encodeURIComponent(event.agent_id)}/audit`}>{event.agent_id}</Link> : '—'}</td>
+        <td>{event.agent_id ? <Link to={`/audit?agent_id=${encodeURIComponent(event.agent_id)}`}>{event.agent_id}</Link> : '—'}</td>
         <td>{event.target ?? '—'}</td><td>{event.result}</td><td>{event.dispatch_state ?? '—'}</td>
         <td>{event.upstream_status ?? '—'}</td><td>{event.correlation_id}</td>
       </tr>)}</tbody>

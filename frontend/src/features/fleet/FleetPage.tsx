@@ -38,6 +38,7 @@ export function FleetPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const filters: AgentFilters = { query: searchParams.get('query') || undefined, connection_status: searchParams.get('connection_status') || undefined, workload_status: searchParams.get('workload_status') || undefined, capability: searchParams.get('capability') || undefined, problem: searchParams.get('problem') || undefined };
   const direction = searchParams.get('order') === 'desc' ? 'descending' : 'ascending';
+  const sortByName = searchParams.get('sort') === 'agent';
   const [removeTarget, setRemoveTarget] = useState<Agent | null>(null);
   const [operationMessage, setOperationMessage] = useState('');
   const [operationError, setOperationError] = useState('');
@@ -85,7 +86,7 @@ export function FleetPage() {
     {fleet.isError ? <p role="alert">Fleet data could not be loaded.</p> : null}
     {fleet.data ? <p role="status" aria-live="polite" className="sr-only">{displayed.length} Agent{displayed.length === 1 ? '' : 's'} displayed.</p> : null}
     {fleet.data && displayed.length === 0 ? <div className="empty-state">No Agents match these filters.</div> : null}
-    {fleet.data && displayed.length > 0 ? compact ? <FleetCardList agents={displayed} onProbe={(agent) => void runAction(() => probeAgent(agent.agent_id), `${agent.display_name} refreshed.`)} onToggle={(agent) => void runAction(() => updateAgent(agent.agent_id, { enabled: !agent.enabled }), `${agent.display_name} ${agent.enabled ? 'disabled' : 'enabled'}.`)} onRemove={setRemoveTarget} /> : <FleetTable agents={displayed} direction={direction} onDirectionChange={setDirection} onProbe={(agent) => void runAction(() => probeAgent(agent.agent_id), `${agent.display_name} refreshed.`)} onToggle={(agent) => void runAction(() => updateAgent(agent.agent_id, { enabled: !agent.enabled }), `${agent.display_name} ${agent.enabled ? 'disabled' : 'enabled'}.`)} onRemove={setRemoveTarget} /> : null}
+    {fleet.data && displayed.length > 0 ? compact ? <FleetCardList agents={displayed} /> : <FleetTable agents={displayed} direction={direction} sortByName={sortByName} onDirectionChange={setDirection} onProbe={(agent) => void runAction(() => probeAgent(agent.agent_id), `${agent.display_name} refreshed.`)} onToggle={(agent) => void runAction(() => updateAgent(agent.agent_id, { enabled: !agent.enabled }), `${agent.display_name} ${agent.enabled ? 'disabled' : 'enabled'}.`)} onRemove={setRemoveTarget} /> : null}
     <p><Link to="/agents/new">Add agent</Link> · <Link to="/discovery">Discover agents</Link></p>
     {removeTarget ? <RemoveAgentDialog agentId={removeTarget.agent_id} onClose={() => setRemoveTarget(null)} onRemoved={() => { setRemoveTarget(null); setOperationMessage(`${removeTarget.display_name} removed.`); void refreshFleet(); }} /> : null}
   </section>;

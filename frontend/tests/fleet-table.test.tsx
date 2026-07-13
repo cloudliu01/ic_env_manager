@@ -30,12 +30,12 @@ const agents = [
   {
     agent_id: 'agent-a', display_name: 'Alpha', endpoint: 'http://10.0.0.4:8765', enabled: true,
     connection_status: 'degraded', workload_status: 'critical', transport_warning: 'trusted_lan_http_unencrypted',
-    agent_version: '2.4.0', observed_at: '2026-07-12T08:00:00Z', last_error_code: 'agent_network_error',
+    api_version: '2', agent_version: '2.4.0', observed_at: '2026-07-12T08:00:00Z', last_error_code: 'agent_network_error',
     capabilities: ['summary.v2'], summary: { observations: { total: 4, critical: 1, warning: 0, stale: 0 }, services: { total: 3, running: 1, unhealthy: 2 } },
   },
   {
     agent_id: 'agent-b', display_name: 'Beta', endpoint: 'https://10.0.0.5:8765', enabled: true,
-    connection_status: 'ready', workload_status: 'healthy', agent_version: '2.3.1', observed_at: '2026-07-12T08:01:00Z',
+    connection_status: 'ready', workload_status: 'healthy', api_version: '2', agent_version: '2.3.1', observed_at: '2026-07-12T08:01:00Z',
     capabilities: ['summary.v2'], summary: { observations: { total: 1, critical: 0, warning: 0, stale: 0 }, services: { total: 2, running: 2, unhealthy: 0 } },
   },
 ];
@@ -60,7 +60,8 @@ describe('Fleet table', () => {
     render(<App />);
 
     const table = await screen.findByRole('table', { name: 'Fleet agents' });
-    expect(within(table).getByRole('columnheader', { name: /Agent/ }).getAttribute('aria-sort')).toBe('ascending');
+    expect(within(table).getByRole('columnheader', { name: /Agent/ }).getAttribute('aria-sort')).toBeNull();
+    expect(within(table).getByRole('columnheader', { name: 'Health' }).getAttribute('aria-sort')).toBe('ascending');
     expect(within(table).getByRole('columnheader', { name: 'Health' })).toBeTruthy();
     expect(within(table).getByRole('columnheader', { name: 'Transport' })).toBeTruthy();
     expect(within(table).getByRole('columnheader', { name: 'Version' })).toBeTruthy();
@@ -70,7 +71,9 @@ describe('Fleet table', () => {
 
     const row = within(table).getByRole('row', { name: /Alpha/ });
     expect(within(row).getByText('Degraded')).toBeTruthy();
-    expect(within(row).getByText('4 total · 1 critical')).toBeTruthy();
+    expect(within(row).getByText('4 total · 1 critical · 0 warning · 0 stale')).toBeTruthy();
+    expect(within(row).getByText('1 running / 3 total · 2 unhealthy')).toBeTruthy();
+    expect(within(row).getByText((_content, element) => element?.tagName === 'TD' && element.textContent === 'Agent 2.4.0API 2')).toBeTruthy();
     expect(within(row).getByText('Unencrypted')).toBeTruthy();
     expect(within(row).getByText('Last error: agent_network_error')).toBeTruthy();
     expect(within(row).getByLabelText('Degraded status').querySelector('svg')).toBeTruthy();
@@ -109,14 +112,13 @@ describe('Fleet table', () => {
 
     await user.click(screen.getByRole('button', { name: 'Actions for Alpha' }));
     expect(screen.getByRole('menu')).toBeTruthy();
-    expect(screen.getByRole('menuitem', { name: 'Probe Alpha' })).toBeTruthy();
     expect(screen.getByRole('menuitem', { name: 'Disable Alpha' })).toBeTruthy();
     expect(screen.getByRole('menuitem', { name: 'Edit Alpha' }).getAttribute('href')).toBe('/agents/agent-a/settings');
     expect(screen.getByRole('menuitem', { name: 'Remove Alpha' })).toBeTruthy();
 
     await user.click(within(screen.getByRole('columnheader', { name: /Agent/ })).getByRole('button'));
     expect(window.location.search).toContain('sort=agent');
-    expect(window.location.search).toContain('order=desc');
+    expect(window.location.search).toContain('order=asc');
   });
 
   it('probes, disables, and removes a selected Agent through real APIs', async () => {
@@ -124,8 +126,7 @@ describe('Fleet table', () => {
     render(<App />);
     await screen.findByRole('table', { name: 'Fleet agents' });
 
-    await user.click(screen.getByRole('button', { name: 'Actions for Alpha' }));
-    await user.click(screen.getByRole('menuitem', { name: 'Probe Alpha' }));
+    await user.click(screen.getByRole('button', { name: 'Probe Alpha' }));
     await waitFor(() => expect(apiRequest).toHaveBeenCalledWith('/api/v2/agents/agent-a/probe', expect.objectContaining({ method: 'POST' })));
 
     await user.click(screen.getByRole('button', { name: 'Actions for Alpha' }));
@@ -152,6 +153,18 @@ describe('Fleet table', () => {
     expect(window.location.search).toContain('problem=has-problems');
     expect(screen.getByText('Alpha')).toBeTruthy();
     expect(screen.queryByText('Beta')).toBeNull();
+  });
+
+  it('does not present a missing summary as zero workload data', async () => {
+    apiRequest.mockImplementation(async (path: string) => {
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['fleet.v2'] };
+      if (path === '/api/v2/fleet/overview') return { collected_at: '2026-07-12T08:02:00Z', agents: [{ ...agents[0], summary: undefined }] };
+      return { agents: [] };
+    });
+    render(<App />);
+    const row = within(await screen.findByRole('table', { name: 'Fleet agents' })).getByRole('row', { name: /Alpha/ });
+    expect(within(row).getAllByText('No summary')).toHaveLength(2);
+    expect(within(row).queryByText(/0 total/)).toBeNull();
   });
 
   it('refreshes every enabled Agent without one failure blocking the rest', async () => {
@@ -185,6 +198,8 @@ describe('Fleet table', () => {
       expect(await screen.findByRole('list', { name: 'Fleet agents' })).toBeTruthy();
       expect(screen.queryByRole('table')).toBeNull();
       expect(screen.getByRole('link', { name: 'Open Alpha' })).toBeTruthy();
+      expect(screen.queryByRole('button', { name: /Probe|Disable|Remove/ })).toBeNull();
+      expect(screen.queryByRole('link', { name: 'Edit' })).toBeNull();
     } else {
       expect(await screen.findByRole('table', { name: 'Fleet agents' })).toBeTruthy();
       expect(screen.queryByRole('list', { name: 'Fleet agents' })).toBeNull();

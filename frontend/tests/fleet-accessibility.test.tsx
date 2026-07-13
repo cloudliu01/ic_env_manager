@@ -69,7 +69,7 @@ function storageText(storage: Storage) {
 
 function installWorkflowApi(removeFails = false) {
   apiRequest.mockImplementation(async (path: string, init?: RequestInit) => {
-    if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['fleet.v2', 'agent-registry.v2', 'discovery.v2'] };
+    if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['fleet.v2', 'agent-registry.v2', 'discovery.v2', 'ssh-enrollment.auto.v1', 'ssh-enrollment.cli.v1'] };
     if (path === '/api/v2/fleet/overview') return { collected_at: '2026-07-12T00:00:00Z', agents: [fleetAgent] };
     if (path === '/api/v2/agents/alpha' && !init?.method) return { agent: fleetAgent };
     if (path === '/api/v2/agents/alpha' && init?.method === 'DELETE') {
@@ -226,7 +226,7 @@ describe('Fleet accessibility workflow', () => {
       return originalMount.call(this);
     });
     apiRequest.mockImplementation(async (path: string, init?: RequestInit) => {
-      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2', 'ssh-enrollment.cli.v1'] };
       if (path === '/api/v2/agent-enrollments' && init?.method === 'POST') return {
         enrollment_id: 'job-opaque', state: 'awaiting_cli', pending_token: secret,
       };
@@ -242,7 +242,7 @@ describe('Fleet accessibility workflow', () => {
     await user.type(await screen.findByLabelText('Display name'), 'Alpha');
     await user.type(screen.getByLabelText('Agent URL'), 'https://10.0.0.4:8765');
     await user.type(screen.getByLabelText('SSH user'), 'edaops');
-    await user.type(screen.getByLabelText('SSH host'), '10.0.0.4');
+    expect((screen.getByLabelText('SSH host') as HTMLInputElement).value).toBe('10.0.0.4');
     await user.click(screen.getByRole('button', { name: 'Start enrollment' }));
     await screen.findByText('Waiting for CLI');
 

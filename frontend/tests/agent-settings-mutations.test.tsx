@@ -41,6 +41,54 @@ describe('Agent Settings mutations', () => {
     expect(screen.getByRole('option', { name: 'Verified TLS — system-tls' })).toBeTruthy();
   });
 
+  it('keeps the registered trusted-LAN warning visible when profile metadata is unavailable', async () => {
+    apiRequest.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
+      if (path === '/api/v2/transport-profiles') throw new Error('profile metadata unavailable');
+      if (path === '/api/v2/agents/alpha' && !init?.method) return { agent: { ...agent, endpoint: 'http://10.0.0.4:8765', transport_profile_id: 'lab-http', transport_warning: 'trusted_lan_http_unencrypted' } };
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText('Trusted-LAN connection is unencrypted.')).toBeTruthy();
+    const url = screen.getByLabelText('Agent URL');
+    await user.type(url, '/changed');
+    expect(screen.getByText('Trusted-LAN connection is unencrypted.')).toBeTruthy();
+  });
+
+  it('requests a one-time legacy token when an endpoint edit requires revalidation', async () => {
+    let updates = 0;
+    apiRequest.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
+      if (path === '/api/v2/transport-profiles') return { profiles: [{ id: 'system-tls', type: 'verified_tls', security_label: 'Verified TLS', warning: null }] };
+      if (path === '/api/v2/agents/alpha' && !init?.method) return { agent: { ...agent, instance_id: null } };
+      if (path === '/api/v2/agents/alpha' && init?.method === 'PUT') {
+        updates += 1;
+        if (updates === 1) throw Object.assign(new Error('revalidation required'), { code: 'legacy_revalidation_required' });
+        return { agent };
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    const url = await screen.findByLabelText('Agent URL');
+    await user.clear(url);
+    await user.type(url, 'https://10.0.0.5:8765');
+    await user.click(screen.getByLabelText('I verified this is the same Agent identity.'));
+    await user.click(screen.getByRole('button', { name: 'Save changes' }));
+
+    const token = await screen.findByLabelText('Legacy admin token');
+    await user.type(token, 'replacement-token');
+    await user.click(screen.getByRole('button', { name: 'Save changes' }));
+
+    await waitFor(() => expect(apiRequest).toHaveBeenCalledWith('/api/v2/agents/alpha', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ display_name: 'Alpha', enabled: true, base_url: 'https://10.0.0.5:8765', transport_profile_id: 'system-tls', legacy_token: 'replacement-token' }),
+    })));
+    expect((screen.getByLabelText('Legacy admin token') as HTMLInputElement).value).toBe('');
+  });
+
   it('keeps an agent_in_use removal dialog actionable', async () => {
     const user = userEvent.setup();
     render(<App />);

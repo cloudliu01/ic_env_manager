@@ -79,7 +79,7 @@ export default function ManagerEntry({ capabilities }: { capabilities: string[] 
   return <Suspense fallback={<main><p role="status">Loading Manager feature…</p></main>}><Routes>
     <Route element={<ManagerLayout actor={actor} capabilities={capabilities} onSignOut={() => void signOut()} />}>
       <Route path="/fleet" element={gate('fleet.v2', <FleetPage />)} />
-      <Route path="/agents/new" element={gate('agent-registry.v2', <AddAgentPage />)} />
+      <Route path="/agents/new" element={gate('agent-registry.v2', <AddAgentPage sshEnrollmentAvailable={capabilities.some((capability) => ['ssh-enrollment.auto.v1', 'ssh-enrollment.cli.v1', 'ssh-enrollment.service-key.v1'].includes(capability))} />)} />
       <Route path="/discovery" element={gate('discovery.v2', <DiscoveryPage />)} />
       <Route path="/monitoring" element={gate('fleet.v2', <MonitoringPage />)} />
       <Route path="/audit" element={gate('fleet.v2', <ManagerAuditPage />)} />

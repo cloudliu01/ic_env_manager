@@ -5,7 +5,10 @@ from types import SimpleNamespace
 import pytest
 
 from ic_env_guard.config.models import AppConfig, AuthConfig, ControlPlaneConfig
-from ic_env_guard.enrollment.agent_client import EnrollmentValidationError
+from ic_env_guard.enrollment.agent_client import (
+    EnrollmentValidation,
+    EnrollmentValidationError,
+)
 from ic_env_guard.enrollment.credential_store import CredentialStoreError
 from ic_env_guard.enrollment.jobs import (
     EnrollmentConflict,
@@ -266,3 +269,63 @@ async def test_local_edit_uses_revision_cas_and_resets_status(tmp_path):
     assert status is not None
     assert status.connection_status == "disabled"
     assert status.target_revision == 2
+
+
+@pytest.mark.integration
+async def test_legacy_target_edit_requires_and_rotates_validated_token(tmp_path):
+    container = manager(tmp_path)
+    with container.credential_store.lifecycle_lease():
+        old_reference = container.credential_store.put(b"old-token")
+    record = AgentRecord(
+        agent_id="legacy",
+        instance_id=None,
+        display_name="Legacy",
+        normalized_endpoint="https://10.0.0.11:8765",
+        credential_ref=old_reference,
+        remote_credential_id=None,
+        transport_profile_id="system-tls",
+        enrollment_method=EnrollmentMethod.LEGACY_ADMIN_TOKEN,
+        enabled=True,
+        source="manual",
+        revision=1,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    container.registry_repository.create(record)
+    orchestrator = container.enrollment_orchestrator
+    orchestrator._clock = lambda: NOW
+
+    with pytest.raises(EnrollmentConflict, match="legacy_revalidation_required"):
+        await orchestrator.update_agent(
+            "legacy", base_url="https://10.0.0.12:8765"
+        )
+
+    class Client:
+        def prepare(self, endpoint, profile):
+            assert profile == "system-tls"
+            return SimpleNamespace(normalized_endpoint=endpoint)
+
+        async def validate_legacy(self, target, token):
+            assert token == b"replacement-token"
+            return EnrollmentValidation(
+                normalized_endpoint=target.normalized_endpoint,
+                api_version="1",
+                agent_version="1.2.3",
+                capabilities=("terminal",),
+                instance_id=None,
+                summary=None,
+                readiness_warning="legacy_readiness_unavailable",
+            )
+
+    orchestrator.agent_client = Client()
+    updated = await orchestrator.update_agent(
+        "legacy",
+        base_url="https://10.0.0.12:8765",
+        legacy_token="replacement-token",
+    )
+
+    assert updated.normalized_endpoint == "https://10.0.0.12:8765"
+    assert updated.credential_ref != old_reference
+    assert container.credential_store.read(updated.credential_ref) == b"replacement-token"
+    with pytest.raises(CredentialStoreError):
+        container.credential_store.read(old_reference)

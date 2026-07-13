@@ -537,6 +537,59 @@ def test_public_projection_folds_internal_states_and_exposes_only_safe_error(
     assert "recovery_revision" not in serialized
 
 
+@pytest.mark.parametrize(
+    ("error_code", "failure_phase"),
+    (
+        ("agent_network_error", "network"),
+        ("ssh_auth_failed", "ssh"),
+        ("transport_profile_invalid", "transport"),
+        ("agent_auth_error", "authentication"),
+        ("agent_protocol_error", "protocol"),
+        ("agent_identity_mismatch", "identity"),
+        ("missing_capabilities", "capabilities"),
+        ("agent_readiness_unhealthy", "readiness"),
+    ),
+)
+def test_public_projection_marks_the_stable_failure_phase(
+    setup, error_code, failure_phase
+):
+    jobs, _repository, _engine = setup
+    pending = jobs.create(ssh_request(), now=NOW)
+    failed = replace(
+        pending,
+        state=EnrollmentState.FAILED,
+        last_error_code=error_code,
+    )
+
+    result = EnrollmentPublicResult(failed).to_public_dict()
+    phases = result["preview"]["phases"]
+    failure_index = list(phases).index(failure_phase)
+
+    assert phases[failure_phase] == {"status": "failure", "code": error_code}
+    assert all(
+        phase["status"] == "success"
+        for phase in list(phases.values())[:failure_index]
+    )
+    assert all(
+        phase["status"] == "skipped"
+        for phase in list(phases.values())[failure_index + 1 :]
+    )
+
+
+def test_public_projection_exposes_real_in_progress_phase(setup):
+    jobs, _repository, _engine = setup
+    running = replace(
+        jobs.create(ssh_request(), now=NOW),
+        state=EnrollmentState.RUNNING,
+    )
+
+    phases = EnrollmentPublicResult(running).to_public_dict()["preview"]["phases"]
+
+    assert phases["network"]["status"] == "success"
+    assert phases["ssh"]["status"] == "pending"
+    assert phases["transport"]["status"] == "pending"
+
+
 def test_journal_serialization_contains_no_secret_shaped_fields(setup):
     jobs, repository, _engine = setup
     job = jobs.create(ssh_request(), now=NOW)
