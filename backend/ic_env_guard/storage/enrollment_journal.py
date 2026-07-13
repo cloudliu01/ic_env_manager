@@ -628,6 +628,100 @@ class EnrollmentJournalRepository(_SQLiteRepository):
         except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
             raise RegistryError("enrollment journal storage is unavailable") from exc
 
+    def rearm_expired_local(
+        self,
+        enrollment_id: str,
+        *,
+        normalized_endpoint: str,
+        transport_profile_id: str,
+        display_name: str,
+        now: datetime,
+        expires_at: datetime,
+    ) -> EnrollmentJob:
+        try:
+            with self._write() as connection:
+                row = connection.execute(
+                    f"SELECT {_COLUMNS} FROM agent_enrollment_jobs "
+                    "WHERE enrollment_id=?",
+                    (enrollment_id,),
+                ).fetchone()
+                if row is None:
+                    raise RegistryConflict("agent_enrollment_not_found")
+                current = _job(row)
+                if current.enrollment_method is not EnrollmentMethod.LOCAL_SOCKET:
+                    raise RegistryConflict("agent_enrollment_conflict")
+                if (
+                    current.state
+                    not in {
+                        EnrollmentState.CANCELLED,
+                        EnrollmentState.EXPIRED,
+                        EnrollmentState.FAILED,
+                    }
+                    or now < current.expires_at
+                    or current.credential_temp_ref is not None
+                ):
+                    raise RegistryConflict("local_bootstrap_retry_pending")
+                rearmed = replace(
+                    current,
+                    state=EnrollmentState.PENDING,
+                    normalized_endpoint=normalized_endpoint,
+                    transport_profile_id=transport_profile_id,
+                    discovery_result_id=None,
+                    replace_agent_id=None,
+                    requested_display_name=display_name,
+                    ssh_user=None,
+                    ssh_host=None,
+                    ssh_port=None,
+                    remote_instance_id=None,
+                    remote_credential_id=None,
+                    credential_temp_ref=None,
+                    old_credential_ref=None,
+                    old_remote_credential_id=None,
+                    save_requested=False,
+                    expires_at=expires_at,
+                    last_error_code=None,
+                    created_at=now,
+                    updated_at=now,
+                    recovery_owner=None,
+                    recovery_lease_until=None,
+                    recovery_revision=current.recovery_revision + 1,
+                    validated_http_address=None,
+                    cli_resume_nonce=None,
+                    cli_peer_uid=None,
+                    cli_input_fingerprint=None,
+                    cli_pinned_address=None,
+                    cli_accept_receipt=None,
+                    old_normalized_endpoint=None,
+                    old_transport_profile_id=None,
+                    old_instance_id=None,
+                    old_registry_revision=None,
+                    old_enrollment_method=None,
+                    old_source=None,
+                    old_enabled=None,
+                    old_display_name=None,
+                )
+                _validate_job(rearmed)
+                assignments = ", ".join(
+                    f"{column.strip()}=?"
+                    for column in _COLUMNS.split(",")
+                    if column.strip() != "enrollment_id"
+                )
+                values = self._values(rearmed)
+                cursor = connection.execute(
+                    f"UPDATE agent_enrollment_jobs SET {assignments} "
+                    "WHERE enrollment_id=? AND enrollment_method='local_socket' "
+                    "AND state IN ('cancelled','expired','failed') AND expires_at<=? "
+                    "AND credential_temp_ref IS NULL",
+                    (*values[1:], enrollment_id, _format_time(now)),
+                )
+                if cursor.rowcount != 1:
+                    raise RevisionConflict("local bootstrap retry state changed")
+            return rearmed
+        except (RegistryConflict, RevisionConflict):
+            raise
+        except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise RegistryError("enrollment journal storage is unavailable") from exc
+
     def set_state(
         self,
         enrollment_id: str,

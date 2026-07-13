@@ -13,7 +13,11 @@ from shutil import rmtree
 import pytest
 
 from ic_env_guard.bootstrap.composition import build_agent_container
-from ic_env_guard.enrollment.protocol import EnrollmentRequest, parse_response
+from ic_env_guard.enrollment.protocol import (
+    LOCAL_RETRY_PROTOCOL,
+    EnrollmentRequest,
+    parse_response,
+)
 from ic_env_guard.enrollment.socket_server import (
     EnrollmentSocketServer,
     SocketSecurityError,
@@ -32,11 +36,16 @@ def socket_dir():
     rmtree(path, ignore_errors=True)
 
 
-def _request(enrollment_id: str = ENROLLMENT_ID) -> bytes:
+def _request(
+    enrollment_id: str = ENROLLMENT_ID,
+    *,
+    protocol: str = "manager-enrollment.v1",
+    manager_id: str = MANAGER_ID,
+) -> bytes:
     return (
         EnrollmentRequest(
-            protocol="manager-enrollment.v1",
-            manager_id=MANAGER_ID,
+            protocol=protocol,
+            manager_id=manager_id,
             enrollment_id=enrollment_id,
         )
         .model_dump_json()
@@ -111,6 +120,61 @@ def test_socket_mode_peer_authorization_replay_and_expiry(tmp_path, socket_dir):
     finally:
         server.stop()
     assert not path.exists()
+
+
+@pytest.mark.security
+def test_local_retry_protocol_replaces_only_same_manager_expired_or_revoked(
+    tmp_path, socket_dir
+):
+    container = build_agent_container(None, tmp_path / "state.db", tmp_path / "instance-id")
+    path = socket_dir / "enroll.sock"
+    server = EnrollmentSocketServer(
+        path, 0o600, container.instance_id, container.enrollment_service
+    )
+    server.start()
+    retry_request = _request(protocol=LOCAL_RETRY_PROTOCOL)
+    try:
+        first = parse_response(_exchange(path, _request()))
+        assert b'"enrollment_rejected"' in _exchange(path, retry_request)
+
+        other_manager = "11111111-1111-4111-8111-111111111111"
+        with container.database_engine.begin() as connection:
+            connection.exec_driver_sql(
+                "UPDATE manager_credentials SET pending_expires_at=? "
+                "WHERE enrollment_id=?",
+                ("2000-01-01T00:00:00.000000Z", ENROLLMENT_ID),
+            )
+        assert b'"enrollment_rejected"' in _exchange(path, _request())
+        assert b'"enrollment_rejected"' in _exchange(
+            path,
+            _request(
+                protocol=LOCAL_RETRY_PROTOCOL,
+                manager_id=other_manager,
+            ),
+        )
+
+        retried = parse_response(_exchange(path, retry_request))
+        assert retried.credential_id != first.credential_id
+        assert len(container.enrollment_service.repository.list_all()) == 1
+        activated = container.enrollment_service.activate(
+            str(retried.credential_id), ENROLLMENT_ID, retried.token
+        )
+        assert activated.state.value == "active"
+        assert b'"enrollment_rejected"' in _exchange(path, retry_request)
+
+        revoked = container.enrollment_service.revoke(
+            str(retried.credential_id),
+            actor_id="local-admin",
+            manager_id=None,
+        )
+        assert revoked.state.value == "revoked"
+        assert b'"enrollment_rejected"' in _exchange(path, _request())
+        after_revoke = parse_response(_exchange(path, retry_request))
+        assert after_revoke.credential_id != retried.credential_id
+        assert len(container.enrollment_service.repository.list_all()) == 1
+    finally:
+        server.stop()
+        container.database_engine.dispose()
 
 
 @pytest.mark.security

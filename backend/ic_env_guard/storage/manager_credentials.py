@@ -133,6 +133,61 @@ class SQLiteManagerCredentialRepository:
         except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
             raise CredentialStorageError("credential storage is unavailable") from exc
 
+    def reissue_expired(
+        self, record: ManagerCredential, *, now: datetime, max_pending: int
+    ) -> None:
+        try:
+            with self._write() as connection:
+                row = connection.execute(
+                    f"SELECT {_COLUMNS} FROM manager_credentials "
+                    "WHERE enrollment_id = ?",
+                    (record.enrollment_id,),
+                ).fetchone()
+                if row is None:
+                    raise DuplicateEnrollment("expired enrollment was not found")
+                existing = _record(row)
+                retryable = (
+                    existing.manager_id == record.manager_id
+                    and (
+                        existing.state is CredentialState.REVOKED
+                        or (
+                            existing.state is CredentialState.PENDING
+                            and existing.pending_expires_at is not None
+                            and now >= existing.pending_expires_at
+                        )
+                    )
+                )
+                if not retryable:
+                    raise DuplicateEnrollment("enrollment retry is not allowed")
+                pending = connection.execute(
+                    "SELECT COUNT(*) FROM manager_credentials "
+                    "WHERE state = 'pending' AND pending_expires_at > ?",
+                    (_format_time(now),),
+                ).fetchone()[0]
+                if pending >= max_pending:
+                    raise EnrollmentCapacityExceeded(
+                        "pending credential capacity exceeded"
+                    )
+                connection.execute(
+                    "UPDATE manager_credentials SET credential_id=?, manager_id=?, "
+                    "token_hash=?, state='pending', pending_expires_at=?, created_at=?, "
+                    "activated_at=NULL, last_used_at=NULL, revoked_at=NULL "
+                    "WHERE enrollment_id=? AND credential_id=?",
+                    (
+                        record.credential_id,
+                        record.manager_id,
+                        record.token_hash,
+                        _format_time(record.pending_expires_at),
+                        _format_time(record.created_at),
+                        record.enrollment_id,
+                        existing.credential_id,
+                    ),
+                )
+        except (DuplicateEnrollment, EnrollmentCapacityExceeded):
+            raise
+        except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise CredentialStorageError("credential storage is unavailable") from exc
+
     def get(self, credential_id: str) -> ManagerCredential | None:
         try:
             with self.engine.connect() as connection:

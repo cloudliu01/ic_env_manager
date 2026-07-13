@@ -183,6 +183,30 @@ class EnrollmentJobs:
                 raise EnrollmentConflict(code) from exc
             raise EnrollmentConflict("agent_enrollment_conflict") from exc
 
+    def rearm_expired_local(
+        self,
+        request: EnrollmentJobRequest,
+        *,
+        enrollment_id: str,
+        now: datetime,
+    ) -> EnrollmentJob:
+        if request.enrollment_method is not EnrollmentMethod.LOCAL_SOCKET:
+            raise EnrollmentConflict("agent_enrollment_conflict")
+        try:
+            return self.repository.rearm_expired_local(
+                enrollment_id,
+                normalized_endpoint=request.normalized_endpoint,
+                transport_profile_id=request.transport_profile_id,
+                display_name=request.display_name or "",
+                now=now,
+                expires_at=now + timedelta(seconds=self.pending_ttl_seconds),
+            )
+        except RegistryConflict as exc:
+            code = str(exc)
+            if code == "local_bootstrap_retry_pending":
+                raise EnrollmentConflict(code) from exc
+            raise EnrollmentConflict("agent_enrollment_conflict") from exc
+
     def get(self, enrollment_id: str, *, now: datetime | None = None) -> EnrollmentJob:
         job = self.repository.get(enrollment_id)
         if job is None:

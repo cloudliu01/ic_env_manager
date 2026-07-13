@@ -15,6 +15,7 @@ from pydantic import (
 from ic_env_guard.enrollment.models import valid_enrollment_id
 
 PROTOCOL = "manager-enrollment.v1"
+LOCAL_RETRY_PROTOCOL = "manager-local-enrollment-retry.v1"
 MAX_REQUEST_BYTES = 4096
 MAX_RESPONSE_BYTES = 8192
 MIN_PENDING_CREDENTIAL_TTL_SECONDS = 60
@@ -29,7 +30,9 @@ class EnrollmentProtocolError(ValueError):
 class EnrollmentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    protocol: Literal["manager-enrollment.v1"]
+    protocol: Literal[
+        "manager-enrollment.v1", "manager-local-enrollment-retry.v1"
+    ]
     manager_id: UUID
     enrollment_id: str = Field(min_length=1, max_length=128)
 

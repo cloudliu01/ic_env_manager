@@ -15,6 +15,7 @@ from ic_env_guard.enrollment.local_socket import (
     LocalEnrollmentSocketError,
 )
 from ic_env_guard.enrollment.protocol import (
+    LOCAL_RETRY_PROTOCOL,
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
     EnrollmentResponse,
@@ -239,6 +240,24 @@ async def test_local_client_exchanges_one_bounded_enrollment_message(socket_dir)
     assert result.expires_at == response.expires_at.replace(microsecond=0)
     assert result.validation_target is target
     assert "managed-secret" not in repr(result)
+
+
+@pytest.mark.security
+async def test_local_client_uses_distinct_protocol_only_for_expired_retry(socket_dir):
+    server, socket_path, received = _one_shot_server(
+        socket_dir, encode_response(_response())
+    )
+
+    await LocalEnrollmentSocketClient(socket_dir).issue(
+        socket_path=socket_path,
+        manager_id=MANAGER_ID,
+        enrollment_id="local-agent",
+        validation_target=_local_target(),
+        retry=True,
+    )
+    server.join(timeout=2)
+
+    assert parse_request(received[0]).protocol == LOCAL_RETRY_PROTOCOL
 
 
 @pytest.mark.security

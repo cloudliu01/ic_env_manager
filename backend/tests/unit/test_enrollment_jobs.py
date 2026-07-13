@@ -124,6 +124,28 @@ def test_local_socket_enrollment_has_no_ssh_fields(setup):
     assert (job.ssh_user, job.ssh_host, job.ssh_port) == (None, None, None)
 
 
+@pytest.mark.unit
+def test_local_retry_rearm_never_changes_terminal_ssh_job(setup):
+    jobs, repository, _engine = setup
+    ssh = jobs.create(ssh_request(), enrollment_id="fixed-ssh", now=NOW)
+    cancelled = jobs.cancel(ssh.enrollment_id, now=NOW + timedelta(seconds=1))
+    local_request = EnrollmentJobRequest(
+        normalized_endpoint="http://127.0.0.1:8766",
+        transport_profile_id="local-loopback-http",
+        display_name="Local development agent",
+        enrollment_method=EnrollmentMethod.LOCAL_SOCKET,
+    )
+
+    with pytest.raises(EnrollmentConflict, match="agent_enrollment_conflict"):
+        jobs.rearm_expired_local(
+            local_request,
+            enrollment_id=ssh.enrollment_id,
+            now=NOW + timedelta(seconds=601),
+        )
+
+    assert repository.get(ssh.enrollment_id) == cancelled
+
+
 def test_expired_job_releases_capacity_and_cannot_be_cancelled(setup):
     jobs, repository, _engine = setup
     first = jobs.create(ssh_request(), now=NOW)

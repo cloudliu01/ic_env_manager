@@ -10,6 +10,7 @@ from time import monotonic
 from pydantic import ValidationError
 
 from ic_env_guard.enrollment.protocol import (
+    LOCAL_RETRY_PROTOCOL,
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
     EnrollmentProtocolError,
@@ -47,11 +48,14 @@ class LocalEnrollmentSocketClient:
         manager_id: str,
         enrollment_id: str,
         validation_target: ValidatedTarget,
+        retry: bool = False,
     ) -> EnrollmentHelperResult:
         request = None
         try:
             request = EnrollmentRequest(
-                protocol="manager-enrollment.v1",
+                protocol=(
+                    LOCAL_RETRY_PROTOCOL if retry else "manager-enrollment.v1"
+                ),
                 manager_id=manager_id,
                 enrollment_id=enrollment_id,
             )

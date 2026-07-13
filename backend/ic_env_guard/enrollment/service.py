@@ -36,6 +36,25 @@ class EnrollmentService:
     def issue_pending(
         self, manager_id: str, enrollment_id: str, *, now: datetime | None = None
     ) -> IssuedCredential:
+        return self._issue_pending(
+            manager_id, enrollment_id, now=now, expired_retry=False
+        )
+
+    def reissue_expired_pending(
+        self, manager_id: str, enrollment_id: str, *, now: datetime | None = None
+    ) -> IssuedCredential:
+        return self._issue_pending(
+            manager_id, enrollment_id, now=now, expired_retry=True
+        )
+
+    def _issue_pending(
+        self,
+        manager_id: str,
+        enrollment_id: str,
+        *,
+        now: datetime | None,
+        expired_retry: bool,
+    ) -> IssuedCredential:
         current = aware_utc(now or datetime.now(UTC), "now")
         manager_id = canonical_uuid(manager_id, "manager_id")
         enrollment_id = valid_enrollment_id(enrollment_id)
@@ -54,7 +73,14 @@ class EnrollmentService:
             created_at=current,
         )
         try:
-            self.repository.issue(record, now=current, max_pending=self.max_pending)
+            if expired_retry:
+                self.repository.reissue_expired(
+                    record, now=current, max_pending=self.max_pending
+                )
+            else:
+                self.repository.issue(
+                    record, now=current, max_pending=self.max_pending
+                )
         except Exception:
             self._record_outcome(
                 operation=operation,

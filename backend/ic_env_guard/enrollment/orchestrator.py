@@ -44,6 +44,10 @@ from ic_env_guard.fleet.models import (
     RegistryError,
     RevisionConflict,
 )
+from ic_env_guard.fleet.registered_target import (
+    LOCAL_BOOTSTRAP_PROFILE_ID,
+    LOCAL_BOOTSTRAP_SOURCE,
+)
 from ic_env_guard.fleet.target_policy import ValidatedTarget
 from ic_env_guard.fleet.transport import TransportProfile
 from ic_env_guard.storage.enrollment_journal import EnrollmentJournalRepository
@@ -298,11 +302,15 @@ class EnrollmentOrchestrator:
         self._local_socket_client = local_socket_client
         self._local_bootstrap_enabled = local_bootstrap_enabled
         self._background_tasks: dict[str, asyncio.Task[None]] = {}
+        self._local_bootstrap_tasks: set[asyncio.Task[Any]] = set()
         self._closing = False
         self._validation_cache: dict[str, EnrollmentValidation] = {}
         self._recovery_owner = str(uuid4())
         max_operation = getattr(agent_client, "max_network_operation_seconds", 10.0)
         self._recovery_lease_seconds = max(3, math.ceil(float(max_operation) * 2))
+        self._local_compensation_timeout_seconds = max(
+            1.0, float(max_operation) + 1.0
+        )
 
     def _public_result(
         self,
@@ -429,7 +437,15 @@ class EnrollmentOrchestrator:
 
     async def shutdown(self) -> None:
         self._closing = True
-        tasks = tuple(self._background_tasks.values())
+        current = asyncio.current_task()
+        tasks = (
+            *tuple(self._background_tasks.values()),
+            *tuple(
+                task
+                for task in self._local_bootstrap_tasks
+                if task is not current
+            ),
+        )
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -495,6 +511,25 @@ class EnrollmentOrchestrator:
         request: LocalBootstrapRequest,
         context: AutoEnrollmentAuditContext,
     ) -> AgentRecord:
+        task = asyncio.current_task()
+        if task is None:
+            return await self._bootstrap_local(request, context)
+        self._local_bootstrap_tasks.add(task)
+        try:
+            try:
+                return await self._bootstrap_local(request, context)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise self._normalize_local_bootstrap_error(exc) from None
+        finally:
+            self._local_bootstrap_tasks.discard(task)
+
+    async def _bootstrap_local(
+        self,
+        request: LocalBootstrapRequest,
+        context: AutoEnrollmentAuditContext,
+    ) -> AgentRecord:
         if (
             not self._local_bootstrap_enabled
             or self._local_socket_client is None
@@ -504,19 +539,76 @@ class EnrollmentOrchestrator:
             raise EnrollmentValidationError(
                 "local_bootstrap_disabled", dispatch_state="not_dispatched"
             )
+        if request.transport_profile_id != LOCAL_BOOTSTRAP_PROFILE_ID:
+            raise EnrollmentValidationError(
+                "local_bootstrap_profile_invalid", dispatch_state="not_dispatched"
+            )
+        existing = self.registry.get(request.agent_id)
+        if existing is not None:
+            if (
+                existing.enrollment_method is EnrollmentMethod.LOCAL_SOCKET
+                and existing.source == LOCAL_BOOTSTRAP_SOURCE
+                and existing.normalized_endpoint == request.base_url
+                and existing.transport_profile_id == request.transport_profile_id
+                and existing.display_name == request.display_name
+            ):
+                return existing
+            raise EnrollmentValidationError(
+                "local_bootstrap_conflict", dispatch_state="not_dispatched"
+            )
         target = self.agent_client.prepare_local(
             request.base_url, request.transport_profile_id
         )
-        pending = self.jobs.create(
-            EnrollmentJobRequest(
-                normalized_endpoint=target.normalized_endpoint,
-                transport_profile_id=request.transport_profile_id,
-                display_name=request.display_name,
-                enrollment_method=EnrollmentMethod.LOCAL_SOCKET,
-            ),
-            enrollment_id=request.agent_id,
-            now=self._clock(),
+        job_request = EnrollmentJobRequest(
+            normalized_endpoint=target.normalized_endpoint,
+            transport_profile_id=request.transport_profile_id,
+            display_name=request.display_name,
+            enrollment_method=EnrollmentMethod.LOCAL_SOCKET,
         )
+        now = self._clock()
+        current = self.journal.get(request.agent_id)
+        retry = current is not None
+        if current is None:
+            pending = self.jobs.create(
+                job_request,
+                enrollment_id=request.agent_id,
+                now=now,
+            )
+        else:
+            current = self.jobs.get(request.agent_id, now=now)
+            if (
+                current.enrollment_method is not EnrollmentMethod.LOCAL_SOCKET
+                or current.normalized_endpoint != target.normalized_endpoint
+                or current.transport_profile_id != request.transport_profile_id
+                or current.requested_display_name != request.display_name
+            ):
+                raise EnrollmentValidationError(
+                    "local_bootstrap_conflict", dispatch_state="not_dispatched"
+                )
+            if (
+                current.state is EnrollmentState.CONSUMED
+                or not current.state.terminal
+                or now < current.expires_at
+            ):
+                raise EnrollmentValidationError(
+                    "local_bootstrap_retry_pending", dispatch_state="not_dispatched"
+                )
+            if current.credential_temp_ref is not None:
+                current = self._cleanup_terminal(current)
+            if current.credential_temp_ref is not None:
+                raise EnrollmentValidationError(
+                    "local_bootstrap_retry_pending", dispatch_state="not_dispatched"
+                )
+            try:
+                pending = self.jobs.rearm_expired_local(
+                    job_request,
+                    enrollment_id=request.agent_id,
+                    now=now,
+                )
+            except EnrollmentConflict as exc:
+                raise EnrollmentValidationError(
+                    exc.code, dispatch_state="not_dispatched"
+                ) from None
         running = self.journal.replace_if_state(
             replace(pending, state=EnrollmentState.RUNNING, updated_at=self._clock()),
             expected_state=EnrollmentState.PENDING,
@@ -541,7 +633,12 @@ class EnrollmentOrchestrator:
                 manager_id=running.manager_id,
                 enrollment_id=running.enrollment_id,
                 validation_target=target,
+                retry=retry,
             )
+            if self._closing:
+                raise EnrollmentValidationError(
+                    "local_bootstrap_cancelled", dispatch_state="unknown"
+                )
             await self._publish_managed_helper(
                 running,
                 helper,
@@ -552,12 +649,58 @@ class EnrollmentOrchestrator:
                 display_name=request.display_name,
                 input_fingerprint=job_input_fingerprint(running),
             )
-        except LocalEnrollmentSocketError as exc:
+        except asyncio.CancelledError:
             error = EnrollmentValidationError(
-                exc.code,
+                "local_bootstrap_cancelled", dispatch_state="unknown"
+            )
+            await self._finish_cancelled_local_bootstrap(
+                running.enrollment_id,
+                helper,
+                event_id,
+                error,
+            )
+            raise
+        except LocalEnrollmentSocketError as exc:
+            error = self._normalize_local_bootstrap_error(exc)
+            await self._finish_local_bootstrap_failure(
+                running.enrollment_id,
+                helper,
+                event_id,
+                error,
+            )
+            raise error from None
+        except Exception as exc:
+            error = self._normalize_local_bootstrap_error(exc)
+            await self._finish_local_bootstrap_failure(
+                running.enrollment_id,
+                helper,
+                event_id,
+                error,
+            )
+            raise error from None
+        self._record_auto_outcome(
+            event_id, result="success", dispatch_state="dispatched"
+        )
+        return record
+
+    @staticmethod
+    def _normalize_local_bootstrap_error(
+        error: Exception,
+    ) -> EnrollmentValidationError:
+        if isinstance(error, EnrollmentValidationError):
+            return EnrollmentValidationError(
+                error.code, dispatch_state=error.dispatch_state
+            )
+        if isinstance(error, MutationSagaError):
+            return EnrollmentValidationError(
+                error.code, dispatch_state=error.dispatch_state
+            )
+        if isinstance(error, LocalEnrollmentSocketError):
+            return EnrollmentValidationError(
+                error.code,
                 dispatch_state=(
                     "not_dispatched"
-                    if exc.code
+                    if error.code
                     in {
                         "local_socket_path_rejected",
                         "local_enrollment_request_invalid",
@@ -565,33 +708,64 @@ class EnrollmentOrchestrator:
                     else "unknown"
                 ),
             )
-            await self._compensate_local_bootstrap(
-                running.enrollment_id, helper, error.code
+        if isinstance(error, CredentialStoreError):
+            return EnrollmentValidationError(
+                "credential_store_unavailable", dispatch_state="unknown"
             )
+        if isinstance(error, RegistryError):
+            return EnrollmentValidationError(
+                "storage_unavailable", dispatch_state="unknown"
+            )
+        if isinstance(error, EnrollmentConflict):
+            return EnrollmentValidationError(
+                error.code, dispatch_state="not_dispatched"
+            )
+        return EnrollmentValidationError(
+            "local_bootstrap_failed", dispatch_state="unknown"
+        )
+
+    async def _finish_local_bootstrap_failure(
+        self,
+        enrollment_id: str,
+        helper: EnrollmentHelperResult | None,
+        event_id: Any,
+        error: EnrollmentValidationError,
+    ) -> None:
+        try:
+            try:
+                await self._compensate_local_bootstrap(
+                    enrollment_id, helper, error.code
+                )
+            except Exception:
+                pass
+        finally:
             self._record_auto_outcome(
                 event_id,
                 result="failure",
                 dispatch_state=error.dispatch_state,
                 failure_category=error.code,
             )
-            raise error from exc
-        except Exception as exc:
-            code = getattr(exc, "code", "storage_unavailable")
-            dispatch_state = getattr(exc, "dispatch_state", "unknown")
-            await self._compensate_local_bootstrap(
-                running.enrollment_id, helper, code
+
+    async def _finish_cancelled_local_bootstrap(
+        self,
+        enrollment_id: str,
+        helper: EnrollmentHelperResult | None,
+        event_id: Any,
+        error: EnrollmentValidationError,
+    ) -> None:
+        cleanup = asyncio.create_task(
+            self._finish_local_bootstrap_failure(
+                enrollment_id, helper, event_id, error
             )
-            self._record_auto_outcome(
-                event_id,
-                result="failure",
-                dispatch_state=dispatch_state,
-                failure_category=code,
-            )
-            raise
-        self._record_auto_outcome(
-            event_id, result="success", dispatch_state="dispatched"
         )
-        return record
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(cleanup),
+                timeout=self._local_compensation_timeout_seconds,
+            )
+        except BaseException:
+            cleanup.cancel()
+            await asyncio.gather(cleanup, return_exceptions=True)
 
     async def _compensate_local_bootstrap(
         self,
@@ -599,6 +773,15 @@ class EnrollmentOrchestrator:
         helper: EnrollmentHelperResult | None,
         code: str,
     ) -> None:
+        try:
+            current = self.journal.get(enrollment_id)
+        except RegistryError:
+            return
+        if current is not None and current.state in {
+            EnrollmentState.ACTIVATION_REQUESTED,
+            EnrollmentState.ACTIVATED,
+        }:
+            return
         if helper is not None and self.agent_client is not None:
             try:
                 await self.agent_client.revoke(
@@ -608,7 +791,6 @@ class EnrollmentOrchestrator:
                 )
             except Exception:
                 return
-        current = self.journal.get(enrollment_id)
         if current is None or current.state.terminal:
             return
         if current.recovery_owner == self._recovery_owner:
@@ -628,7 +810,10 @@ class EnrollmentOrchestrator:
             except (RegistryError, RevisionConflict):
                 return
         if current is not None and current.state.terminal:
-            self._cleanup_terminal(current)
+            try:
+                self._cleanup_terminal(current)
+            except Exception:
+                return
 
     async def consume_rotation(
         self, agent_id: str, enrollment_id: str
@@ -1921,7 +2106,13 @@ class EnrollmentOrchestrator:
                         else "unknown"
                     )
                     self._record_mutation_failure(current, code, dispatch_state)
-                    self._fail_claim(current, code)
+                    if (
+                        current.enrollment_method
+                        is EnrollmentMethod.LOCAL_SOCKET
+                    ):
+                        self._residual_claim(current, code)
+                    else:
+                        self._fail_claim(current, code)
                     return
             transitioned = self._transition_claimed(
                 current, EnrollmentState.ACTIVATED
