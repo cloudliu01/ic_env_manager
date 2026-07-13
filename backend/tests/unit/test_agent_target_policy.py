@@ -68,6 +68,30 @@ def test_local_socket_target_accepts_literal_loopback_only():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("endpoint", "stored_ip"),
+    (
+        ("http://127.0.0.2:8766", "127.0.0.2"),
+        ("http://[::1]:8766", "::1"),
+    ),
+)
+def test_local_socket_target_rejects_every_other_loopback(endpoint, stored_ip):
+    profile = TrustedLanHttpProfile(
+        id="local-loopback-http",
+        allowed_cidrs=["127.0.0.0/8", "::1/128"],
+    )
+    policy = AgentTargetPolicy(
+        allowed_agent_cidrs=["127.0.0.0/8", "::1/128"],
+        self_targets=[("127.0.0.1", 8765)],
+    )
+
+    with pytest.raises(TargetPolicyError, match="target_address_forbidden"):
+        policy.resolve_local_socket(endpoint, profile)
+    with pytest.raises(TargetPolicyError, match="target_address_forbidden"):
+        policy.revalidate_local_socket_target(endpoint, profile, stored_ip)
+
+
+@pytest.mark.unit
 def test_local_socket_target_requires_trusted_lan_http_profile():
     policy = AgentTargetPolicy(
         allowed_agent_cidrs=["127.0.0.0/8"],

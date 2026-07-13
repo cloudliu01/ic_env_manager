@@ -117,7 +117,7 @@ def _validate_job(job: EnrollmentJob) -> None:
         if any(value is not None for value in ssh_fields):
             raise RegistryInvariantError("non-SSH enrollment must not contain SSH fields")
     elif any(value is None for value in ssh_fields):
-        raise RegistryInvariantError("SSH enrollment requires all SSH fields")
+        raise RegistryInvariantError("managed enrollment requires all SSH fields")
     if job.ssh_port is not None and not 1 <= job.ssh_port <= 65535:
         raise RegistryInvariantError("SSH port is invalid")
     if job.save_requested and not job.requested_display_name:
@@ -177,7 +177,9 @@ def _validate_job(job: EnrollmentJob) -> None:
         if job.enrollment_method is not EnrollmentMethod.LEGACY_ADMIN_TOKEN and (
             job.remote_instance_id is None or job.remote_credential_id is None
         ):
-            raise RegistryInvariantError("SSH activation requires remote identity and credential")
+            raise RegistryInvariantError(
+                "managed enrollment activation requires remote identity and credential"
+            )
     if (job.recovery_owner is None) != (job.recovery_lease_until is None):
         raise RegistryInvariantError("recovery claim fields must be set together")
     if job.recovery_owner is not None:
@@ -262,7 +264,9 @@ def _validate_job(job: EnrollmentJob) -> None:
         if pinned is not None:
             raise RegistryInvariantError("legacy enrollment cannot store a pinned address")
     elif credential_pin_required != (pinned is not None):
-        raise RegistryInvariantError("SSH credential phase requires a pinned address")
+        raise RegistryInvariantError(
+            "managed enrollment credential phase requires a pinned address"
+        )
     for reference in (
         job.credential_temp_ref,
         job.old_credential_ref,

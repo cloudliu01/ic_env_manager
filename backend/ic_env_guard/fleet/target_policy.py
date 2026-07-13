@@ -16,6 +16,7 @@ Resolver = Callable[[str, int], Iterable[str]]
 METADATA_ADDRESSES = frozenset(
     {ip_address("169.254.169.254"), ip_address("fd00:ec2::254")}
 )
+LOCAL_BOOTSTRAP_ADDRESS = ip_address("127.0.0.1")
 
 
 class TargetPolicyError(Exception):
@@ -116,7 +117,7 @@ class AgentTargetPolicy:
             ) from None
         if (
             str(address) != stored_ip
-            or not address.is_loopback
+            or address != LOCAL_BOOTSTRAP_ADDRESS
             or address != endpoint_address
         ):
             raise TargetPolicyError(

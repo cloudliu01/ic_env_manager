@@ -162,7 +162,9 @@ def _validate_record(record: AgentRecord) -> None:
     if record.remote_credential_id is None and (
         record.enrollment_method is not EnrollmentMethod.LEGACY_ADMIN_TOKEN
     ):
-        raise RegistryInvariantError("SSH enrollment requires a remote credential ID")
+        raise RegistryInvariantError(
+            "managed enrollment requires a remote credential ID"
+        )
     _format_time(record.created_at)
     _format_time(record.updated_at)
 

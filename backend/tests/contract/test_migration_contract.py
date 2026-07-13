@@ -1047,6 +1047,23 @@ def test_local_socket_migration_preserves_schema_and_enforces_managed_identity(t
             ),
         )
         connection.execute(
+            "INSERT INTO agent_status VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "ssh-01",
+                1,
+                "ready",
+                "healthy",
+                None,
+                None,
+                "v2",
+                "0.1.0",
+                "[]",
+                "{}",
+                None,
+                "2026-07-13T12:00:00.000000Z",
+            ),
+        )
+        connection.execute(
             "INSERT INTO agent_removal_jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 "remove-ssh",
@@ -1084,6 +1101,9 @@ def test_local_socket_migration_preserves_schema_and_enforces_managed_identity(t
             table: tuple(connection.execute(f"PRAGMA foreign_key_list({table})"))
             for table in tables
         }
+        before_status_fks = tuple(
+            connection.execute("PRAGMA foreign_key_list(agent_status)")
+        )
         connection.commit()
     finally:
         connection.close()
@@ -1112,6 +1132,9 @@ def test_local_socket_migration_preserves_schema_and_enforces_managed_identity(t
             table: tuple(connection.execute(f"PRAGMA foreign_key_list({table})"))
             for table in tables
         } == before_fks
+        assert tuple(connection.execute("PRAGMA foreign_key_list(agent_status)")) == (
+            before_status_fks
+        )
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("SELECT agent_id FROM agents").fetchone() == ("ssh-01",)
         assert connection.execute(
@@ -1120,6 +1143,9 @@ def test_local_socket_migration_preserves_schema_and_enforces_managed_identity(t
         assert connection.execute(
             "SELECT removal_id FROM agent_removal_jobs"
         ).fetchone() == ("remove-ssh",)
+        assert connection.execute(
+            "SELECT agent_id FROM agent_status"
+        ).fetchone() == ("ssh-01",)
 
         connection.execute(
             "INSERT INTO agents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1274,5 +1300,111 @@ def test_local_socket_migration_preserves_schema_and_enforces_managed_identity(t
             "SELECT COUNT(*) FROM schema_versions "
             "WHERE version='0013_local_socket_bootstrap' AND result='success'"
         ).fetchone() == (1,)
+        connection.execute("DELETE FROM agents WHERE agent_id='ssh-01'")
+        assert connection.execute(
+            "SELECT agent_id FROM agent_status WHERE agent_id='ssh-01'"
+        ).fetchone() is None
+    finally:
+        connection.close()
+
+
+@pytest.mark.contract
+def test_local_socket_migration_rolls_back_foreign_key_failure(tmp_path):
+    db_path = tmp_path / "control-plane.db"
+    connection = sqlite3.connect(db_path)
+    try:
+        _run_control_plane_through(connection, "0012_rotation_agent_tombstone.py")
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute(
+            "INSERT INTO agents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "ssh-01",
+                "11111111-1111-4111-8111-111111111111",
+                "SSH Agent",
+                "https://ssh.example:8765",
+                "a" * 48,
+                "remote-ssh",
+                "system-tls",
+                "ssh_auto",
+                1,
+                "manual",
+                1,
+                "2026-07-13T12:00:00.000000Z",
+                "2026-07-13T12:00:00.000000Z",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO agent_status VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "orphan-agent",
+                1,
+                "unknown",
+                "unknown",
+                None,
+                None,
+                None,
+                None,
+                "[]",
+                "{}",
+                None,
+                "2026-07-13T12:00:00.000000Z",
+            ),
+        )
+        rebuilt_tables = (
+            "agents",
+            "agent_enrollment_jobs",
+            "agent_removal_jobs",
+        )
+        before_schema = {
+            table: connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()[0]
+            for table in rebuilt_tables
+        }
+        before_indexes = tuple(
+            connection.execute(
+                "SELECT name,tbl_name,sql FROM sqlite_master "
+                "WHERE type='index' AND sql IS NOT NULL ORDER BY name"
+            )
+        )
+        before_agents = connection.execute("SELECT * FROM agents").fetchall()
+        before_status = connection.execute("SELECT * FROM agent_status").fetchall()
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys=ON")
+        migration = _load_migration(
+            CONTROL_PLANE_MIGRATIONS / "0013_local_socket_bootstrap.py"
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="violated foreign keys"):
+            migration.upgrade(connection)
+
+        assert connection.execute("PRAGMA foreign_keys").fetchone() == (1,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (12,)
+        assert connection.execute(
+            "SELECT 1 FROM schema_versions "
+            "WHERE version='0013_local_socket_bootstrap'"
+        ).fetchone() is None
+        assert {
+            table: connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()[0]
+            for table in rebuilt_tables
+        } == before_schema
+        assert tuple(
+            connection.execute(
+                "SELECT name,tbl_name,sql FROM sqlite_master "
+                "WHERE type='index' AND sql IS NOT NULL ORDER BY name"
+            )
+        ) == before_indexes
+        assert connection.execute("SELECT * FROM agents").fetchall() == before_agents
+        assert connection.execute("SELECT * FROM agent_status").fetchall() == before_status
+        assert not {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE '%_next'"
+            )
+        }
     finally:
         connection.close()
