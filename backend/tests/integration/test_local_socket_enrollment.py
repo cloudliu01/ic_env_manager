@@ -298,6 +298,60 @@ async def test_local_socket_lost_response_retries_only_after_bounded_expiry(tmp_
 
 
 @pytest.mark.integration
+async def test_local_socket_pre_dispatch_failure_retries_when_agent_row_is_missing(
+    tmp_path,
+):
+    agent, manager, agent_config, _admin, runtime = _containers(tmp_path)
+    assert agent.enrollment_socket_server is not None
+    agent.enrollment_socket_server.start()
+    transport_client = AgentHttpClient(
+        transport=httpx.ASGITransport(app=create_public_app(agent))
+    )
+    orchestrator = manager.enrollment_orchestrator
+    orchestrator.agent_client._client = transport_client
+    clock = [datetime.now(UTC)]
+    orchestrator._clock = lambda: clock[0]
+    real_socket_client = LocalEnrollmentSocketClient(runtime)
+
+    class FailBeforeFirstIssueClient:
+        calls = 0
+
+        async def issue(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise LocalEnrollmentSocketError("local_socket_unavailable")
+            return await real_socket_client.issue(**kwargs)
+
+    socket_client = FailBeforeFirstIssueClient()
+    orchestrator._local_socket_client = socket_client
+    orchestrator._local_bootstrap_enabled = True
+    try:
+        with pytest.raises(EnrollmentValidationError) as first:
+            await orchestrator.bootstrap_local(_request(agent_config), _context())
+        assert first.value.code == "local_socket_unavailable"
+        assert agent.enrollment_service.repository.list_all() == ()
+        failed = manager.enrollment_journal_repository.get("local-agent")
+        assert failed is not None
+        assert failed.state is EnrollmentState.FAILED
+        assert failed.credential_temp_ref is None
+
+        clock[0] += timedelta(seconds=601)
+        record = await orchestrator.bootstrap_local(_request(agent_config), _context())
+
+        assert record.agent_id == "local-agent"
+        assert socket_client.calls == 2
+        credentials = agent.enrollment_service.repository.list_all()
+        assert len(credentials) == 1
+        assert credentials[0].state is CredentialState.ACTIVE
+    finally:
+        await transport_client.aclose()
+        agent.enrollment_socket_server.stop()
+        agent.database_engine.dispose()
+        manager.database_engine.dispose()
+        shutil.rmtree(runtime, ignore_errors=True)
+
+
+@pytest.mark.integration
 async def test_local_activation_lost_response_retains_durable_recovery_reference(tmp_path):
     agent, manager, agent_config, _admin, runtime = _containers(tmp_path)
     assert agent.enrollment_socket_server is not None

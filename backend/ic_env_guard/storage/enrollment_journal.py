@@ -651,6 +651,12 @@ class EnrollmentJournalRepository(_SQLiteRepository):
                 if current.enrollment_method is not EnrollmentMethod.LOCAL_SOCKET:
                     raise RegistryConflict("agent_enrollment_conflict")
                 if (
+                    current.normalized_endpoint != normalized_endpoint
+                    or current.transport_profile_id != transport_profile_id
+                    or current.requested_display_name != display_name
+                ):
+                    raise RegistryConflict("agent_enrollment_conflict")
+                if (
                     current.state
                     not in {
                         EnrollmentState.CANCELLED,
@@ -664,11 +670,8 @@ class EnrollmentJournalRepository(_SQLiteRepository):
                 rearmed = replace(
                     current,
                     state=EnrollmentState.PENDING,
-                    normalized_endpoint=normalized_endpoint,
-                    transport_profile_id=transport_profile_id,
                     discovery_result_id=None,
                     replace_agent_id=None,
-                    requested_display_name=display_name,
                     ssh_user=None,
                     ssh_host=None,
                     ssh_port=None,
@@ -701,18 +704,39 @@ class EnrollmentJournalRepository(_SQLiteRepository):
                     old_display_name=None,
                 )
                 _validate_job(rearmed)
-                assignments = ", ".join(
-                    f"{column.strip()}=?"
-                    for column in _COLUMNS.split(",")
-                    if column.strip() != "enrollment_id"
+                immutable_columns = {
+                    "enrollment_id",
+                    "manager_id",
+                    "normalized_endpoint",
+                    "transport_profile_id",
+                    "requested_display_name",
+                    "enrollment_method",
+                }
+                columns = tuple(column.strip() for column in _COLUMNS.split(","))
+                values_by_column = dict(
+                    zip(columns, self._values(rearmed), strict=True)
                 )
-                values = self._values(rearmed)
+                update_columns = tuple(
+                    column for column in columns if column not in immutable_columns
+                )
+                assignments = ", ".join(
+                    f"{column}=?" for column in update_columns
+                )
                 cursor = connection.execute(
                     f"UPDATE agent_enrollment_jobs SET {assignments} "
                     "WHERE enrollment_id=? AND enrollment_method='local_socket' "
+                    "AND normalized_endpoint=? AND transport_profile_id=? "
+                    "AND requested_display_name=? "
                     "AND state IN ('cancelled','expired','failed') AND expires_at<=? "
                     "AND credential_temp_ref IS NULL",
-                    (*values[1:], enrollment_id, _format_time(now)),
+                    (
+                        *(values_by_column[column] for column in update_columns),
+                        enrollment_id,
+                        normalized_endpoint,
+                        transport_profile_id,
+                        display_name,
+                        _format_time(now),
+                    ),
                 )
                 if cursor.rowcount != 1:
                     raise RevisionConflict("local bootstrap retry state changed")

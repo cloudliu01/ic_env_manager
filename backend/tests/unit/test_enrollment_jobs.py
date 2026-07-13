@@ -146,6 +146,36 @@ def test_local_retry_rearm_never_changes_terminal_ssh_job(setup):
     assert repository.get(ssh.enrollment_id) == cancelled
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "change",
+    (
+        {"normalized_endpoint": "http://127.0.0.1:9999"},
+        {"transport_profile_id": "different-profile"},
+        {"display_name": "Different Agent"},
+    ),
+)
+def test_local_retry_rearm_rejects_changed_identity_inputs(setup, change):
+    jobs, repository, _engine = setup
+    request = EnrollmentJobRequest(
+        normalized_endpoint="http://127.0.0.1:8766",
+        transport_profile_id="local-loopback-http",
+        display_name="Local development agent",
+        enrollment_method=EnrollmentMethod.LOCAL_SOCKET,
+    )
+    local = jobs.create(request, enrollment_id="local-agent", now=NOW)
+    cancelled = jobs.cancel(local.enrollment_id, now=NOW + timedelta(seconds=1))
+
+    with pytest.raises(EnrollmentConflict, match="agent_enrollment_conflict"):
+        jobs.rearm_expired_local(
+            replace(request, **change),
+            enrollment_id=local.enrollment_id,
+            now=NOW + timedelta(seconds=601),
+        )
+
+    assert repository.get(local.enrollment_id) == cancelled
+
+
 def test_expired_job_releases_capacity_and_cannot_be_cancelled(setup):
     jobs, repository, _engine = setup
     first = jobs.create(ssh_request(), now=NOW)

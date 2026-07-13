@@ -178,6 +178,41 @@ def test_local_retry_protocol_replaces_only_same_manager_expired_or_revoked(
 
 
 @pytest.mark.security
+def test_local_retry_protocol_creates_missing_row_without_weakening_standard_replay(
+    tmp_path, socket_dir
+):
+    container = build_agent_container(None, tmp_path / "state.db", tmp_path / "instance-id")
+    path = socket_dir / "enroll.sock"
+    server = EnrollmentSocketServer(
+        path, 0o600, container.instance_id, container.enrollment_service
+    )
+    server.start()
+    retry_id = "01J2W4ABCDEFGHJKMNPQRSTMISSING"
+    standard_id = "01J2W4ABCDEFGHJKMNPQRSTSTANDARD"
+    try:
+        retried = parse_response(
+            _exchange(
+                path,
+                _request(retry_id, protocol=LOCAL_RETRY_PROTOCOL),
+            )
+        )
+        assert retried.credential_id
+        assert b'"enrollment_rejected"' in _exchange(path, _request(retry_id))
+        assert b'"enrollment_rejected"' in _exchange(
+            path,
+            _request(retry_id, protocol=LOCAL_RETRY_PROTOCOL),
+        )
+
+        standard = parse_response(_exchange(path, _request(standard_id)))
+        assert standard.credential_id
+        assert b'"enrollment_rejected"' in _exchange(path, _request(standard_id))
+        assert len(container.enrollment_service.repository.list_all()) == 2
+    finally:
+        server.stop()
+        container.database_engine.dispose()
+
+
+@pytest.mark.security
 def test_socket_rejects_unauthorized_peer_without_issuing(tmp_path, socket_dir):
     container = build_agent_container(None, tmp_path / "state.db", tmp_path / "instance-id")
     path = socket_dir / "enroll.sock"

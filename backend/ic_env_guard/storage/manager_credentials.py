@@ -143,22 +143,21 @@ class SQLiteManagerCredentialRepository:
                     "WHERE enrollment_id = ?",
                     (record.enrollment_id,),
                 ).fetchone()
-                if row is None:
-                    raise DuplicateEnrollment("expired enrollment was not found")
-                existing = _record(row)
-                retryable = (
-                    existing.manager_id == record.manager_id
-                    and (
-                        existing.state is CredentialState.REVOKED
-                        or (
-                            existing.state is CredentialState.PENDING
-                            and existing.pending_expires_at is not None
-                            and now >= existing.pending_expires_at
+                existing = _record(row) if row is not None else None
+                if existing is not None:
+                    retryable = (
+                        existing.manager_id == record.manager_id
+                        and (
+                            existing.state is CredentialState.REVOKED
+                            or (
+                                existing.state is CredentialState.PENDING
+                                and existing.pending_expires_at is not None
+                                and now >= existing.pending_expires_at
+                            )
                         )
                     )
-                )
-                if not retryable:
-                    raise DuplicateEnrollment("enrollment retry is not allowed")
+                    if not retryable:
+                        raise DuplicateEnrollment("enrollment retry is not allowed")
                 pending = connection.execute(
                     "SELECT COUNT(*) FROM manager_credentials "
                     "WHERE state = 'pending' AND pending_expires_at > ?",
@@ -168,21 +167,39 @@ class SQLiteManagerCredentialRepository:
                     raise EnrollmentCapacityExceeded(
                         "pending credential capacity exceeded"
                     )
-                connection.execute(
-                    "UPDATE manager_credentials SET credential_id=?, manager_id=?, "
-                    "token_hash=?, state='pending', pending_expires_at=?, created_at=?, "
-                    "activated_at=NULL, last_used_at=NULL, revoked_at=NULL "
-                    "WHERE enrollment_id=? AND credential_id=?",
-                    (
-                        record.credential_id,
-                        record.manager_id,
-                        record.token_hash,
-                        _format_time(record.pending_expires_at),
-                        _format_time(record.created_at),
-                        record.enrollment_id,
-                        existing.credential_id,
-                    ),
-                )
+                if existing is None:
+                    connection.execute(
+                        "INSERT INTO manager_credentials (" + _COLUMNS + ") "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            record.credential_id,
+                            record.manager_id,
+                            record.enrollment_id,
+                            record.token_hash,
+                            record.state.value,
+                            _format_time(record.pending_expires_at),
+                            _format_time(record.created_at),
+                            _format_time(record.activated_at),
+                            _format_time(record.last_used_at),
+                            _format_time(record.revoked_at),
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        "UPDATE manager_credentials SET credential_id=?, manager_id=?, "
+                        "token_hash=?, state='pending', pending_expires_at=?, created_at=?, "
+                        "activated_at=NULL, last_used_at=NULL, revoked_at=NULL "
+                        "WHERE enrollment_id=? AND credential_id=?",
+                        (
+                            record.credential_id,
+                            record.manager_id,
+                            record.token_hash,
+                            _format_time(record.pending_expires_at),
+                            _format_time(record.created_at),
+                            record.enrollment_id,
+                            existing.credential_id,
+                        ),
+                    )
         except (DuplicateEnrollment, EnrollmentCapacityExceeded):
             raise
         except (SQLAlchemyError, sqlite3.Error, TypeError, ValueError) as exc:
