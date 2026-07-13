@@ -314,6 +314,31 @@ start_frontend() {
   npm run dev -- --host "${FRONTEND_HOST}" --port "${FRONTEND_PORT}"
 }
 
+start_tracked_frontend() {
+  ensure_frontend_deps
+  export IC_ENV_GUARD_HOST="${BACKEND_HOST}"
+  export IC_ENV_GUARD_PORT="${BACKEND_PORT}"
+
+  echo "Starting frontend on http://${FRONTEND_HOST}:${FRONTEND_PORT}"
+  exec python - \
+    "${DEV_DIR}/frontend-runtime" \
+    "${FRONTEND_DIR}" \
+    "${FRONTEND_HOST}" \
+    "${FRONTEND_PORT}" <<'PY'
+import os
+import subprocess
+import sys
+
+_, frontend_dir, host, port = sys.argv[1:]
+os.setsid()
+process = subprocess.Popen(
+    ["npm", "run", "dev", "--", "--host", host, "--port", port],
+    cwd=frontend_dir,
+)
+raise SystemExit(process.wait())
+PY
+}
+
 wait_for_backend() {
   local expected_pid="$1"
   local process_status
@@ -622,6 +647,155 @@ print(hashlib.sha256(identity.encode("utf-8")).hexdigest())
 PY
 }
 
+frontend_process_matches() {
+  local pid="$1"
+  python - "${pid}" "$(id -u)" "${DEV_DIR}/frontend-runtime" <<'PY'
+import hashlib
+import subprocess
+import sys
+
+pid, expected_uid, marker = sys.argv[1:]
+result = subprocess.run(
+    [
+        "ps", "-ww", "-o", "uid=", "-o", "lstart=", "-o", "stat=",
+        "-o", "pgid=", "-o", "command=", "-p", pid,
+    ],
+    capture_output=True,
+    text=True,
+)
+if result.returncode != 0 or not result.stdout.strip():
+    raise SystemExit(2)
+parts = result.stdout.strip().split(maxsplit=8)
+if len(parts) != 9:
+    raise SystemExit(1)
+uid, *start_fields, state, pgid, command = parts
+if state.startswith("Z"):
+    raise SystemExit(3)
+if uid != expected_uid or pgid != pid or marker not in command.split():
+    raise SystemExit(1)
+identity = "\0".join((uid, " ".join(start_fields), pgid, command))
+print(hashlib.sha256(identity.encode("utf-8")).hexdigest())
+PY
+}
+
+wait_for_frontend_identity() {
+  local pid="$1"
+  local identity_status
+  for _ in $(seq 1 100); do
+    if frontend_process_matches "${pid}"; then
+      return
+    else
+      identity_status=$?
+    fi
+    if [[ "${identity_status}" == "2" || "${identity_status}" == "3" ]]; then
+      return 1
+    fi
+    sleep 0.02
+  done
+  return 1
+}
+
+write_frontend_metadata() {
+  local pid="$1"
+  local identity="$2"
+  local temporary_path
+  umask 077
+  temporary_path="$(mktemp "${DEV_DIR}/frontend.pid.tmp.XXXXXX")"
+  if ! printf '%s %s\n' "${pid}" "${identity}" > "${temporary_path}" \
+    || ! chmod 0600 "${temporary_path}" \
+    || ! mv -f "${temporary_path}" "${DEV_DIR}/frontend.pid"; then
+    rm -f "${temporary_path}"
+    return 1
+  fi
+}
+
+read_frontend_metadata() {
+  python - "${DEV_DIR}/frontend.pid" "$(id -u)" <<'PY'
+import os
+import re
+import stat
+import sys
+
+path, expected_uid = sys.argv[1], int(sys.argv[2])
+try:
+    metadata = os.lstat(path)
+except FileNotFoundError:
+    raise SystemExit(2)
+if (
+    not stat.S_ISREG(metadata.st_mode)
+    or stat.S_ISLNK(metadata.st_mode)
+    or metadata.st_uid != expected_uid
+    or stat.S_IMODE(metadata.st_mode) & 0o077
+    or not 67 <= metadata.st_size <= 96
+):
+    raise SystemExit(1)
+flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+descriptor = None
+try:
+    descriptor = os.open(path, flags)
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_uid != expected_uid
+        or stat.S_IMODE(opened.st_mode) & 0o077
+        or not 67 <= opened.st_size <= 96
+        or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+    ):
+        raise SystemExit(1)
+    payload = os.read(descriptor, 97)
+except OSError:
+    raise SystemExit(1)
+finally:
+    if descriptor is not None:
+        os.close(descriptor)
+try:
+    value = payload.decode("ascii")
+except UnicodeDecodeError:
+    raise SystemExit(1)
+match = re.fullmatch(r"([1-9][0-9]*) ([0-9a-f]{64})\n?", value)
+if match is None:
+    raise SystemExit(1)
+print(*match.groups())
+PY
+}
+
+remove_owned_frontend_metadata() {
+  local expected="$1"
+  python - "${DEV_DIR}/frontend.pid" "${expected}" <<'PY'
+import os
+import stat
+import sys
+
+path, expected = sys.argv[1:]
+try:
+    metadata = os.lstat(path)
+except FileNotFoundError:
+    raise SystemExit(0)
+if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+    raise SystemExit(0)
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+try:
+    descriptor = os.open(path, flags)
+except OSError:
+    raise SystemExit(0)
+try:
+    opened = os.fstat(descriptor)
+    payload = os.read(descriptor, 97)
+finally:
+    os.close(descriptor)
+if (
+    (opened.st_dev, opened.st_ino) == (metadata.st_dev, metadata.st_ino)
+    and payload.decode("ascii", errors="ignore").rstrip("\n") == expected
+):
+    try:
+        current = os.lstat(path)
+    except FileNotFoundError:
+        raise SystemExit(0)
+    if (current.st_dev, current.st_ino) == (metadata.st_dev, metadata.st_ino):
+        os.unlink(path)
+PY
+}
+
 process_exists() {
   local pid="$1"
   python - "${pid}" <<'PY'
@@ -881,6 +1055,240 @@ stop_recorded_process() {
   return 1
 }
 
+frontend_group_exists() {
+  local pid="$1"
+  python - "${pid}" <<'PY'
+import errno
+import os
+import sys
+
+try:
+    os.killpg(int(sys.argv[1]), 0)
+except OSError as error:
+    if error.errno == errno.ESRCH:
+        raise SystemExit(1)
+    if error.errno == errno.EPERM:
+        raise SystemExit(0)
+    raise SystemExit(2)
+PY
+}
+
+signal_frontend_group() {
+  local pid="$1"
+  local signal_name="$2"
+  python - "${pid}" "${signal_name}" <<'PY'
+import errno
+import os
+import signal
+import sys
+
+pid = int(sys.argv[1])
+signal_number = getattr(signal, sys.argv[2])
+try:
+    os.killpg(pid, signal_number)
+except OSError as error:
+    if error.errno != errno.ESRCH:
+        raise
+PY
+}
+
+signal_owned_frontend() {
+  local pid="$1"
+  local signal_name="$2"
+  python - "${pid}" "${signal_name}" <<'PY'
+import errno
+import os
+import signal
+import sys
+
+pid = int(sys.argv[1])
+signal_number = getattr(signal, sys.argv[2])
+for target in (lambda: os.kill(pid, signal_number), lambda: os.killpg(pid, signal_number)):
+    try:
+        target()
+    except OSError as error:
+        if error.errno != errno.ESRCH:
+            raise
+PY
+}
+
+wait_for_owned_frontend_exit() {
+  local pid="$1"
+  local process_alive
+  local group_alive
+  local process_state
+  local target_status
+  for _ in $(seq 1 50); do
+    process_alive=1
+    group_alive=1
+    if process_exists "${pid}"; then
+      process_state="$(ps -ww -o stat= -p "${pid}" 2>/dev/null || true)"
+      if [[ "${process_state}" != Z* ]]; then
+        process_alive=0
+      fi
+    else
+      target_status=$?
+      if [[ "${target_status}" != "1" ]]; then
+        return 2
+      fi
+    fi
+    if frontend_group_exists "${pid}"; then
+      group_alive=0
+    else
+      target_status=$?
+      if [[ "${target_status}" != "1" ]]; then
+        return 2
+      fi
+    fi
+    if [[ "${process_alive}" == "1" && "${group_alive}" == "1" ]]; then
+      return
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+terminate_owned_frontend() {
+  local pid="$1"
+  signal_owned_frontend "${pid}" SIGTERM
+  if ! wait_for_owned_frontend_exit "${pid}"; then
+    signal_owned_frontend "${pid}" SIGKILL
+    if ! wait_for_owned_frontend_exit "${pid}"; then
+      echo "development frontend did not exit" >&2
+      return 1
+    fi
+  fi
+  wait "${pid}" >/dev/null 2>&1 || true
+}
+
+wait_for_frontend_group_exit() {
+  local pid="$1"
+  local expected_identity="$2"
+  local current_identity
+  local identity_status
+  local group_status
+  for _ in $(seq 1 50); do
+    if current_identity="$(frontend_process_matches "${pid}")"; then
+      if [[ "${current_identity}" != "${expected_identity}" ]]; then
+        return 2
+      fi
+    else
+      identity_status=$?
+      if [[ "${identity_status}" == "1" ]]; then
+        return 2
+      fi
+    fi
+    if frontend_group_exists "${pid}"; then
+      :
+    else
+      group_status=$?
+      if [[ "${group_status}" == "1" ]]; then
+        return
+      fi
+      return 2
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+terminate_frontend_group() {
+  local pid="$1"
+  local expected_identity="$2"
+  local current_identity
+  local identity_status
+  local wait_status
+  local group_status
+
+  if current_identity="$(frontend_process_matches "${pid}")"; then
+    if [[ "${current_identity}" != "${expected_identity}" ]]; then
+      echo "development frontend identity mismatch" >&2
+      return 1
+    fi
+  else
+    identity_status=$?
+    if [[ "${identity_status}" == "1" ]]; then
+      echo "development frontend identity mismatch" >&2
+      return 1
+    fi
+    if frontend_group_exists "${pid}"; then
+      echo "development frontend identity mismatch" >&2
+      return 1
+    else
+      group_status=$?
+      if [[ "${group_status}" == "1" ]]; then
+        return
+      fi
+    fi
+    echo "development frontend identity mismatch" >&2
+    return 1
+  fi
+  if current_identity="$(frontend_process_matches "${pid}")"; then
+    if [[ "${current_identity}" != "${expected_identity}" ]]; then
+      echo "development frontend identity mismatch" >&2
+      return 1
+    fi
+  else
+    echo "development frontend identity mismatch" >&2
+    return 1
+  fi
+  signal_frontend_group "${pid}" SIGTERM
+  if wait_for_frontend_group_exit "${pid}" "${expected_identity}"; then
+    return
+  else
+    wait_status=$?
+  fi
+  if [[ "${wait_status}" == "2" ]]; then
+    echo "development frontend identity mismatch" >&2
+    return 1
+  fi
+  if current_identity="$(frontend_process_matches "${pid}")"; then
+    if [[ "${current_identity}" != "${expected_identity}" ]]; then
+      echo "development frontend identity mismatch" >&2
+      return 1
+    fi
+  else
+    identity_status=$?
+    if [[ "${identity_status}" == "1" ]]; then
+      echo "development frontend identity mismatch" >&2
+      return 1
+    fi
+  fi
+  signal_frontend_group "${pid}" SIGKILL
+  if wait_for_frontend_group_exit "${pid}" "${expected_identity}"; then
+    return
+  else
+    wait_status=$?
+  fi
+  if [[ "${wait_status}" == "2" ]]; then
+    echo "development frontend identity mismatch" >&2
+  else
+    echo "development frontend did not exit" >&2
+  fi
+  return 1
+}
+
+stop_recorded_frontend() {
+  local metadata
+  local metadata_status
+  local pid
+  local expected_identity
+  if metadata="$(read_frontend_metadata)"; then
+    read -r pid expected_identity <<< "${metadata}"
+  else
+    metadata_status=$?
+    if [[ "${metadata_status}" == "2" ]]; then
+      return
+    fi
+    echo "development frontend identity mismatch" >&2
+    return 1
+  fi
+  if ! terminate_frontend_group "${pid}" "${expected_identity}"; then
+    return 1
+  fi
+  remove_owned_frontend_metadata "${pid} ${expected_identity}"
+}
+
 stop_recorded_backends() {
   stop_recorded_process "${DEV_DIR}/agent.pid" "${DEV_DIR}/agent.yaml"
   stop_recorded_process "${DEV_DIR}/control-plane.pid" "${DEV_DIR}/control-plane.yaml"
@@ -931,6 +1339,7 @@ reset_generated_state() {
     "${DEV_DIR}/manager-enrollment.sock" \
     "${DEV_DIR}/agent.pid" \
     "${DEV_DIR}/control-plane.pid" \
+    "${DEV_DIR}/frontend.pid" \
     "${DEV_DIR}/agent.yaml" \
     "${DEV_DIR}/control-plane.yaml"
   rm -rf "${DEV_DIR}/manager-credentials"
@@ -1088,6 +1497,8 @@ start_all() {
   local control_plane_port="${BACKEND_PORT}"
   local agent_pid=""
   local control_plane_pid=""
+  local frontend_pid=""
+  local frontend_identity=""
   local agent_socket_identity=""
   local control_plane_socket_identity=""
   local cleaned_up=0
@@ -1112,6 +1523,21 @@ start_all() {
     trap - EXIT ERR
     trap '' INT TERM
     cleaned_up=1
+    if [[ -n "${frontend_pid}" && "${lifecycle_lock_held}" != "1" ]]; then
+      if ! acquire_lifecycle_lock; then
+        return 1
+      fi
+    fi
+    if [[ -n "${frontend_pid}" ]]; then
+      if terminate_owned_frontend "${frontend_pid}"; then
+        if [[ -n "${frontend_identity}" ]]; then
+          remove_owned_frontend_metadata \
+            "${frontend_pid} ${frontend_identity}"
+        fi
+      else
+        cleanup_status=1
+      fi
+    fi
     if [[ -n "${agent_pid}" ]]; then
       if terminate_child "${agent_pid}"; then
         remove_owned_pid_file "${DEV_DIR}/agent.pid" "${agent_pid}"
@@ -1192,6 +1618,7 @@ start_all() {
   if [[ -z "${IC_ENV_GUARD_AGENT_INGEST_PORT:-}" ]]; then
     AGENT_INGEST_PORT=8767
   fi
+  stop_recorded_frontend
   stop_recorded_backends
   validate_development_ports_available "${control_plane_port}"
   reset_generated_state
@@ -1219,7 +1646,14 @@ start_all() {
   release_lifecycle_lock
 
   run_terminal_readiness
-  start_frontend
+  start_tracked_frontend 8>&- 9>&- &
+  frontend_pid=$!
+  if ! frontend_identity="$(wait_for_frontend_identity "${frontend_pid}")"; then
+    echo "frontend child exited before identity capture" >&2
+    return 1
+  fi
+  write_frontend_metadata "${frontend_pid}" "${frontend_identity}"
+  wait "${frontend_pid}"
   cleanup 0
 }
 

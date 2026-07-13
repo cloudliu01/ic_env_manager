@@ -97,6 +97,88 @@ def _bounded_all(environment: dict[str, str], timeout: float = 3) -> tuple[int |
     return process.returncode, output
 
 
+def _wait_for_file(path: Path, process: subprocess.Popen, timeout: float = 10) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        if process.poll() is not None:
+            assert process.stdout is not None
+            raise AssertionError(process.stdout.read())
+        time.sleep(0.02)
+    raise AssertionError(f"file did not appear: {path}")
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _write_frontend_listener(executable: Path, dev_dir: Path) -> None:
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import socket\n"
+        "import sys\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        f"dev_dir = Path({str(dev_dir)!r})\n"
+        "port = int(sys.argv[sys.argv.index('--port') + 1])\n"
+        "counter = dev_dir / 'frontend.count'\n"
+        "run = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+        "counter.write_text(str(run))\n"
+        "(dev_dir / f'frontend-run-{run}.pid').write_text(str(os.getpid()))\n"
+        "listener = socket.socket()\n"
+        "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+        "listener.bind(('127.0.0.1', port))\n"
+        "listener.listen()\n"
+        "while True:\n"
+        "    time.sleep(0.1)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+
+
+def _write_frontend_with_descendant(executable: Path, dev_dir: Path) -> None:
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import subprocess\n"
+        "import sys\n"
+        f"dev_dir = {str(dev_dir)!r}\n"
+        "port = sys.argv[sys.argv.index('--port') + 1]\n"
+        "source = (\n"
+        "    'import os,socket,sys,time; from pathlib import Path; '\n"
+        "    'listener=socket.socket(); listener.bind((\"127.0.0.1\", int(sys.argv[1]))); '\n"
+        "    'listener.listen(); Path(sys.argv[2]).write_text(str(os.getpid())); '\n"
+        "    'time.sleep(60)'\n"
+        ")\n"
+        "child = subprocess.Popen([sys.executable, '-c', source, port, "
+        "dev_dir + '/frontend-descendant.pid'])\n"
+        "(open(dev_dir + '/frontend-parent.pid', 'w')).write(str(child.pid))\n"
+        "raise SystemExit(child.wait())\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+
+
+def _fail_frontend_ps_after_marker(executable: Path, marker: Path) -> None:
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"marker = Path({str(marker)!r})\n"
+        "if marker.exists() and 'pgid=' in sys.argv:\n"
+        "    raise SystemExit(1)\n"
+        "os.execv('/bin/ps', ['/bin/ps', *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+
+
 def _start_foreign_listener(signal_marker: Path, *, health: bool = False):
     process = subprocess.Popen(
         [
@@ -275,6 +357,145 @@ def test_start_all_runs_isolated_agent_and_manager_lifecycle(tmp_path):
         output = _stop_all(process)
         assert "preserved-agent-login-token" not in output
         assert "preserved-manager-login-token" not in output
+        rmtree(dev_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+def test_second_start_all_replaces_the_owned_frontend_and_backend_processes():
+    dev_dir = Path(mkdtemp(prefix="ieg-all-restart-", dir="/tmp")).resolve()
+    dev_dir.chmod(0o700)
+    environment, manager_port, agent_port = _launcher_environment(dev_dir)
+    _write_frontend_listener(dev_dir / "bin" / "npm", dev_dir)
+    first = _start_all(environment)
+    second: subprocess.Popen | None = None
+    first_output = ""
+    try:
+        _wait_for_health(f"http://127.0.0.1:{manager_port}/healthz", first)
+        _wait_for_health(f"http://127.0.0.1:{agent_port}/healthz", first)
+        _wait_for_file(dev_dir / "frontend-run-1.pid", first)
+        _wait_for_file(dev_dir / "frontend.pid", first)
+        old_pids = {
+            "agent": int((dev_dir / "agent.pid").read_text()),
+            "manager": int((dev_dir / "control-plane.pid").read_text()),
+            "frontend-leader": int((dev_dir / "frontend.pid").read_text().split()[0]),
+            "frontend-child": int((dev_dir / "frontend-run-1.pid").read_text()),
+        }
+
+        second = _start_all(environment)
+        _wait_for_file(dev_dir / "frontend-run-2.pid", second, timeout=20)
+        _wait_for_health(f"http://127.0.0.1:{manager_port}/healthz", second)
+        _wait_for_health(f"http://127.0.0.1:{agent_port}/healthz", second)
+        first_output = first.communicate(timeout=10)[0]
+
+        assert second.poll() is None
+        assert first.returncode is not None
+        assert all(not _pid_exists(pid) for pid in old_pids.values())
+        frontend_metadata = (dev_dir / "frontend.pid").read_text().split()
+        assert int(frontend_metadata[0]) != old_pids["frontend-leader"]
+        assert _pid_exists(int(frontend_metadata[0]))
+    finally:
+        if first.poll() is None:
+            first_output = _stop_all(first)
+        second_output = _stop_all(second) if second is not None else ""
+        assert "development port already in use" not in first_output + second_output
+        rmtree(dev_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+def test_term_launcher_pid_stops_owned_frontend_descendants_and_metadata():
+    dev_dir = Path(mkdtemp(prefix="ieg-all-term-", dir="/tmp")).resolve()
+    dev_dir.chmod(0o700)
+    environment, manager_port, agent_port = _launcher_environment(dev_dir)
+    _write_frontend_with_descendant(dev_dir / "bin" / "npm", dev_dir)
+    process = _start_all(environment)
+    descendant_pid = 0
+    try:
+        _wait_for_health(f"http://127.0.0.1:{manager_port}/healthz", process)
+        _wait_for_health(f"http://127.0.0.1:{agent_port}/healthz", process)
+        descendant_path = dev_dir / "frontend-descendant.pid"
+        _wait_for_file(descendant_path, process)
+        descendant_pid = int(descendant_path.read_text())
+
+        started = time.monotonic()
+        os.kill(process.pid, signal.SIGTERM)
+        output = process.communicate(timeout=10)[0]
+
+        assert time.monotonic() - started < 10
+        assert process.returncode == 143, output
+        assert not _pid_exists(descendant_pid)
+        assert not (dev_dir / "frontend.pid").exists()
+        assert not (dev_dir / "agent.pid").exists()
+        assert not (dev_dir / "control-plane.pid").exists()
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", int(environment["IC_ENV_GUARD_FRONTEND_PORT"])))
+    finally:
+        if process.poll() is None:
+            _stop_all(process)
+        if descendant_pid and _pid_exists(descendant_pid):
+            try:
+                os.kill(descendant_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        rmtree(dev_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+def test_term_launcher_cleanup_does_not_depend_on_frontend_identity_reprobe():
+    dev_dir = Path(mkdtemp(prefix="ieg-all-term-ps-", dir="/tmp")).resolve()
+    dev_dir.chmod(0o700)
+    environment, manager_port, agent_port = _launcher_environment(dev_dir)
+    _write_frontend_with_descendant(dev_dir / "bin" / "npm", dev_dir)
+    ps_failure = dev_dir / "fail-frontend-ps"
+    _fail_frontend_ps_after_marker(dev_dir / "bin" / "ps", ps_failure)
+    process = _start_all(environment)
+    descendant_pid = 0
+    try:
+        _wait_for_health(f"http://127.0.0.1:{manager_port}/healthz", process)
+        _wait_for_health(f"http://127.0.0.1:{agent_port}/healthz", process)
+        descendant_path = dev_dir / "frontend-descendant.pid"
+        _wait_for_file(descendant_path, process)
+        _wait_for_file(dev_dir / "frontend.pid", process)
+        descendant_pid = int(descendant_path.read_text())
+        ps_failure.touch()
+
+        os.kill(process.pid, signal.SIGTERM)
+        output = process.communicate(timeout=10)[0]
+
+        assert process.returncode == 143, output
+        assert not _pid_exists(descendant_pid)
+        assert not (dev_dir / "frontend.pid").exists()
+    finally:
+        if process.poll() is None:
+            _stop_all(process)
+        if descendant_pid and _pid_exists(descendant_pid):
+            try:
+                os.kill(descendant_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        rmtree(dev_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+def test_start_all_does_not_signal_frontend_with_mismatched_identity():
+    dev_dir = Path(mkdtemp(prefix="ieg-foreign-frontend-", dir="/tmp")).resolve()
+    dev_dir.chmod(0o700)
+    environment, _, _ = _launcher_environment(dev_dir)
+    foreign = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    metadata = dev_dir / "frontend.pid"
+    metadata.write_text(f"{foreign.pid} {'0' * 64}\n", encoding="ascii")
+    metadata.chmod(0o600)
+    try:
+        returncode, output = _bounded_all(environment)
+
+        assert returncode is not None
+        assert returncode != 0
+        assert "development frontend identity mismatch" in output
+        assert foreign.poll() is None
+        assert metadata.exists()
+    finally:
+        if foreign.poll() is None:
+            foreign.kill()
+            foreign.wait(timeout=5)
         rmtree(dev_dir, ignore_errors=True)
 
 
@@ -1137,6 +1358,67 @@ exit "$status"
 
 
 @pytest.mark.integration
+def test_owned_frontend_cleanup_closes_setsid_race_after_process_classification(
+    tmp_path,
+):
+    ready = tmp_path / "frontend.ready"
+    descendant = tmp_path / "frontend.descendant"
+    script = f"""
+source {str(PROJECT_ROOT / 'start.sh')!r} help >/dev/null
+python - {str(ready)!r} {str(descendant)!r} <<'PY' &
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+os.setsid()
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(60)"],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+Path(sys.argv[2]).write_text(str(child.pid), encoding="ascii")
+Path(sys.argv[1]).touch()
+raise SystemExit(child.wait())
+PY
+leader=$!
+for _ in $(seq 1 100); do
+  [[ -e {str(ready)!r} ]] && break
+  sleep 0.02
+done
+[[ -e {str(ready)!r} ]]
+owned_frontend_is_group() {{ return 1; }}
+terminate_owned_frontend "$leader"
+child="$(cat {str(descendant)!r})"
+status=0
+if kill -0 "$child" 2>/dev/null; then
+  status=42
+fi
+python - "$leader" <<'PY'
+import os
+import signal
+import sys
+
+try:
+    os.killpg(int(sys.argv[1]), signal.SIGKILL)
+except ProcessLookupError:
+    pass
+PY
+exit "$status"
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize(
     ("probe_error", "expected_status", "pid_metadata_survives"),
     [("ESRCH", 0, False), ("EPERM", 1, True)],
@@ -1331,6 +1613,6 @@ def test_start_all_runs_terminal_readiness_after_bootstrap_and_before_frontend()
 
     bootstrap_position = start_all.index("bootstrap_local_agent")
     readiness_position = start_all.index("run_terminal_readiness")
-    frontend_position = start_all.index("start_frontend")
+    frontend_position = start_all.index("start_tracked_frontend")
 
     assert bootstrap_position < readiness_position < frontend_position
