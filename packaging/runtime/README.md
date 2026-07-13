@@ -24,9 +24,11 @@ The same runtime directory is required when a valid older Agent config omits an
 
 Public and Local Ingest are two listeners in one process. Local Ingest is
 loopback-only and must never be reverse proxied, forwarded, published, or opened
-in a firewall. See [Agent v2 Operations](../../docs/agent-v2-operations.md) for
-account selection, producer examples, backup, migration, and rollback steps.
-Manager Fleet deployment, SSH enrollment restrictions, and grouped Manager
-database/credential recovery are in [Manager Fleet Operations](../../docs/manager-fleet-operations.md),
-[Manager Enrollment Security](../../docs/manager-enrollment-security.md), and
-[Manager Backup and Rollback](../../docs/manager-backup-and-rollback.md).
+in a firewall. See [Agent Deployment](../../docs/guides/agent-deployment.md) and
+[Local Data Ingest](../../docs/guides/local-data-ingest.md) for account selection,
+listener ownership, and producer examples.
+
+Manager deployment is in [Manager Fleet](../../docs/guides/manager-fleet.md).
+Use [Security](../../docs/guides/security.md) for SSH enrollment and credential
+boundaries, and [Backup, Upgrade, and Recovery](../../docs/guides/backup-upgrade-recovery.md)
+for grouped Agent and Manager state procedures.

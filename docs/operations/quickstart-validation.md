@@ -99,8 +99,8 @@ Expected outcome: schema migration history is recorded and startup detects faile
 
 Coverage:
 
-- `docs/operations/lifecycle.md`
-- `docs/operations/recovery.md`
-- `docs/operations/platform-validation.md`
+- `docs/guides/agent-deployment.md`
+- `docs/guides/backup-upgrade-recovery.md`
+- `docs/development/validation/platform-validation.md`
 
 Expected outcome: install, configure, validate, start, stop, restart, status, logs, upgrade, uninstall, and recovery workflows are documented.
