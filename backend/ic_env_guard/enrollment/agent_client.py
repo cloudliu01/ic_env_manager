@@ -82,6 +82,36 @@ class EnrollmentAgentClient:
                 exc.code, dispatch_state="not_dispatched"
             ) from exc
 
+    def prepare_local(self, endpoint: str, profile_id: str) -> ValidatedTarget:
+        try:
+            profile = self._profiles[profile_id]
+            return self._policy.resolve_local_socket(endpoint, profile)
+        except KeyError as exc:
+            raise EnrollmentValidationError(
+                "transport_profile_invalid", dispatch_state="not_dispatched"
+            ) from exc
+        except TargetPolicyError as exc:
+            raise EnrollmentValidationError(
+                exc.code, dispatch_state="not_dispatched"
+            ) from exc
+
+    def prepare_local_pinned(
+        self, endpoint: str, profile_id: str, stored_ip: str
+    ) -> ValidatedTarget:
+        try:
+            profile = self._profiles[profile_id]
+            return self._policy.revalidate_local_socket_target(
+                endpoint, profile, stored_ip
+            )
+        except KeyError as exc:
+            raise EnrollmentValidationError(
+                "transport_profile_invalid", dispatch_state="not_dispatched"
+            ) from exc
+        except TargetPolicyError as exc:
+            raise EnrollmentValidationError(
+                exc.code, dispatch_state="not_dispatched"
+            ) from exc
+
     def prepare_cli_target(
         self,
         endpoint: str,

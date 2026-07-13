@@ -24,6 +24,10 @@ from ic_env_guard.enrollment.jobs import (
     EnrollmentJobs,
     job_input_fingerprint,
 )
+from ic_env_guard.enrollment.local_socket import (
+    LocalEnrollmentSocketClient,
+    LocalEnrollmentSocketError,
+)
 from ic_env_guard.enrollment.ssh import (
     EnrollmentHelperResult,
     SshEnrollmentAdapter,
@@ -107,6 +111,15 @@ class AutoEnrollmentAuditContext:
     actor_id: str | None
     source_addr: str | None
     correlation_id: str | None
+
+
+@dataclass(frozen=True)
+class LocalBootstrapRequest:
+    agent_id: str
+    display_name: str
+    base_url: str
+    transport_profile_id: str
+    agent_socket_path: Path
 
 
 @dataclass(frozen=True)
@@ -262,6 +275,8 @@ class EnrollmentOrchestrator:
         removal_repository: AgentRemovalRepository | None = None,
         terminal_usage: GatewayTicketStore | None = None,
         manager_socket_path: Path | None = None,
+        local_socket_client: LocalEnrollmentSocketClient | None = None,
+        local_bootstrap_enabled: bool = False,
     ) -> None:
         self.jobs = jobs
         self.journal = journal
@@ -280,6 +295,8 @@ class EnrollmentOrchestrator:
         self._removals = removal_repository
         self._terminal_usage = terminal_usage
         self._manager_socket_path = manager_socket_path
+        self._local_socket_client = local_socket_client
+        self._local_bootstrap_enabled = local_bootstrap_enabled
         self._background_tasks: dict[str, asyncio.Task[None]] = {}
         self._closing = False
         self._validation_cache: dict[str, EnrollmentValidation] = {}
@@ -472,6 +489,146 @@ class EnrollmentOrchestrator:
                 dispatch_state="unknown",
             )
         return record
+
+    async def bootstrap_local(
+        self,
+        request: LocalBootstrapRequest,
+        context: AutoEnrollmentAuditContext,
+    ) -> AgentRecord:
+        if (
+            not self._local_bootstrap_enabled
+            or self._local_socket_client is None
+            or self.agent_client is None
+            or self._closing
+        ):
+            raise EnrollmentValidationError(
+                "local_bootstrap_disabled", dispatch_state="not_dispatched"
+            )
+        target = self.agent_client.prepare_local(
+            request.base_url, request.transport_profile_id
+        )
+        pending = self.jobs.create(
+            EnrollmentJobRequest(
+                normalized_endpoint=target.normalized_endpoint,
+                transport_profile_id=request.transport_profile_id,
+                display_name=request.display_name,
+                enrollment_method=EnrollmentMethod.LOCAL_SOCKET,
+            ),
+            enrollment_id=request.agent_id,
+            now=self._clock(),
+        )
+        running = self.journal.replace_if_state(
+            replace(pending, state=EnrollmentState.RUNNING, updated_at=self._clock()),
+            expected_state=EnrollmentState.PENDING,
+        )
+        event_id = None
+        helper = None
+        try:
+            if self._auto_audit is None:
+                raise EnrollmentValidationError(
+                    "audit_unavailable", dispatch_state="not_dispatched"
+                )
+            try:
+                event_id = self._auto_audit.record_intent(
+                    running.enrollment_id, context
+                )
+            except Exception:
+                raise EnrollmentValidationError(
+                    "audit_unavailable", dispatch_state="not_dispatched"
+                ) from None
+            helper = await self._local_socket_client.issue(
+                socket_path=request.agent_socket_path,
+                manager_id=running.manager_id,
+                enrollment_id=running.enrollment_id,
+                validation_target=target,
+            )
+            await self._publish_managed_helper(
+                running,
+                helper,
+                expected_method=EnrollmentMethod.LOCAL_SOCKET,
+            )
+            record = await self.consume(
+                running.enrollment_id,
+                display_name=request.display_name,
+                input_fingerprint=job_input_fingerprint(running),
+            )
+        except LocalEnrollmentSocketError as exc:
+            error = EnrollmentValidationError(
+                exc.code,
+                dispatch_state=(
+                    "not_dispatched"
+                    if exc.code
+                    in {
+                        "local_socket_path_rejected",
+                        "local_enrollment_request_invalid",
+                    }
+                    else "unknown"
+                ),
+            )
+            await self._compensate_local_bootstrap(
+                running.enrollment_id, helper, error.code
+            )
+            self._record_auto_outcome(
+                event_id,
+                result="failure",
+                dispatch_state=error.dispatch_state,
+                failure_category=error.code,
+            )
+            raise error from exc
+        except Exception as exc:
+            code = getattr(exc, "code", "storage_unavailable")
+            dispatch_state = getattr(exc, "dispatch_state", "unknown")
+            await self._compensate_local_bootstrap(
+                running.enrollment_id, helper, code
+            )
+            self._record_auto_outcome(
+                event_id,
+                result="failure",
+                dispatch_state=dispatch_state,
+                failure_category=code,
+            )
+            raise
+        self._record_auto_outcome(
+            event_id, result="success", dispatch_state="dispatched"
+        )
+        return record
+
+    async def _compensate_local_bootstrap(
+        self,
+        enrollment_id: str,
+        helper: EnrollmentHelperResult | None,
+        code: str,
+    ) -> None:
+        if helper is not None and self.agent_client is not None:
+            try:
+                await self.agent_client.revoke(
+                    helper.validation_target,
+                    helper.token,
+                    credential_id=helper.credential_id,
+                )
+            except Exception:
+                return
+        current = self.journal.get(enrollment_id)
+        if current is None or current.state.terminal:
+            return
+        if current.recovery_owner == self._recovery_owner:
+            self._fail_claim(current, code)
+            current = self.journal.get(enrollment_id)
+        else:
+            try:
+                current = self.journal.replace_if_state(
+                    replace(
+                        current,
+                        state=EnrollmentState.FAILED,
+                        last_error_code=code,
+                        updated_at=self._clock(),
+                    ),
+                    expected_state=current.state,
+                )
+            except (RegistryError, RevisionConflict):
+                return
+        if current is not None and current.state.terminal:
+            self._cleanup_terminal(current)
 
     async def consume_rotation(
         self, agent_id: str, enrollment_id: str
@@ -1039,7 +1196,9 @@ class EnrollmentOrchestrator:
             validation_target=claim.target,
             now=now,
         )
-        await self._publish_cli_helper(current, helper)
+        await self._publish_managed_helper(
+            current, helper, expected_method=EnrollmentMethod.SSH_CLI
+        )
         self._record_auto_outcome(
             claim.audit_event_id, result="success", dispatch_state="dispatched"
         )
@@ -1317,69 +1476,16 @@ class EnrollmentOrchestrator:
         )
         if self._closing:
             raise _AutoStateLost
-        reference = None
-        try:
-            with self.credential_store.lifecycle_lease():
-                current = self.journal.get(job.enrollment_id)
-                if current is None or current.state is not EnrollmentState.RUNNING:
-                    raise _AutoStateLost
-                reference = self.credential_store.put(helper.token)
-                issued = self.journal.replace_if_state(
-                    replace(
-                        current,
-                        state=EnrollmentState.CREDENTIAL_ISSUED,
-                        remote_instance_id=helper.instance_id,
-                        remote_credential_id=helper.credential_id,
-                        credential_temp_ref=reference,
-                        validated_http_address=str(
-                            helper.validation_target.pinned_address
-                        ),
-                        updated_at=self._clock(),
-                    ),
-                    expected_state=EnrollmentState.RUNNING,
-                )
-        except Exception:
-            if reference is not None:
-                self.credential_store.delete_if_exists(reference)
-            raise
-        verifying = self.journal.replace_if_state(
-            replace(
-                issued,
-                state=EnrollmentState.VERIFYING,
-                updated_at=self._clock(),
-            ),
-            expected_state=EnrollmentState.CREDENTIAL_ISSUED,
+        await self._publish_managed_helper(
+            job, helper, expected_method=job.enrollment_method
         )
-        if self.agent_client is None:
-            raise EnrollmentValidationError(
-                "enrollment_unavailable", dispatch_state="not_dispatched"
-            )
-        target = helper.validation_target
-        if target is None:
-            raise EnrollmentValidationError(
-                "enrollment_unavailable", dispatch_state="not_dispatched"
-            )
-        validation = await self.agent_client.validate_pending(
-            target,
-            self.credential_store.read(verifying.credential_temp_ref),
-            helper_instance_id=helper.instance_id,
-        )
-        self._validation_cache[verifying.enrollment_id] = validation
-        try:
-            self.journal.replace_if_state(
-                replace(
-                    verifying,
-                    state=EnrollmentState.VERIFIED,
-                    updated_at=self._clock(),
-                ),
-                expected_state=EnrollmentState.VERIFYING,
-            )
-        except Exception:
-            self._validation_cache.pop(verifying.enrollment_id, None)
-            raise
 
-    async def _publish_cli_helper(
-        self, job: EnrollmentJob, helper: EnrollmentHelperResult
+    async def _publish_managed_helper(
+        self,
+        job: EnrollmentJob,
+        helper: EnrollmentHelperResult,
+        *,
+        expected_method: EnrollmentMethod,
     ) -> None:
         reference = None
         try:
@@ -1388,12 +1494,18 @@ class EnrollmentOrchestrator:
                 if (
                     current is None
                     or current.state is not EnrollmentState.RUNNING
-                    or current.enrollment_method is not EnrollmentMethod.SSH_CLI
-                    or current.recovery_owner != job.recovery_owner
-                    or current.recovery_revision != job.recovery_revision
+                    or current.enrollment_method is not expected_method
+                    or (
+                        expected_method is EnrollmentMethod.SSH_CLI
+                        and (
+                            current.recovery_owner != job.recovery_owner
+                            or current.recovery_revision != job.recovery_revision
+                        )
+                    )
                 ):
                     raise _AutoStateLost
                 reference = self.credential_store.put(helper.token)
+                cli_submission = expected_method is EnrollmentMethod.SSH_CLI
                 issued = self.journal.replace_if_state(
                     replace(
                         current,
@@ -1404,15 +1516,25 @@ class EnrollmentOrchestrator:
                         validated_http_address=str(
                             helper.validation_target.pinned_address
                         ),
-                        recovery_owner=None,
-                        recovery_lease_until=None,
-                        recovery_revision=current.recovery_revision + 1,
+                        recovery_owner=None if cli_submission else current.recovery_owner,
+                        recovery_lease_until=(
+                            None if cli_submission else current.recovery_lease_until
+                        ),
+                        recovery_revision=(
+                            current.recovery_revision + 1
+                            if cli_submission
+                            else current.recovery_revision
+                        ),
                         updated_at=self._clock(),
                     ),
                     expected_state=EnrollmentState.RUNNING,
-                    expected_recovery_owner=current.recovery_owner,
-                    expected_recovery_revision=current.recovery_revision,
-                    recovery_now=self._clock(),
+                    expected_recovery_owner=(
+                        current.recovery_owner if cli_submission else None
+                    ),
+                    expected_recovery_revision=(
+                        current.recovery_revision if cli_submission else None
+                    ),
+                    recovery_now=self._clock() if cli_submission else None,
                 )
         except Exception:
             if reference is not None:
@@ -1484,6 +1606,23 @@ class EnrollmentOrchestrator:
         except Exception:
             return
 
+    def _prepare_pinned_job(self, job: EnrollmentJob) -> ValidatedTarget:
+        if self.agent_client is None or not job.validated_http_address:
+            raise EnrollmentValidationError(
+                "enrollment_unavailable", dispatch_state="not_dispatched"
+            )
+        if job.enrollment_method is EnrollmentMethod.LOCAL_SOCKET:
+            return self.agent_client.prepare_local_pinned(
+                job.normalized_endpoint,
+                job.transport_profile_id,
+                job.validated_http_address,
+            )
+        return self.agent_client.prepare_pinned(
+            job.normalized_endpoint,
+            job.transport_profile_id,
+            job.validated_http_address,
+        )
+
     async def _recover_validation(self, job: EnrollmentJob) -> None:
         if self.agent_client is None:
             self._fail_claim(job, "enrollment_unavailable")
@@ -1517,11 +1656,7 @@ class EnrollmentOrchestrator:
                 return
             current = transitioned
         try:
-            target = self.agent_client.prepare_pinned(
-                current.normalized_endpoint,
-                current.transport_profile_id,
-                current.validated_http_address,
-            )
+            target = self._prepare_pinned_job(current)
             token = self.credential_store.read(current.credential_temp_ref)
         except EnrollmentValidationError as exc:
             self._fail_claim(current, exc.code)
@@ -1750,11 +1885,7 @@ class EnrollmentOrchestrator:
                 self._fail_claim(current, "enrollment_unavailable")
                 return
             try:
-                target = self.agent_client.prepare_pinned(
-                    current.normalized_endpoint,
-                    current.transport_profile_id,
-                    current.validated_http_address,
-                )
+                target = self._prepare_pinned_job(current)
             except EnrollmentValidationError as exc:
                 self._record_mutation_failure(current, exc.code, exc.dispatch_state)
                 self._fail_claim(current, exc.code)
@@ -1812,7 +1943,13 @@ class EnrollmentOrchestrator:
             transport_profile_id=current.transport_profile_id,
             enrollment_method=current.enrollment_method,
             enabled=True,
-            source="discovery" if current.discovery_result_id is not None else "manual",
+            source=(
+                "local_dev_bootstrap"
+                if current.enrollment_method is EnrollmentMethod.LOCAL_SOCKET
+                else "discovery"
+                if current.discovery_result_id is not None
+                else "manual"
+            ),
             revision=1,
             created_at=self._clock(),
             updated_at=self._clock(),
@@ -1919,11 +2056,7 @@ class EnrollmentOrchestrator:
             self._residual_claim(job, "enrollment_unavailable")
             return
         try:
-            target = self.agent_client.prepare_pinned(
-                job.normalized_endpoint,
-                job.transport_profile_id,
-                job.validated_http_address,
-            )
+            target = self._prepare_pinned_job(job)
             token = self.credential_store.read(job.credential_temp_ref)
         except EnrollmentValidationError as exc:
             self._residual_claim(job, exc.code)

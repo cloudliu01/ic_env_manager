@@ -248,6 +248,77 @@ async def test_ssh_recovery_uses_durable_pin_without_prepare_or_dns(tmp_path):
 
 
 @pytest.mark.integration
+async def test_local_socket_recovery_uses_local_durable_pin_without_dns(tmp_path):
+    calls = []
+
+    class Client:
+        def prepare(self, *_args):
+            raise AssertionError("recovery must not resolve DNS")
+
+        def prepare_pinned(self, *_args):
+            raise AssertionError("local recovery must use the guarded local policy")
+
+        def prepare_local_pinned(self, endpoint, profile, stored_ip):
+            calls.append(("local-pinned", endpoint, profile, stored_ip))
+            return SimpleNamespace(normalized_endpoint=endpoint)
+
+        async def validate_pending(self, _target, token, *, helper_instance_id):
+            calls.append(("validate", token, helper_instance_id))
+            return validation()
+
+    orchestrator, jobs, journal, _registry, store, engine = setup_services(
+        tmp_path, Client()
+    )
+    try:
+        pending = jobs.create(
+            EnrollmentJobRequest(
+                normalized_endpoint="http://127.0.0.1:8766",
+                transport_profile_id="local-loopback-http",
+                enrollment_method=EnrollmentMethod.LOCAL_SOCKET,
+            ),
+            enrollment_id="local-agent",
+            now=NOW,
+        )
+        reference = store.put(b"durably-pinned-local")
+        running = journal.replace_if_state(
+            replace(pending, state=EnrollmentState.RUNNING),
+            expected_state=EnrollmentState.PENDING,
+        )
+        journal.replace_if_state(
+            replace(
+                running,
+                state=EnrollmentState.CREDENTIAL_ISSUED,
+                credential_temp_ref=reference,
+                remote_instance_id="33333333-3333-4333-8333-333333333333",
+                remote_credential_id="remote-credential",
+                validated_http_address="127.0.0.1",
+            ),
+            expected_state=EnrollmentState.RUNNING,
+        )
+
+        await orchestrator.recover()
+
+        recovered = journal.get("local-agent")
+        assert recovered.state is EnrollmentState.VERIFIED
+        assert recovered.validated_http_address == "127.0.0.1"
+        assert calls == [
+            (
+                "local-pinned",
+                "http://127.0.0.1:8766",
+                "local-loopback-http",
+                "127.0.0.1",
+            ),
+            (
+                "validate",
+                b"durably-pinned-local",
+                "33333333-3333-4333-8333-333333333333",
+            ),
+        ]
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.integration
 async def test_recovery_finishes_activated_local_commit_and_consumes_once(tmp_path):
     orchestrator, jobs, journal, registry, store, engine = setup_services(
         tmp_path, client=None
