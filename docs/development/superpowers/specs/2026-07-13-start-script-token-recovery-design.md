@@ -1,6 +1,6 @@
 # Start Script Development Token Recovery Design
 
-**Date:** 2026-07-13  
+**Date:** 2026-07-13
 **Status:** Approved design, pending implementation review
 
 ## Context
