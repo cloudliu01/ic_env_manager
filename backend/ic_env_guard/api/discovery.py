@@ -45,6 +45,14 @@ def list_scopes(
             {
                 "id": scope.id,
                 "name": scope.name,
+                "cidr": str(scope.cidr),
+                "endpoints": [
+                    {
+                        "port": endpoint.port,
+                        "transport_profile_id": endpoint.transport_profile_id,
+                    }
+                    for endpoint in scope.endpoints
+                ],
                 "target_count": service.target_count(scope),
             }
             for scope in scopes

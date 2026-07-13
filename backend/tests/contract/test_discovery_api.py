@@ -101,6 +101,20 @@ def test_discovery_disabled_and_start_body_accepts_only_scope_id(tmp_path):
     assert response.json()["error"]["code"] == "discovery_disabled"
 
     enabled = _client(tmp_path / "enabled", enabled=True)
+    assert enabled.get("/api/v2/discovery/scopes", headers=AUTH).json() == {
+        "enabled": True,
+        "scopes": [
+            {
+                "id": "lab",
+                "name": "Lab",
+                "cidr": "10.20.30.0/30",
+                "endpoints": [
+                    {"port": 8765, "transport_profile_id": "eda-http"}
+                ],
+                "target_count": 2,
+            }
+        ],
+    }
     assert enabled.get("/api/v2/runtime").json() == {
         "mode": "manager",
         "capabilities": [

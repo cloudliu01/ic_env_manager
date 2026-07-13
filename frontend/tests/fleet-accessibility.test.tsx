@@ -7,7 +7,7 @@ import { readFileSync } from 'node:fs';
 import { App } from '../src/app/App';
 
 const apiRequest = vi.hoisted(() => vi.fn());
-vi.mock('../src/shared/api/client', () => ({ apiClient: { request: apiRequest } }));
+vi.mock('../src/shared/api/client', () => ({ apiClient: { request: apiRequest, setToken: vi.fn(), setUnauthorizedHandler: vi.fn() } }));
 const baseStyles = readFileSync('src/shared/styles/base.css', 'utf8');
 
 const agent = {
@@ -69,14 +69,18 @@ function storageText(storage: Storage) {
 
 function installWorkflowApi(removeFails = false) {
   apiRequest.mockImplementation(async (path: string, init?: RequestInit) => {
-    if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2', 'discovery.v2'] };
+    if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['fleet.v2', 'agent-registry.v2', 'discovery.v2'] };
     if (path === '/api/v2/fleet/overview') return { collected_at: '2026-07-12T00:00:00Z', agents: [fleetAgent] };
     if (path === '/api/v2/agents/alpha' && !init?.method) return { agent: fleetAgent };
     if (path === '/api/v2/agents/alpha' && init?.method === 'DELETE') {
       if (removeFails) throw Object.assign(new Error('Agent is in use'), { code: 'agent_in_use' });
       return undefined;
     }
-    if (path === '/api/v2/discovery/scopes') return { enabled: true, scopes: [{ id: 'lab', name: 'Lab rack', target_count: 1 }] };
+    if (path === '/api/v2/transport-profiles') return { profiles: [
+      { id: 'system-tls', type: 'system_tls', security_label: 'Verified TLS', warning: null },
+      { id: 'trusted-lan-http', type: 'trusted_lan_http', security_label: 'Trusted LAN HTTP', warning: 'Unencrypted transport' },
+    ] };
+    if (path === '/api/v2/discovery/scopes') return { enabled: true, scopes: [{ id: 'lab', name: 'Lab rack', cidr: '10.0.0.4/32', endpoints: [{ port: 8765, transport_profile_id: 'trusted-lan-http' }], target_count: 1 }] };
     if (path === '/api/v2/discovery/jobs' && init?.method === 'POST') return { job: discoveryJob };
     if (path === '/api/v2/discovery/jobs/scan-opaque') return { job: discoveryJob };
     if (path === '/api/v2/discovery/jobs/scan-opaque/results') return { results: [discoveryResult] };
@@ -97,6 +101,7 @@ describe('Fleet accessibility workflow', () => {
     window.history.replaceState({}, '', '/agents/alpha/settings');
     Object.defineProperty(window, 'localStorage', { configurable: true, value: memoryStorage() });
     Object.defineProperty(window, 'sessionStorage', { configurable: true, value: memoryStorage() });
+    window.sessionStorage.setItem('ic-env-guard-token', 'manager-test-token');
     apiRequest.mockReset();
     installWorkflowApi();
   });
@@ -145,7 +150,8 @@ describe('Fleet accessibility workflow', () => {
 
     await keyboardActivate(user, await screen.findByRole('link', { name: 'Add agent' }));
     expect(await screen.findByRole('heading', { name: 'Add agent' })).toBe(document.activeElement);
-    expect(screen.getByRole('alert').textContent).toContain('Trusted-LAN');
+    expect((screen.getByLabelText('Transport profile') as HTMLSelectElement).value).toBe('system-tls');
+    expect(screen.queryByRole('alert')).toBeNull();
 
     await keyboardActivate(user, screen.getByRole('link', { name: 'Return to Fleet' }));
     await keyboardActivate(user, await screen.findByRole('link', { name: 'Discover agents' }));

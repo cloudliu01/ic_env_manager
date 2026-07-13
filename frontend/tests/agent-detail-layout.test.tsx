@@ -4,7 +4,7 @@ import { App } from '../src/app/App';
 
 const apiRequest = vi.hoisted(() => vi.fn());
 
-vi.mock('../src/shared/api/client', () => ({ apiClient: { request: apiRequest } }));
+vi.mock('../src/shared/api/client', () => ({ apiClient: { request: apiRequest, setToken: vi.fn(), setUnauthorizedHandler: vi.fn() } }));
 
 const detail = {
   agent_id: 'agent-a', display_name: 'Alpha', endpoint: 'http://10.0.0.4:8765', enabled: true,
@@ -21,9 +21,10 @@ function renderManagerAt(path: string) {
 
 describe('Agent detail shell', () => {
   beforeEach(() => {
+    window.sessionStorage.setItem('ic-env-guard-token', 'manager-test-token');
     apiRequest.mockReset();
     apiRequest.mockImplementation(async (path: string) => {
-      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: [] };
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
       if (path === '/api/v2/agents/agent-a') return { agent: detail };
       throw new Error(`Unexpected request: ${path}`);
     });

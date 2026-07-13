@@ -6,7 +6,7 @@ import { App } from '../src/app/App';
 const apiRequest = vi.hoisted(() => vi.fn());
 
 vi.mock('../src/shared/api/client', () => ({
-  apiClient: { request: apiRequest },
+  apiClient: { request: apiRequest, setToken: vi.fn(), setUnauthorizedHandler: vi.fn() },
 }));
 
 function agent(id: string, capabilities = ['observations.v2']) {
@@ -27,9 +27,10 @@ function renderManagerAt(path: string) {
 
 describe('manager router', () => {
   beforeEach(() => {
+    window.sessionStorage.setItem('ic-env-guard-token', 'manager-test-token');
     apiRequest.mockReset();
     apiRequest.mockImplementation(async (path: string) => {
-      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: [] };
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
       if (path === '/api/v2/agents/agent-b') return { agent: agent('agent-b') };
       if (path === '/api/v2/agents/agent-b/observations') return { items: [] };
       return { agents: [] };
@@ -47,7 +48,7 @@ describe('manager router', () => {
 
   it('shows an unavailable capability with an explanation and return link', async () => {
     apiRequest.mockImplementation(async (path: string) => {
-      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: [] };
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
       if (path === '/api/v2/agents/agent-b') return { agent: agent('agent-b', []) };
       return { items: [] };
     });
@@ -61,7 +62,7 @@ describe('manager router', () => {
 
   it('does not request observations for an unsupported deep link', async () => {
     apiRequest.mockImplementation(async (path: string) => {
-      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: [] };
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
       if (path === '/api/v2/agents/agent-b') return { agent: agent('agent-b', []) };
       throw new Error(`Unexpected request: ${path}`);
     });

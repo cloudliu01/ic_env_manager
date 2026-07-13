@@ -2,10 +2,12 @@ import asyncio
 import hashlib
 import hmac
 import math
+import shlex
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from ipaddress import ip_address
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -87,6 +89,8 @@ class CliSubmissionClaim:
 class EnrollmentPublicResult:
     job: EnrollmentJob
     validation: EnrollmentValidation | None = None
+    manager_socket_path: Path | None = None
+    transport_security: str | None = None
 
     def to_public_dict(self) -> dict[str, Any]:
         validation = self.validation
@@ -118,17 +122,48 @@ class EnrollmentPublicResult:
             agent = {
                 "agent_id": self.job.enrollment_id,
                 "instance_id": validation.instance_id,
+                "name": validation.name,
+                "endpoint": validation.normalized_endpoint,
+                "transport_profile_id": self.job.transport_profile_id,
+                "transport_security": self.transport_security,
                 "api_version": validation.api_version,
                 "agent_version": validation.agent_version,
                 "capabilities": list(validation.capabilities),
+                "summary": validation.summary,
             }
-        return {
+        result = {
             "enrollment_id": self.job.enrollment_id,
             "state": _PUBLIC_STATE.get(state, state.value),
             "expires_at": self.job.expires_at.isoformat().replace("+00:00", "Z"),
             "last_error_code": self.job.last_error_code,
             "preview": {"agent": agent, "phases": phases},
         }
+        if (
+            state is EnrollmentState.AWAITING_CLI
+            and self.job.enrollment_method is EnrollmentMethod.SSH_CLI
+            and self.manager_socket_path is not None
+            and self.job.ssh_user
+            and self.job.ssh_host
+            and self.job.ssh_port
+        ):
+            host = (
+                f"[{self.job.ssh_host}]"
+                if ":" in self.job.ssh_host
+                else self.job.ssh_host
+            )
+            argv = [
+                "ic-env-guardctl",
+                "agent",
+                "enroll",
+                "--manager-socket",
+                str(self.manager_socket_path),
+                "--enrollment-id",
+                self.job.enrollment_id,
+                "--ssh",
+                f"{self.job.ssh_user}@{host}:{self.job.ssh_port}",
+            ]
+            result["cli"] = {"argv": argv, "display": shlex.join(argv)}
+        return result
 
 
 @dataclass(frozen=True)
@@ -168,6 +203,7 @@ class EnrollmentOrchestrator:
         auto_audit: Any | None = None,
         removal_repository: AgentRemovalRepository | None = None,
         terminal_usage: GatewayTicketStore | None = None,
+        manager_socket_path: Path | None = None,
     ) -> None:
         self.jobs = jobs
         self.journal = journal
@@ -185,6 +221,7 @@ class EnrollmentOrchestrator:
         self._auto_audit = auto_audit
         self._removals = removal_repository
         self._terminal_usage = terminal_usage
+        self._manager_socket_path = manager_socket_path
         self._background_tasks: dict[str, asyncio.Task[None]] = {}
         self._closing = False
         self._validation_cache: dict[str, EnrollmentValidation] = {}
@@ -192,8 +229,21 @@ class EnrollmentOrchestrator:
         max_operation = getattr(agent_client, "max_network_operation_seconds", 10.0)
         self._recovery_lease_seconds = max(3, math.ceil(float(max_operation) * 2))
 
+    def _public_result(
+        self,
+        job: EnrollmentJob,
+        validation: EnrollmentValidation | None = None,
+    ) -> EnrollmentPublicResult:
+        profile = self._transport_profiles.get(job.transport_profile_id)
+        return EnrollmentPublicResult(
+            job,
+            validation,
+            manager_socket_path=self._manager_socket_path,
+            transport_security=getattr(profile, "type", None),
+        )
+
     def create(self, request: EnrollmentJobRequest) -> EnrollmentPublicResult:
-        return EnrollmentPublicResult(self.jobs.create(request, now=self._clock()))
+        return self._public_result(self.jobs.create(request, now=self._clock()))
 
     def create_auto(
         self,
@@ -223,7 +273,7 @@ class EnrollmentOrchestrator:
                 ),
                 expected_state=EnrollmentState.PENDING,
             )
-            return EnrollmentPublicResult(awaiting)
+            return self._public_result(awaiting)
         running = self.journal.claim_pending_auto(
             pending.enrollment_id, now=self._clock()
         )
@@ -231,9 +281,9 @@ class EnrollmentOrchestrator:
             current = self.journal.get(pending.enrollment_id)
             if current is None:
                 raise RegistryError("enrollment journal storage is unavailable")
-            return EnrollmentPublicResult(current)
+            return self._public_result(current)
         self._schedule_auto(running, audit_context)
-        return EnrollmentPublicResult(running)
+        return self._public_result(running)
 
     def start_rotation(
         self,
@@ -277,7 +327,7 @@ class EnrollmentOrchestrator:
                 ),
                 expected_state=EnrollmentState.PENDING,
             )
-            return EnrollmentPublicResult(awaiting)
+            return self._public_result(awaiting)
         running = self.journal.claim_pending_auto(
             pending.enrollment_id, now=self._clock()
         )
@@ -285,12 +335,12 @@ class EnrollmentOrchestrator:
             current = self.journal.get(pending.enrollment_id)
             if current is None:
                 raise RegistryError("enrollment journal storage is unavailable")
-            return EnrollmentPublicResult(current)
+            return self._public_result(current)
         self._schedule_auto(
             running,
             audit_context or AutoEnrollmentAuditContext(None, None, None),
         )
-        return EnrollmentPublicResult(running)
+        return self._public_result(running)
 
     @property
     def background_task_count(self) -> int:
@@ -310,7 +360,7 @@ class EnrollmentOrchestrator:
         await asyncio.gather(*tasks, return_exceptions=True)
 
     def get(self, enrollment_id: str) -> EnrollmentPublicResult:
-        return EnrollmentPublicResult(
+        return self._public_result(
             self.jobs.get(enrollment_id, now=self._clock()),
             self._validation_cache.get(enrollment_id),
         )
@@ -319,7 +369,7 @@ class EnrollmentOrchestrator:
         self,
         enrollment_id: str,
         *,
-        display_name: str,
+        display_name: str | None,
         input_fingerprint: str,
     ) -> AgentRecord:
         current = self.jobs.get(enrollment_id, now=self._clock())
@@ -331,6 +381,14 @@ class EnrollmentOrchestrator:
             raise EnrollmentConflict("agent_enrollment_not_verified")
         if input_fingerprint != job_input_fingerprint(current):
             raise EnrollmentConflict("agent_enrollment_input_changed")
+        validation = self._validation_cache.get(enrollment_id)
+        selected_display_name = (
+            display_name
+            or current.requested_display_name
+            or (validation.name if validation is not None else None)
+        )
+        if not selected_display_name:
+            raise EnrollmentConflict("agent_display_name_required")
         duplicate = self.registry.find_duplicate(
             instance_id=current.remote_instance_id,
             normalized_endpoint=current.normalized_endpoint,
@@ -339,7 +397,7 @@ class EnrollmentOrchestrator:
             raise EnrollmentConflict("agent_already_registered")
         requested = self.jobs.consume(
             enrollment_id,
-            display_name=display_name,
+            display_name=selected_display_name,
             input_fingerprint=input_fingerprint,
             now=self._clock(),
         )
@@ -637,7 +695,7 @@ class EnrollmentOrchestrator:
         if task is not None:
             task.cancel()
         with self.credential_store.lifecycle_lease():
-            return EnrollmentPublicResult(
+            return self._public_result(
                 self._cleanup_terminal(
                     self.jobs.cancel(enrollment_id, now=self._clock())
                 )
@@ -956,7 +1014,7 @@ class EnrollmentOrchestrator:
                 expected_state=EnrollmentState.VERIFYING,
             )
             self._validation_cache[verified.enrollment_id] = validation
-            return EnrollmentPublicResult(verified, validation)
+            return self._public_result(verified, validation)
         except (EnrollmentValidationError, CredentialStoreError) as exc:
             current = self.journal.get(job.enrollment_id)
             if current is not None and not current.state.terminal:
@@ -1209,15 +1267,19 @@ class EnrollmentOrchestrator:
             self.credential_store.read(verifying.credential_temp_ref),
             helper_instance_id=helper.instance_id,
         )
-        verified = self.journal.replace_if_state(
-            replace(
-                verifying,
-                state=EnrollmentState.VERIFIED,
-                updated_at=self._clock(),
-            ),
-            expected_state=EnrollmentState.VERIFYING,
-        )
-        self._validation_cache[verified.enrollment_id] = validation
+        self._validation_cache[verifying.enrollment_id] = validation
+        try:
+            self.journal.replace_if_state(
+                replace(
+                    verifying,
+                    state=EnrollmentState.VERIFIED,
+                    updated_at=self._clock(),
+                ),
+                expected_state=EnrollmentState.VERIFYING,
+            )
+        except Exception:
+            self._validation_cache.pop(verifying.enrollment_id, None)
+            raise
 
     async def _publish_cli_helper(
         self, job: EnrollmentJob, helper: EnrollmentHelperResult
@@ -1272,11 +1334,15 @@ class EnrollmentOrchestrator:
             self.credential_store.read(verifying.credential_temp_ref),
             helper_instance_id=helper.instance_id,
         )
-        verified = self.journal.replace_if_state(
-            replace(verifying, state=EnrollmentState.VERIFIED, updated_at=self._clock()),
-            expected_state=EnrollmentState.VERIFYING,
-        )
-        self._validation_cache[verified.enrollment_id] = validation
+        self._validation_cache[verifying.enrollment_id] = validation
+        try:
+            self.journal.replace_if_state(
+                replace(verifying, state=EnrollmentState.VERIFIED, updated_at=self._clock()),
+                expected_state=EnrollmentState.VERIFYING,
+            )
+        except Exception:
+            self._validation_cache.pop(verifying.enrollment_id, None)
+            raise
 
     def _converge_auto(
         self,

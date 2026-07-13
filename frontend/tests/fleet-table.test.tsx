@@ -1,4 +1,4 @@
-import { cleanup, render, screen, within } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // @ts-expect-error Vitest runs tests in Node; the frontend compiler intentionally omits Node types.
@@ -8,7 +8,7 @@ import { App } from '../src/app/App';
 const apiRequest = vi.hoisted(() => vi.fn());
 const baseStyles = readFileSync('src/shared/styles/base.css', 'utf8');
 
-vi.mock('../src/shared/api/client', () => ({ apiClient: { request: apiRequest } }));
+vi.mock('../src/shared/api/client', () => ({ apiClient: { request: apiRequest, setToken: vi.fn(), setUnauthorizedHandler: vi.fn() } }));
 
 function setViewport(width: number) {
   Object.defineProperty(window, 'matchMedia', {
@@ -42,11 +42,12 @@ const agents = [
 
 describe('Fleet table', () => {
   beforeEach(() => {
+    window.sessionStorage.setItem('ic-env-guard-token', 'manager-test-token');
     setViewport(1440);
     window.history.replaceState({}, '', '/fleet');
     apiRequest.mockReset();
     apiRequest.mockImplementation(async (path: string) => {
-      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: [] };
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['fleet.v2'] };
       if (path === '/api/v2/fleet/overview') return { collected_at: '2026-07-12T08:02:00Z', agents };
       if (path === '/api/v2/agents/agent-a') return { agent: agents[0] };
       return { agents: [] };
@@ -69,7 +70,7 @@ describe('Fleet table', () => {
 
     const row = within(table).getByRole('row', { name: /Alpha/ });
     expect(within(row).getByText('Degraded')).toBeTruthy();
-    expect(within(row).getByText('1 critical')).toBeTruthy();
+    expect(within(row).getByText('4 total · 1 critical')).toBeTruthy();
     expect(within(row).getByText('Unencrypted')).toBeTruthy();
     expect(within(row).getByText('Last error: agent_network_error')).toBeTruthy();
     expect(within(row).getByLabelText('Degraded status').querySelector('svg')).toBeTruthy();
@@ -97,7 +98,7 @@ describe('Fleet table', () => {
     }
   });
 
-  it('keeps filters in the URL and exposes only non-mutating row entry points', async () => {
+  it('keeps filters and sorting in the URL and exposes complete row operations', async () => {
     const user = userEvent.setup();
     render(<App />);
 
@@ -109,8 +110,64 @@ describe('Fleet table', () => {
     await user.click(screen.getByRole('button', { name: 'Actions for Alpha' }));
     expect(screen.getByRole('menu')).toBeTruthy();
     expect(screen.getByRole('menuitem', { name: 'Probe Alpha' })).toBeTruthy();
-    await user.click(screen.getByRole('link', { name: 'Open Alpha' }));
-    expect(window.location.pathname).toBe('/agents/agent-a/overview');
+    expect(screen.getByRole('menuitem', { name: 'Disable Alpha' })).toBeTruthy();
+    expect(screen.getByRole('menuitem', { name: 'Edit Alpha' }).getAttribute('href')).toBe('/agents/agent-a/settings');
+    expect(screen.getByRole('menuitem', { name: 'Remove Alpha' })).toBeTruthy();
+
+    await user.click(within(screen.getByRole('columnheader', { name: /Agent/ })).getByRole('button'));
+    expect(window.location.search).toContain('sort=agent');
+    expect(window.location.search).toContain('order=desc');
+  });
+
+  it('probes, disables, and removes a selected Agent through real APIs', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole('table', { name: 'Fleet agents' });
+
+    await user.click(screen.getByRole('button', { name: 'Actions for Alpha' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Probe Alpha' }));
+    await waitFor(() => expect(apiRequest).toHaveBeenCalledWith('/api/v2/agents/agent-a/probe', expect.objectContaining({ method: 'POST' })));
+
+    await user.click(screen.getByRole('button', { name: 'Actions for Alpha' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Disable Alpha' }));
+    await waitFor(() => expect(apiRequest).toHaveBeenCalledWith('/api/v2/agents/agent-a', expect.objectContaining({ method: 'PUT', body: '{"enabled":false}' })));
+
+    await user.click(screen.getByRole('button', { name: 'Actions for Alpha' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Remove Alpha' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Remove from Manager' });
+    await user.click(within(dialog).getByRole('button', { name: 'Remove from Manager' }));
+    await waitFor(() => expect(apiRequest).toHaveBeenCalledWith('/api/v2/agents/agent-a', expect.objectContaining({ method: 'DELETE' })));
+  });
+
+  it('shows fleet status counts and filters by capability and problems', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole('table', { name: 'Fleet agents' });
+    expect(screen.getByText('Ready 1')).toBeTruthy();
+    expect(screen.getByText('Degraded 1')).toBeTruthy();
+
+    await user.selectOptions(screen.getByLabelText('Capability'), 'summary.v2');
+    expect(window.location.search).toContain('capability=summary.v2');
+    await user.selectOptions(screen.getByLabelText('Problems'), 'has-problems');
+    expect(window.location.search).toContain('problem=has-problems');
+    expect(screen.getByText('Alpha')).toBeTruthy();
+    expect(screen.queryByText('Beta')).toBeNull();
+  });
+
+  it('refreshes every enabled Agent without one failure blocking the rest', async () => {
+    apiRequest.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['fleet.v2'] };
+      if (path === '/api/v2/fleet/overview') return { collected_at: '2026-07-12T08:02:00Z', agents };
+      if (path === '/api/v2/agents/agent-a/probe' && init?.method === 'POST') throw new Error('offline');
+      if (path === '/api/v2/agents/agent-b/probe' && init?.method === 'POST') return { agent: agents[1] };
+      return { agents: [] };
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole('table', { name: 'Fleet agents' });
+    await user.click(screen.getByRole('button', { name: 'Refresh all' }));
+    expect((await screen.findByRole('status', { name: 'Fleet refresh result' })).textContent).toContain('1 refreshed; 1 failed');
+    expect(apiRequest).toHaveBeenCalledWith('/api/v2/agents/agent-b/probe', expect.objectContaining({ method: 'POST' }));
   });
 
   it('falls back to the table when matchMedia is unavailable', async () => {

@@ -1,7 +1,9 @@
+import { lazy, Suspense } from 'react';
 import { Link, NavLink, Outlet, useLocation, useOutletContext, useParams } from 'react-router-dom';
 import { Agent } from './types';
 import { useAgent } from './queries';
-import { TerminalPage } from '../terminal/TerminalPage';
+
+const TerminalPage = lazy(() => import('../terminal/TerminalPage').then((module) => ({ default: module.TerminalPage })));
 
 const detailTabs = [
   { path: 'overview', label: 'Overview' },
@@ -47,7 +49,7 @@ export function AgentLayout() {
     </nav>
     <div hidden={!terminalVisible} className="persistent-agent-terminal">
       {agent.data.capabilities.includes('terminals.v1') ? <><h1 tabIndex={-1} className="sr-only">Terminal</h1>
-        <TerminalPage target={{ agentId, name: agent.data.display_name, capabilities: agent.data.capabilities }} visible={terminalVisible} /></> : <section><h1 tabIndex={-1}>Feature unavailable</h1><p role="alert">This Agent does not advertise <code>terminals.v1</code>.</p></section>}
+        <Suspense fallback={<p role="status">Loading Terminal…</p>}><TerminalPage target={{ agentId, name: agent.data.display_name, capabilities: agent.data.capabilities }} visible={terminalVisible} /></Suspense></> : <section><h1 tabIndex={-1}>Feature unavailable</h1><p role="alert">This Agent does not advertise <code>terminals.v1</code>.</p></section>}
     </div>
     {terminalVisible ? null : <Outlet context={context} />}
   </section>;

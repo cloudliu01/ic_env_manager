@@ -25,6 +25,7 @@ export type AgentFilters = {
   connection_status?: string;
   workload_status?: string;
   capability?: string;
+  problem?: string;
 };
 
 export type ObservationFilters = {

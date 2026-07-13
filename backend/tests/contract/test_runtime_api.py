@@ -147,6 +147,52 @@ def test_manager_runtime_reports_configured_trusted_lan_adapter_without_policy_d
 
 
 @pytest.mark.contract
+def test_authenticated_manager_transport_profiles_are_safe_select_metadata(tmp_path):
+    token_file = _token_file(tmp_path)
+    config = AppConfig(
+        mode="control-plane",
+        auth=AuthConfig(token_file=token_file),
+        control_plane=ControlPlaneConfig(
+            audit_database=tmp_path / "control-plane.db",
+            allowed_agent_cidrs=["10.0.0.0/8"],
+            transport_profiles=(
+                TrustedLanHttpProfile(
+                    id="lab-http", allowed_cidrs=["10.1.0.0/16"]
+                ),
+            ),
+        ),
+    )
+    client = TestClient(create_app(config=config))
+
+    missing = client.get("/api/v2/transport-profiles")
+    response = client.get(
+        "/api/v2/transport-profiles",
+        headers={"Authorization": "Bearer secret-token"},
+    )
+
+    assert missing.status_code == 401
+    assert response.status_code == 200
+    assert response.json() == {
+        "profiles": [
+            {
+                "id": "system-tls",
+                "type": "verified_tls",
+                "security_label": "Verified TLS",
+                "warning": None,
+            },
+            {
+                "id": "lab-http",
+                "type": "trusted_lan_http",
+                "security_label": "Trusted-LAN HTTP",
+                "warning": "trusted_lan_http_unencrypted",
+            },
+        ]
+    }
+    assert "10.1.0.0/16" not in response.text
+    assert "ca_bundle" not in response.text
+
+
+@pytest.mark.contract
 def test_manager_runtime_does_not_claim_v2_when_self_target_inventory_fails(
     tmp_path, monkeypatch
 ):

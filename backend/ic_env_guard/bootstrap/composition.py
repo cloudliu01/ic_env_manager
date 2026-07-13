@@ -427,6 +427,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
         auto_audit=ManagerAutoEnrollmentAudit(control_plane_session_factory),
         removal_repository=removal_repository,
         terminal_usage=gateway_ticket_store,
+        manager_socket_path=config.enrollment.manager_socket_path,
     )
     discovery_service = DiscoveryService(
         config=config.control_plane.discovery,

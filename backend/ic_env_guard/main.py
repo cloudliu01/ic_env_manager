@@ -105,6 +105,7 @@ from ic_env_guard.api.terminals import (
 from ic_env_guard.api.terminals import (
     router as terminals_router,
 )
+from ic_env_guard.api.transport_profiles import router as transport_profiles_router
 from ic_env_guard.api.v2_errors import (
     V2ApiError,
     is_v2_path,
@@ -575,6 +576,7 @@ def create_app(
         app.include_router(agent_terminals_router)
         app.include_router(agent_terminal_ws_router)
         app.include_router(control_plane_audit_router)
+        app.include_router(transport_profiles_router)
         app.include_router(discovery_router)
 
     mount_static_ui(app)

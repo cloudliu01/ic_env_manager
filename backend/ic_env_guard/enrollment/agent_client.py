@@ -34,6 +34,7 @@ class EnrollmentValidation:
     instance_id: str | None
     summary: dict[str, Any] | None
     readiness_warning: str | None
+    name: str | None = None
 
 
 class EnrollmentAgentClient:
@@ -224,6 +225,7 @@ class EnrollmentAgentClient:
             instance_id=payload["instance_id"],
             summary=summary,
             readiness_warning=warning,
+            name=payload["name"],
         )
 
     async def activate(
@@ -320,6 +322,7 @@ def _parse_capabilities(
         ):
             raise ValueError
         result["instance_id"] = instance_id
+        result["name"] = name
     return result
 
 

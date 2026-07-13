@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { useEffect } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '../src/app/App';
-import { ApiClient, ApiClientError } from '../src/shared/api/client';
+import { apiClient, ApiClient, ApiClientError } from '../src/shared/api/client';
 
 const terminalMounts = vi.hoisted(() => vi.fn());
 
@@ -67,11 +67,14 @@ describe('runtime routing', () => {
   beforeEach(() => {
     window.history.replaceState({}, '', '/');
     window.sessionStorage.clear();
+    apiClient.setToken(null);
+    apiClient.setUnauthorizedHandler(undefined);
     terminalMounts.mockClear();
   });
 
   afterEach(() => {
     cleanup();
+    window.sessionStorage.clear();
     vi.unstubAllGlobals();
   });
 
@@ -187,14 +190,97 @@ describe('runtime routing', () => {
     await waitFor(() => expect(document.activeElement).toBe(heading));
   });
 
-  it('routes manager mode to the fleet router', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => response({ mode: 'manager', capabilities: [] })));
+  it('requires manager authentication before routing to the fleet', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.endsWith('/api/v2/runtime')) return response({ mode: 'manager', capabilities: ['fleet.v2'] });
+      if (path.endsWith('/api/v2/fleet/overview')) return response({ agents: [], collected_at: '2026-07-13T00:00:00Z' });
+      return response({});
+    }));
+    const user = userEvent.setup();
     render(<App />);
 
+    expect(await screen.findByRole('button', { name: 'Sign in' })).toBeTruthy();
+    expect(screen.queryByRole('heading', { name: 'Fleet' })).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: 'Sign in' }));
     expect(await screen.findByRole('heading', { name: 'Fleet' })).toBeTruthy();
     expect(window.location.pathname).toBe('/fleet');
     expect(screen.getByText('Manager Console')).toBeTruthy();
     expect(screen.queryByText('Standalone Agent')).toBeNull();
+  });
+
+  it('restores a manager session and redirects an authenticated login route to fleet', async () => {
+    window.history.replaceState({}, '', '/login');
+    window.sessionStorage.setItem('ic-env-guard-token', 'manager-session-token');
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.endsWith('/api/v2/runtime')) return response({ mode: 'manager', capabilities: ['fleet.v2'] });
+      if (path.endsWith('/api/v2/fleet/overview')) return response({ agents: [], collected_at: '2026-07-13T00:00:00Z' });
+      return response({});
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByRole('heading', { name: 'Fleet' })).toBeTruthy();
+    expect(window.location.pathname).toBe('/fleet');
+    expect(screen.queryByRole('button', { name: 'Sign in' })).toBeNull();
+  });
+
+  it('expires a restored manager session on 401 while preserving the deep link', async () => {
+    window.history.replaceState({}, '', '/fleet?connection_status=ready');
+    window.sessionStorage.setItem('ic-env-guard-token', 'expired-manager-token');
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.endsWith('/api/v2/runtime')) return response({ mode: 'manager', capabilities: ['fleet.v2'] });
+      if (path.endsWith('/api/v2/fleet/overview')) {
+        return response({ error: { code: 'unauthorized', message: 'expired' } }, 401);
+      }
+      return response({});
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByRole('button', { name: 'Sign in' })).toBeTruthy();
+    expect(window.location.pathname).toBe('/fleet');
+    expect(window.location.search).toBe('?connection_status=ready');
+    expect(window.sessionStorage.getItem('ic-env-guard-token')).toBeNull();
+  });
+
+  it('logs out of manager mode and clears the browser session', async () => {
+    window.sessionStorage.setItem('ic-env-guard-token', 'manager-session-token');
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.endsWith('/api/v2/runtime')) return response({ mode: 'manager', capabilities: ['fleet.v2'] });
+      if (path.endsWith('/api/v2/fleet/overview')) return response({ agents: [], collected_at: '2026-07-13T00:00:00Z' });
+      if (path.endsWith('/api/auth/logout')) return new Response(null, { status: 204 });
+      return response({});
+    }));
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', { name: 'Sign out' }));
+
+    expect(await screen.findByRole('button', { name: 'Sign in' })).toBeTruthy();
+    expect(window.location.pathname).toBe('/login');
+    expect(window.sessionStorage.getItem('ic-env-guard-token')).toBeNull();
+  });
+
+  it('blocks a Manager feature that is absent from runtime capabilities without calling its API', async () => {
+    window.history.replaceState({}, '', '/discovery');
+    window.sessionStorage.setItem('ic-env-guard-token', 'manager-session-token');
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.endsWith('/api/v2/runtime')) return response({ mode: 'manager', capabilities: ['fleet.v2', 'agent-registry.v2'] });
+      return response({});
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+
+    expect(await screen.findByRole('heading', { name: 'Feature unavailable' })).toBeTruthy();
+    expect(screen.getByRole('alert').textContent).toContain('discovery.v2');
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes('/api/v2/discovery/scopes'))).toBe(false);
   });
 });
 

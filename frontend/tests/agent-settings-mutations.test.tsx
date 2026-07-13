@@ -4,16 +4,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '../src/app/App';
 
 const apiRequest = vi.hoisted(() => vi.fn());
-vi.mock('../src/shared/api/client', () => ({ apiClient: { request: apiRequest } }));
+vi.mock('../src/shared/api/client', () => ({ apiClient: { request: apiRequest, setToken: vi.fn(), setUnauthorizedHandler: vi.fn() } }));
 
 const agent = { agent_id: 'alpha', display_name: 'Alpha', endpoint: 'https://10.0.0.4:8765', transport_profile_id: 'system-tls', enabled: true, connection_status: 'ready', workload_status: 'healthy', capabilities: [] };
 
 describe('Agent Settings mutations', () => {
   beforeEach(() => {
+    window.sessionStorage.setItem('ic-env-guard-token', 'manager-test-token');
     window.history.replaceState({}, '', '/agents/alpha/settings');
     apiRequest.mockReset();
     apiRequest.mockImplementation(async (path: string, init?: RequestInit) => {
       if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
+      if (path === '/api/v2/transport-profiles') return { profiles: [{ id: 'system-tls', type: 'verified_tls', security_label: 'Verified TLS', warning: null }] };
       if (path === '/api/v2/agents/alpha' && !init?.method) return { agent };
       if (path === '/api/v2/agents/alpha' && init?.method === 'DELETE') throw Object.assign(new Error('Agent is in use'), { code: 'agent_in_use' });
       if (path === '/api/v2/agents/alpha' && init?.method === 'PUT') return { agent };
@@ -30,6 +32,13 @@ describe('Agent Settings mutations', () => {
     await user.type(url, 'https://10.0.0.5:8765');
     await user.click(screen.getByRole('button', { name: 'Save changes' }));
     expect(screen.getByRole('alert').textContent).toContain('same Agent identity');
+  });
+
+  it('restricts edits to configured transport profiles', async () => {
+    render(<App />);
+    const profile = await screen.findByLabelText('Transport profile');
+    expect(profile.tagName).toBe('SELECT');
+    expect(screen.getByRole('option', { name: 'Verified TLS — system-tls' })).toBeTruthy();
   });
 
   it('keeps an agent_in_use removal dialog actionable', async () => {

@@ -10,9 +10,10 @@ const CAPABILITIES = ['services.v1', 'terminals.v1', 'audit.v1', 'monitoring.sna
 
 vi.mock('../src/features/metrics/api', () => ({ getMonitoringSnapshot: getAgentMonitoringSnapshot }));
 
-vi.mock('../src/shared/api/client', () => ({ apiClient: { request: apiRequest } }));
+vi.mock('../src/shared/api/client', () => ({ apiClient: { request: apiRequest, setToken: vi.fn(), setUnauthorizedHandler: vi.fn() } }));
 
 beforeEach(() => {
+  window.sessionStorage.setItem('ic-env-guard-token', 'manager-test-token');
   getAgentMonitoringSnapshot.mockReset();
   getAgentMonitoringSnapshot.mockImplementation(async (agentId: string) => ({
     host_id: agentId,
@@ -53,7 +54,7 @@ describe('Manager monitoring', () => {
     window.history.replaceState({}, '', '/monitoring');
     apiRequest.mockReset();
     apiRequest.mockImplementation(async (path: string) => {
-      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: [] };
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['fleet.v2'] };
       if (path === '/api/v2/fleet/overview') {
         return { collected_at: '2026-07-12T08:02:00Z', agents: [{
           agent_id: 'agent-a', display_name: 'Alpha', enabled: true, endpoint: 'http://10.0.0.4:8765',

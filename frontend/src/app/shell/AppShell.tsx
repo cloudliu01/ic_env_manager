@@ -24,7 +24,7 @@ const managerNavigation = [
   { to: '/audit', label: 'Audit' },
 ];
 
-export function AppShell({ identity, terminal, children, manager = false }: PropsWithChildren<{ identity: Identity; terminal: ReactNode; manager?: boolean }>) {
+export function AppShell({ identity, terminal, children, manager = false, actor, onSignOut }: PropsWithChildren<{ identity: Identity; terminal: ReactNode; manager?: boolean; actor?: string; onSignOut?: () => void }>) {
   const location = useLocation();
 
   useEffect(() => {
@@ -81,7 +81,7 @@ export function AppShell({ identity, terminal, children, manager = false }: Prop
       <div className="app-workspace">
         <header className="identity-bar">
           <div><span className="mode-label">{manager ? 'Manager Console' : 'Standalone Agent'}</span><strong>{identity.name}</strong></div>
-          {manager ? null : <code>{identity.instance_id}</code>}
+          {manager ? <div><span>Signed in as {actor}</span><button type="button" className="secondary-button" onClick={onSignOut}>Sign out</button></div> : <code>{identity.instance_id}</code>}
         </header>
         <main id="main-content" tabIndex={-1}>
           {!manager ? <div hidden={location.pathname !== '/terminal'} className="persistent-terminal">

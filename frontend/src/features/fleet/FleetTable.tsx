@@ -5,6 +5,12 @@ import { Agent } from '../agent-registry/types';
 
 type SortDirection = 'ascending' | 'descending';
 
+type FleetActions = {
+  onProbe: (agent: Agent) => void;
+  onToggle: (agent: Agent) => void;
+  onRemove: (agent: Agent) => void;
+};
+
 function count(agent: Agent, section: string, key: string) {
   const value = agent.summary?.[section];
   return typeof value === 'object' && value && typeof (value as Record<string, unknown>)[key] === 'number'
@@ -17,9 +23,8 @@ function Status({ value }: { value: string }) {
   return <span className={`status status-${value}`} aria-label={`${label} status`}><Icon size={14} aria-hidden="true" />{label}</span>;
 }
 
-export function FleetTable({ agents }: { agents: Agent[] }) {
+export function FleetTable({ agents, direction, onDirectionChange, onProbe, onToggle, onRemove }: { agents: Agent[]; direction: SortDirection; onDirectionChange: (direction: SortDirection) => void } & FleetActions) {
   const navigate = useNavigate();
-  const [direction, setDirection] = useState<SortDirection>('ascending');
   const [menuAgent, setMenuAgent] = useState<string | null>(null);
   const sorted = useMemo(() => agents.map((agent, index) => ({ agent, index })).sort((a, b) => {
     const result = a.agent.display_name.localeCompare(b.agent.display_name);
@@ -32,7 +37,7 @@ export function FleetTable({ agents }: { agents: Agent[] }) {
 
   return <div className="table-region"><table className="fleet-table" aria-label="Fleet agents">
     <thead><tr>
-      <th aria-sort={direction}><button type="button" className="table-sort" onClick={() => setDirection(direction === 'ascending' ? 'descending' : 'ascending')}>Agent</button></th>
+      <th aria-sort={direction}><button type="button" className="table-sort" onClick={() => onDirectionChange(direction === 'ascending' ? 'descending' : 'ascending')}>Agent</button></th>
       <th>Health</th><th>Transport</th><th>Version</th><th>Observations</th><th>Services</th><th>Last probe</th><th>Actions</th>
     </tr></thead>
     <tbody>{sorted.map((agent) => {
@@ -43,12 +48,17 @@ export function FleetTable({ agents }: { agents: Agent[] }) {
         <td className="fleet-health-cell"><Status value={agent.connection_status} /><Status value={agent.workload_status} /></td>
         <td className="fleet-transport-cell">{agent.endpoint ? <span className="data-cell" title={agent.endpoint}>{agent.endpoint}</span> : 'No endpoint'}{agent.transport_warning ? <span className="status status-warning">Unencrypted</span> : null}</td>
         <td className="data-cell fleet-cell">{agent.agent_version ?? '—'}</td>
-        <td className="fleet-cell">{critical ? `${critical} critical` : `${count(agent, 'observations', 'total')} total`}</td>
-        <td className="fleet-cell">{unhealthy ? `${unhealthy} unhealthy` : `${count(agent, 'services', 'total')} total`}</td>
+        <td className="fleet-cell">{count(agent, 'observations', 'total')} total{critical ? ` · ${critical} critical` : ''}</td>
+        <td className="fleet-cell">{count(agent, 'services', 'total')} total{unhealthy ? ` · ${unhealthy} unhealthy` : ''}</td>
         <td className="data-cell fleet-cell" title={agent.observed_at ?? undefined}>{agent.observed_at ? new Date(agent.observed_at).toLocaleString() : 'Never'}</td>
         <td className="fleet-actions" onClick={(event) => event.stopPropagation()}><Link className="secondary-button fleet-open" to={`/agents/${encodeURIComponent(agent.agent_id)}/overview`}>Open {agent.display_name}</Link>
           <button type="button" className="icon-button fleet-actions-trigger" aria-label={`Actions for ${agent.display_name}`} aria-expanded={menuAgent === agent.agent_id} onClick={() => setMenuAgent(menuAgent === agent.agent_id ? null : agent.agent_id)}>Actions</button>
-          {menuAgent === agent.agent_id ? <div className="row-menu" role="menu"><button type="button" role="menuitem" onClick={() => setMenuAgent(null)}>Probe {agent.display_name}</button></div> : null}
+          {menuAgent === agent.agent_id ? <div className="row-menu" role="menu">
+            <button type="button" role="menuitem" onClick={() => { setMenuAgent(null); onProbe(agent); }}>Probe {agent.display_name}</button>
+            <button type="button" role="menuitem" onClick={() => { setMenuAgent(null); onToggle(agent); }}>{agent.enabled ? 'Disable' : 'Enable'} {agent.display_name}</button>
+            <Link role="menuitem" to={`/agents/${encodeURIComponent(agent.agent_id)}/settings`} onClick={() => setMenuAgent(null)}>Edit {agent.display_name}</Link>
+            <button type="button" role="menuitem" onClick={() => { setMenuAgent(null); onRemove(agent); }}>Remove {agent.display_name}</button>
+          </div> : null}
         </td>
       </tr>;
     })}</tbody>

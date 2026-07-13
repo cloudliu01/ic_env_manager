@@ -7,7 +7,22 @@ export type EnrollmentJob = {
   expires_at?: string;
   last_error_code?: string | null;
   residual_warning?: string | null;
-  preview?: { agent?: { agent_id?: string; instance_id?: string | null }; phases?: Record<string, unknown> };
+  cli?: { argv: string[]; display: string };
+  preview?: {
+    agent?: {
+      agent_id?: string;
+      instance_id?: string | null;
+      name?: string | null;
+      endpoint?: string;
+      transport_profile_id?: string;
+      transport_security?: string | null;
+      api_version?: string;
+      agent_version?: string;
+      capabilities?: string[];
+      summary?: Record<string, unknown> | null;
+    } | null;
+    phases?: Record<string, { status?: string; code?: string | null }>;
+  };
 };
 
 export type EnrollmentInput = {
@@ -30,7 +45,7 @@ export function cancelEnrollment(enrollmentId: string) {
   return apiClient.request<EnrollmentJob>(`/api/v2/agent-enrollments/${encodeURIComponent(enrollmentId)}/cancel`, { method: 'POST' });
 }
 
-export function saveEnrolledAgent(enrollmentId: string, displayName: string) {
+export function saveEnrolledAgent(enrollmentId: string, displayName?: string) {
   return apiClient.request<{ agent: Agent }>('/api/v2/agents', { method: 'POST', body: JSON.stringify({ enrollment_id: enrollmentId, display_name: displayName }) });
 }
 
@@ -40,6 +55,10 @@ export function validateLegacyAgent(input: Pick<EnrollmentInput, 'base_url' | 't
 
 export function updateAgent(agentId: string, body: Partial<Pick<Agent, 'display_name' | 'enabled'>> & { base_url?: string; transport_profile_id?: string }) {
   return apiClient.request<{ agent: Agent }>(`/api/v2/agents/${encodeURIComponent(agentId)}`, { method: 'PUT', body: JSON.stringify(body) });
+}
+
+export function probeAgent(agentId: string) {
+  return apiClient.request<{ agent: Agent }>(`/api/v2/agents/${encodeURIComponent(agentId)}/probe`, { method: 'POST' });
 }
 
 export function removeAgent(agentId: string, localOnly: boolean) {

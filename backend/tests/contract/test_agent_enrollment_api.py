@@ -5,10 +5,11 @@ from datetime import UTC, datetime, timedelta
 from fastapi.testclient import TestClient
 
 from ic_env_guard.api.agent_enrollments import get_enrollment_orchestrator
-from ic_env_guard.config.models import AppConfig, AuthConfig, ControlPlaneConfig
+from ic_env_guard.config.models import AppConfig, AuthConfig, ControlPlaneConfig, EnrollmentConfig
 from ic_env_guard.enrollment.agent_client import EnrollmentValidation
 from ic_env_guard.enrollment.ssh import EnrollmentHelperResult
 from ic_env_guard.main import create_app
+from ic_env_guard.systemd.cli import build_ctl_parser
 
 AUTH = {"Authorization": "Bearer manager-secret"}
 PHASES = {
@@ -32,6 +33,9 @@ def manager_app(tmp_path):
             mode="control-plane",
             auth=AuthConfig(token_file=token_file),
             control_plane=ControlPlaneConfig(audit_database=tmp_path / "manager.db"),
+            enrollment=EnrollmentConfig(
+                manager_socket_path=tmp_path / "manager-enrollment.sock"
+            ),
         )
     )
 
@@ -63,6 +67,23 @@ def test_enrollment_create_get_cancel_are_authenticated_and_safe(tmp_path):
     assert created.status_code == 201
     assert created.json()["state"] == "awaiting_cli"
     assert created.json()["last_error_code"] == "ssh_unavailable"
+    cli = created.json()["cli"]
+    assert cli["argv"] == [
+        "ic-env-guardctl",
+        "agent",
+        "enroll",
+        "--manager-socket",
+        str(tmp_path / "manager-enrollment.sock"),
+        "--enrollment-id",
+        enrollment_id,
+        "--ssh",
+        "edaops@10.20.30.40:22",
+    ]
+    parsed = build_ctl_parser().parse_args(cli["argv"][1:])
+    assert parsed.manager_socket == tmp_path / "manager-enrollment.sock"
+    assert parsed.enrollment_id == enrollment_id
+    assert parsed.ssh == "edaops@10.20.30.40:22"
+    assert cli["display"]
     assert set(created.json()["preview"]["phases"]) == PHASES
     assert fetched.json() == created.json()
     assert cancelled.status_code == 200
@@ -238,6 +259,7 @@ def test_create_and_background_auto_have_separate_durable_audit_events(
             instance_id=helper_instance_id,
             summary=None,
             readiness_warning="agent_readiness_unavailable",
+            name="Build Agent 01",
         )
 
     monkeypatch.setattr(
@@ -275,6 +297,19 @@ def test_create_and_background_auto_have_separate_durable_audit_events(
             if current["state"] == "verified":
                 break
             time.sleep(0.01)
+
+        assert current["preview"]["agent"] == {
+            "agent_id": enrollment_id,
+            "instance_id": "33333333-3333-4333-8333-333333333333",
+            "name": "Build Agent 01",
+            "endpoint": "https://10.20.30.40:8765",
+            "transport_profile_id": "system-tls",
+            "transport_security": "verified_tls",
+            "api_version": "2",
+            "agent_version": "0.3.0",
+            "capabilities": ["manager-enrollment.v1", "summary.v2"],
+            "summary": None,
+        }
 
     connection = sqlite3.connect(database)
     try:

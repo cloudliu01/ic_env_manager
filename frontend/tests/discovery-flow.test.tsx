@@ -4,15 +4,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '../src/app/App';
 
 const apiRequest = vi.hoisted(() => vi.fn());
-vi.mock('../src/shared/api/client', () => ({ apiClient: { request: apiRequest } }));
+vi.mock('../src/shared/api/client', () => ({ apiClient: { request: apiRequest, setToken: vi.fn(), setUnauthorizedHandler: vi.fn() } }));
 
 describe('Discovery flow', () => {
   beforeEach(() => {
+    window.sessionStorage.setItem('ic-env-guard-token', 'manager-test-token');
     window.history.replaceState({}, '', '/discovery');
     apiRequest.mockReset();
     apiRequest.mockImplementation(async (path: string, init?: RequestInit) => {
       if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['discovery.v2'] };
-      if (path === '/api/v2/discovery/scopes') return { enabled: true, scopes: [{ id: 'lab', name: 'Lab rack', target_count: 2 }] };
+      if (path === '/api/v2/discovery/scopes') return { enabled: true, scopes: [{ id: 'lab', name: 'Lab rack', cidr: '10.0.0.0/30', endpoints: [{ port: 8765, transport_profile_id: 'eda-http' }], target_count: 2 }] };
       if (path === '/api/v2/discovery/jobs' && init?.method === 'POST') return { job: { job_id: 'scan-opaque', scope_id: 'lab', state: 'running', total_targets: 2, checked_targets: 1, found_targets: 1 } };
       if (path === '/api/v2/discovery/jobs/scan-opaque') return { job: { job_id: 'scan-opaque', scope_id: 'lab', state: 'completed', total_targets: 2, checked_targets: 2, found_targets: 1 } };
       if (path === '/api/v2/discovery/jobs/scan-opaque/results') return { results: [{ result_id: 'result-opaque', candidate_url: 'http://10.0.0.4:8765', ip: '10.0.0.4', port: 8765, transport_profile_id: 'eda-http', status: 'new', enrollment_status: 'enrollment_required' }] };
@@ -26,6 +27,8 @@ describe('Discovery flow', () => {
     render(<App />);
     await screen.findByRole('option', { name: /Lab rack/ });
     await user.selectOptions(screen.getByLabelText('Discovery scope'), 'lab');
+    expect(screen.getByText('CIDR 10.0.0.0/30')).toBeTruthy();
+    expect(screen.getByText('Port 8765 · Profile eda-http')).toBeTruthy();
     await user.click(screen.getByRole('button', { name: 'Start discovery' }));
     expect(await screen.findByText('2 checked of 2')).toBeTruthy();
     expect(screen.getByText('1 found')).toBeTruthy();
@@ -40,7 +43,7 @@ describe('Discovery flow', () => {
     let resultReads = 0;
     apiRequest.mockImplementation(async (path: string, init?: RequestInit) => {
       if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['discovery.v2'] };
-      if (path === '/api/v2/discovery/scopes') return { enabled: true, scopes: [{ id: 'lab', name: 'Lab rack', target_count: 2 }] };
+      if (path === '/api/v2/discovery/scopes') return { enabled: true, scopes: [{ id: 'lab', name: 'Lab rack', cidr: '10.0.0.0/30', endpoints: [{ port: 8765, transport_profile_id: 'eda-http' }], target_count: 2 }] };
       if (path === '/api/v2/discovery/jobs' && init?.method === 'POST') return { job: { job_id: 'scan-opaque', scope_id: 'lab', state: 'running', total_targets: 2, checked_targets: 1, found_targets: 1 } };
       if (path === '/api/v2/discovery/jobs/scan-opaque') return { job: { job_id: 'scan-opaque', scope_id: 'lab', state: ++jobReads === 1 ? 'running' : 'completed', total_targets: 2, checked_targets: jobReads === 1 ? 1 : 2, found_targets: 1 } };
       if (path === '/api/v2/discovery/jobs/scan-opaque/results') return { results: ++resultReads === 1 ? [] : [{ result_id: 'result-opaque', candidate_url: 'http://10.0.0.4:8765', ip: '10.0.0.4', port: 8765, transport_profile_id: 'eda-http', status: 'new', enrollment_status: 'enrollment_required' }] };

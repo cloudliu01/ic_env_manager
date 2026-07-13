@@ -31,6 +31,61 @@ the Manager's owner-only Unix socket authenticates the local peer before it
 accepts the helper result. Do not replace this with an SSH proxy, `ProxyJump`,
 or `ProxyCommand`.
 
+The displayed command is directly executable and contains only bounded,
+non-secret arguments. For example (IDs and hosts are illustrative):
+
+```bash
+ic-env-guardctl agent enroll \
+  --manager-socket /run/ic-env-guard/manager-enrollment.sock \
+  --enrollment-id 6f142a38-85dc-4bcf-aaf2-a9c58c0a6a32 \
+  --ssh edaops@10.20.30.41:22
+```
+
+Do not add a token, private-key path, password, `ProxyCommand`, or shell
+redirection. The CLI invokes fixed OpenSSH arguments, parses bounded helper
+JSON without printing the credential, and submits it once to the Manager
+socket. Reusing an enrollment ID is rejected.
+
 The Agent enrollment socket is ephemeral under `/run/ic-env-guard`, mode
 `0600` by default. Do not expose, forward, back up, or widen it. Audit logs
 record bounded operation metadata, not credential values.
+
+## Manager enrollment configuration
+
+`enrollment` is a top-level section (not nested below `control_plane`):
+
+```yaml
+enrollment:
+  manager_socket_path: /run/ic-env-guard/manager-enrollment.sock
+  manager_socket_mode: "0600"
+  pending_ttl_seconds: 600
+  max_pending: 32
+  ssh_binary: /usr/bin/ssh
+  ssh_connect_timeout_seconds: 10
+  ssh_total_timeout_seconds: 15
+  # Optional unattended enrollment; configure both or neither.
+  service_key_identity_file: /var/lib/ic-env-guard/ssh/id_ed25519
+  service_key_known_hosts_file: /var/lib/ic-env-guard/ssh/known_hosts
+```
+
+The Manager user must own the service-key directory and files. The private key
+must be an unencrypted Ed25519 OpenSSH key with mode `0600`; `known_hosts` must
+be non-empty and neither file nor any parent may be symlinked or group/world
+writable. Authorize its public key on an existing Agent user with these exact
+forced-command options:
+
+```text
+command="ic-env-guard agent enroll-manager",restrict,no-pty,no-agent-forwarding,no-X11-forwarding,no-port-forwarding,no-user-rc ssh-ed25519 AAAA... manager-enrollment
+```
+
+## Stable failures
+
+- `service_key_unavailable`: fix key type, ownership, mode, parent directory,
+  or `known_hosts`; the flow safely falls back to the displayed CLI.
+- `ssh_host_key_unknown` / `ssh_host_key_changed`: verify the fingerprint out
+  of band, then update the Manager user's `known_hosts`; never disable checks.
+- `enrollment_expired`: start a new enrollment; do not reuse the old command.
+- `enrollment_replayed` or `enrollment_already_submitted`: the one-time result
+  was already consumed; inspect Manager audit before starting again.
+- `manager_socket_unavailable`: verify the absolute path, running Manager,
+  `/run/ic-env-guard` ownership, and socket mode.
