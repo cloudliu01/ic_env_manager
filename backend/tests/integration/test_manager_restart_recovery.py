@@ -86,6 +86,16 @@ def _stop_all(process: subprocess.Popen) -> str:
     return output
 
 
+def _bounded_all(environment: dict[str, str], timeout: float = 3) -> tuple[int | None, str]:
+    process = _start_all(environment)
+    try:
+        output = process.communicate(timeout=timeout)[0]
+    except subprocess.TimeoutExpired:
+        output = _stop_all(process)
+        return None, output
+    return process.returncode, output
+
+
 def _wait_for_local_agent(
     database: Path, process: subprocess.Popen | None = None
 ) -> tuple[str, str, str]:
@@ -242,9 +252,17 @@ def test_start_all_stops_recorded_same_user_backend_before_reset():
     dev_dir.chmod(0o700)
     config_path = dev_dir / "agent.yaml"
     recorded = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(30)", str(config_path)]
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(30)",
+            "x" * 2048,
+            str(config_path),
+        ]
     )
-    (dev_dir / "agent.pid").write_text(f"{recorded.pid}\n", encoding="ascii")
+    pid_file = dev_dir / "agent.pid"
+    pid_file.write_text(f"{recorded.pid}\n", encoding="ascii")
+    pid_file.chmod(0o600)
     environment, manager_port, agent_port = _launcher_environment(dev_dir)
     process = _start_all(environment)
     try:
@@ -265,7 +283,9 @@ def test_start_all_rejects_unrelated_recorded_process_without_signaling_it():
     dev_dir = Path(mkdtemp(prefix="ieg-unrelated-process-", dir="/tmp")).resolve()
     dev_dir.chmod(0o700)
     unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-    (dev_dir / "agent.pid").write_text(f"{unrelated.pid}\n", encoding="ascii")
+    pid_file = dev_dir / "agent.pid"
+    pid_file.write_text(f"{unrelated.pid}\n", encoding="ascii")
+    pid_file.chmod(0o600)
     environment, _, _ = _launcher_environment(dev_dir)
     try:
         result = subprocess.run(
@@ -284,3 +304,250 @@ def test_start_all_rejects_unrelated_recorded_process_without_signaling_it():
         unrelated.terminate()
         unrelated.wait(timeout=5)
         rmtree(dev_dir, ignore_errors=True)
+
+
+def test_reset_validation_uses_passwd_home_before_any_directory_mutation():
+    launcher = (PROJECT_ROOT / "start.sh").read_text(encoding="utf-8")
+    validation = launcher.split("prepare_dev_dir_for_reset() {", 1)[1].split(
+        "\n}\n", 1
+    )[0]
+
+    assert "pwd.getpwuid(os.getuid()).pw_dir" in validation
+    assert "Path.home()" not in validation
+    assert validation.index("pwd.getpwuid") < validation.index("resolved.mkdir")
+
+
+@pytest.mark.integration
+def test_start_all_rejects_environment_home_before_reset(tmp_path):
+    dev_dir = (tmp_path / "environment-home").resolve()
+    dev_dir.mkdir(mode=0o700)
+    state = dev_dir / "state.db"
+    state.write_text("must survive", encoding="utf-8")
+    environment, _, _ = _launcher_environment(dev_dir)
+    environment["HOME"] = str(dev_dir)
+
+    returncode, output = _bounded_all(environment)
+
+    assert returncode is not None
+    assert returncode != 0
+    assert "unsafe development directory" in output
+    assert state.read_text(encoding="utf-8") == "must survive"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "path_component",
+    ["unsupported path", "unsupported\npath", "unsupported\x7fpath"],
+    ids=["space", "newline", "delete-control"],
+)
+def test_start_all_rejects_unsupported_development_path_before_reset(
+    tmp_path, path_component
+):
+    dev_dir = (tmp_path / path_component).resolve()
+    dev_dir.mkdir(mode=0o700)
+    state = dev_dir / "state.db"
+    state.write_text("must survive", encoding="utf-8")
+    (dev_dir / "agent.pid").write_text("malformed\n", encoding="ascii")
+    environment, _, _ = _launcher_environment(dev_dir)
+
+    returncode, output = _bounded_all(environment)
+
+    assert returncode is not None
+    assert returncode != 0
+    assert "development directory path is unsupported" in output
+    assert state.read_text(encoding="utf-8") == "must survive"
+
+
+@pytest.mark.integration
+def test_cleanup_preserves_replaced_enrollment_sockets():
+    dev_dir = Path(mkdtemp(prefix="ieg-replaced-socket-", dir="/tmp")).resolve()
+    dev_dir.chmod(0o700)
+    environment, manager_port, agent_port = _launcher_environment(dev_dir)
+    frontend_exit = dev_dir / "frontend.exit"
+    (dev_dir / "bin" / "npm").write_text(
+        f"#!/bin/sh\nwhile [ ! -e '{frontend_exit}' ]; do sleep 0.1; done\nexit 1\n",
+        encoding="utf-8",
+    )
+    process = _start_all(environment)
+    replacements: list[socket.socket] = []
+    try:
+        _wait_for_health(f"http://127.0.0.1:{manager_port}/healthz", process)
+        _wait_for_health(f"http://127.0.0.1:{agent_port}/healthz", process)
+        _wait_for_local_agent(dev_dir / "control-plane.db", process)
+        identities = {}
+        for name in ("agent-enrollment.sock", "manager-enrollment.sock"):
+            path = dev_dir / name
+            path.unlink()
+            replacement = socket.socket(socket.AF_UNIX)
+            replacement.bind(str(path))
+            replacements.append(replacement)
+            metadata = path.lstat()
+            identities[name] = (metadata.st_dev, metadata.st_ino)
+
+        frontend_exit.touch()
+        process.wait(timeout=10)
+
+        for name, identity in identities.items():
+            metadata = (dev_dir / name).lstat()
+            assert (metadata.st_dev, metadata.st_ino) == identity
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        for replacement in replacements:
+            replacement.close()
+        rmtree(dev_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+def test_recorded_process_identity_change_before_kill_fails_closed():
+    dev_dir = Path(mkdtemp(prefix="ieg-reused-process-", dir="/tmp")).resolve()
+    dev_dir.chmod(0o700)
+    environment, _, _ = _launcher_environment(dev_dir)
+    ready = dev_dir / "recorded.ready"
+    signaled = dev_dir / "recorded.signaled"
+    config_path = dev_dir / "agent.yaml"
+    recorded = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal,sys,time; from pathlib import Path; "
+            "signal.signal(signal.SIGTERM, lambda *_: Path(sys.argv[2]).touch()); "
+            "Path(sys.argv[1]).touch(); time.sleep(30)",
+            str(ready),
+            str(signaled),
+            str(config_path),
+        ]
+    )
+    for _ in range(50):
+        if ready.exists():
+            break
+        time.sleep(0.02)
+    assert ready.exists()
+    pid_file = dev_dir / "agent.pid"
+    pid_file.write_text(f"{recorded.pid}\n", encoding="ascii")
+    pid_file.chmod(0o600)
+    ps_counter = dev_dir / "ps-counter"
+    fake_ps = dev_dir / "bin" / "ps"
+    fake_ps.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"counter = Path({str(ps_counter)!r})\n"
+        f"uid = {os.getuid()!r}\n"
+        f"config = {str(config_path)!r}\n"
+        "if 'lstart=' in sys.argv:\n"
+        "    count = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+        "    counter.write_text(str(count))\n"
+        "    command = f'python runtime {config}' if count == 1 else 'python unrelated'\n"
+        "    print(f'{uid} Mon Jan  1 00:00:00 2024 S {command}')\n"
+        "elif 'command=' in sys.argv:\n"
+        "    print(f'{uid} python runtime {config}')\n"
+        "elif 'stat=' in sys.argv:\n"
+        "    print('S')\n",
+        encoding="utf-8",
+    )
+    fake_ps.chmod(0o700)
+    launcher = _start_all(environment)
+    try:
+        output = launcher.communicate(timeout=8)[0]
+
+        assert launcher.returncode != 0
+        assert "development process identity mismatch" in output
+        assert recorded.poll() is None
+        assert not signaled.exists()
+    except subprocess.TimeoutExpired:
+        _stop_all(launcher)
+        pytest.fail("launcher did not fail closed after recorded process identity changed")
+    finally:
+        if launcher.poll() is None:
+            _stop_all(launcher)
+        if recorded.poll() is None:
+            recorded.kill()
+        recorded.wait(timeout=5)
+        rmtree(dev_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+def test_pid_metadata_symlink_fails_closed_without_following_target():
+    dev_dir = Path(mkdtemp(prefix="ieg-pid-symlink-", dir="/tmp")).resolve()
+    dev_dir.chmod(0o700)
+    environment, _, _ = _launcher_environment(dev_dir)
+    target = dev_dir / "pid-target"
+    target.write_text("99999999\n", encoding="ascii")
+    pid_file = dev_dir / "agent.pid"
+    pid_file.symlink_to(target)
+    try:
+        returncode, output = _bounded_all(environment)
+
+        assert returncode is not None
+        assert returncode != 0
+        assert "development process identity mismatch" in output
+        assert pid_file.is_symlink()
+        assert target.read_text(encoding="ascii") == "99999999\n"
+    finally:
+        rmtree(dev_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+def test_pid_metadata_fifo_fails_closed_without_blocking():
+    dev_dir = Path(mkdtemp(prefix="ieg-pid-fifo-", dir="/tmp")).resolve()
+    dev_dir.chmod(0o700)
+    environment, _, _ = _launcher_environment(dev_dir)
+    os.mkfifo(dev_dir / "agent.pid", mode=0o600)
+    try:
+        returncode, output = _bounded_all(environment)
+
+        assert returncode is not None
+        assert returncode != 0
+        assert "development process identity mismatch" in output
+    finally:
+        rmtree(dev_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+def test_pid_metadata_oversize_fails_closed_without_reading_it():
+    dev_dir = Path(mkdtemp(prefix="ieg-pid-oversize-", dir="/tmp")).resolve()
+    dev_dir.chmod(0o700)
+    environment, _, _ = _launcher_environment(dev_dir)
+    pid_file = dev_dir / "agent.pid"
+    pid_file.write_text("9" * 5000, encoding="ascii")
+    pid_file.chmod(0o600)
+    try:
+        returncode, output = _bounded_all(environment)
+
+        assert returncode is not None
+        assert returncode != 0
+        assert "development process identity mismatch" in output
+        assert pid_file.stat().st_size == 5000
+    finally:
+        rmtree(dev_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+def test_pid_metadata_unreadable_fails_closed():
+    dev_dir = Path(mkdtemp(prefix="ieg-pid-unreadable-", dir="/tmp")).resolve()
+    dev_dir.chmod(0o700)
+    environment, _, _ = _launcher_environment(dev_dir)
+    pid_file = dev_dir / "agent.pid"
+    pid_file.write_text("99999999\n", encoding="ascii")
+    pid_file.chmod(0o000)
+    try:
+        returncode, output = _bounded_all(environment)
+
+        assert returncode is not None
+        assert returncode != 0
+        assert "development process identity mismatch" in output
+    finally:
+        rmtree(dev_dir, ignore_errors=True)
+
+
+def test_recorded_process_inspection_requests_untruncated_ps_without_shlex():
+    launcher = (PROJECT_ROOT / "start.sh").read_text(encoding="utf-8")
+    inspection = launcher.split("recorded_process_matches() {", 1)[1].split(
+        "\n}\n", 1
+    )[0]
+
+    assert '["ps", "-ww"' in inspection
+    assert "shlex" not in inspection

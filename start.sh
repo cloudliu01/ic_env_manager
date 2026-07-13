@@ -346,14 +346,28 @@ wait_for_socket() {
 prepare_dev_dir_for_reset() {
   DEV_DIR="$(python - "${DEV_DIR}" <<'PY'
 import os
+import pwd
 import stat
 import sys
+import unicodedata
 from pathlib import Path
 
 requested = Path(sys.argv[1]).expanduser()
 resolved = requested.resolve()
-home = Path.home().resolve()
-if not resolved.is_absolute() or resolved == Path("/") or resolved == home:
+passwd_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+environment_home = Path(os.environ["HOME"]).resolve() if os.environ.get("HOME") else None
+unsupported_path = any(
+    character.isspace() or unicodedata.category(character) == "Cc"
+    for character in str(resolved)
+)
+if unsupported_path:
+    raise SystemExit("development directory path is unsupported")
+if (
+    not resolved.is_absolute()
+    or resolved == Path("/")
+    or resolved == passwd_home
+    or resolved == environment_home
+):
     raise SystemExit("unsafe development directory")
 resolved.mkdir(mode=0o700, parents=True, exist_ok=True)
 metadata = resolved.stat()
@@ -368,27 +382,55 @@ recorded_process_matches() {
   local pid="$1"
   local expected_config="$2"
   python - "${pid}" "$(id -u)" "${expected_config}" <<'PY'
-import shlex
+import hashlib
 import subprocess
 import sys
 
 pid, expected_uid, expected_config = sys.argv[1:]
 result = subprocess.run(
-    ["ps", "-o", "uid=", "-o", "command=", "-p", pid],
+    ["ps", "-ww", "-o", "uid=", "-o", "lstart=", "-o", "stat=", "-o", "command=", "-p", pid],
     capture_output=True,
     text=True,
 )
 if result.returncode != 0 or not result.stdout.strip():
     raise SystemExit(2)
-uid, command = result.stdout.strip().split(maxsplit=1)
-if uid != expected_uid:
+parts = result.stdout.strip().split(maxsplit=7)
+if len(parts) != 8:
     raise SystemExit(1)
-try:
-    arguments = shlex.split(command)
-except ValueError:
+uid, *start_fields, state, command = parts
+if state.startswith("Z"):
+    raise SystemExit(3)
+if uid != expected_uid or expected_config not in command.split():
     raise SystemExit(1)
-raise SystemExit(0 if expected_config in arguments else 1)
+identity = "\0".join((uid, " ".join(start_fields), command))
+print(hashlib.sha256(identity.encode("utf-8")).hexdigest())
 PY
+}
+
+wait_for_recorded_process_exit() {
+  local pid="$1"
+  local expected_config="$2"
+  local expected_identity="$3"
+  local current_identity
+  local identity_status
+  for _ in $(seq 1 50); do
+    if current_identity="$(recorded_process_matches "${pid}" "${expected_config}")"; then
+      if [[ "${current_identity}" != "${expected_identity}" ]]; then
+        return 2
+      fi
+    else
+      identity_status=$?
+      if [[ "${identity_status}" == "3" ]]; then
+        return
+      fi
+      if [[ "${identity_status}" == "2" ]] && ! kill -0 "${pid}" >/dev/null 2>&1; then
+        return
+      fi
+      return 2
+    fi
+    sleep 0.1
+  done
+  return 1
 }
 
 wait_for_process_exit() {
@@ -398,7 +440,7 @@ wait_for_process_exit() {
     if ! kill -0 "${pid}" >/dev/null 2>&1; then
       return
     fi
-    process_state="$(ps -o stat= -p "${pid}" 2>/dev/null || true)"
+    process_state="$(ps -ww -o stat= -p "${pid}" 2>/dev/null || true)"
     if [[ "${process_state}" == Z* ]]; then
       return
     fi
@@ -407,37 +449,138 @@ wait_for_process_exit() {
   return 1
 }
 
+read_pid_metadata() {
+  local pid_file="$1"
+  python - "${pid_file}" "$(id -u)" <<'PY'
+import os
+import re
+import stat
+import sys
+
+path, expected_uid = sys.argv[1], int(sys.argv[2])
+try:
+    metadata = os.lstat(path)
+except FileNotFoundError:
+    raise SystemExit(2)
+if (
+    not stat.S_ISREG(metadata.st_mode)
+    or stat.S_ISLNK(metadata.st_mode)
+    or metadata.st_uid != expected_uid
+    or stat.S_IMODE(metadata.st_mode) & 0o077
+    or not 1 <= metadata.st_size <= 32
+):
+    raise SystemExit(1)
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+try:
+    descriptor = os.open(path, flags)
+except OSError:
+    raise SystemExit(1)
+try:
+    opened = os.fstat(descriptor)
+    if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+        raise SystemExit(1)
+    payload = os.read(descriptor, 33)
+finally:
+    os.close(descriptor)
+try:
+    value = payload.decode("ascii")
+except UnicodeDecodeError:
+    raise SystemExit(1)
+if not re.fullmatch(r"[1-9][0-9]*\n?", value):
+    raise SystemExit(1)
+print(value.rstrip("\n"))
+PY
+}
+
 stop_recorded_process() {
   local pid_file="$1"
   local expected_config="$2"
   local pid
   local identity_status
+  local recorded_identity
+  local current_identity
+  local wait_status
 
-  if [[ ! -e "${pid_file}" ]]; then
-    return
-  fi
-  pid="$(cat "${pid_file}")"
-  if [[ ! "${pid}" =~ ^[1-9][0-9]*$ ]]; then
+  if pid="$(read_pid_metadata "${pid_file}")"; then
+    :
+  else
+    identity_status=$?
+    if [[ "${identity_status}" == "2" ]]; then
+      return
+    fi
     echo "development process identity mismatch" >&2
     return 1
   fi
-  if recorded_process_matches "${pid}" "${expected_config}"; then
-    kill -TERM "${pid}"
-    if ! wait_for_process_exit "${pid}"; then
-      kill -KILL "${pid}" >/dev/null 2>&1 || true
-      wait_for_process_exit "${pid}" || true
-    fi
-    rm -f "${pid_file}"
-    return
+  if recorded_identity="$(recorded_process_matches "${pid}" "${expected_config}")"; then
+    :
   else
     identity_status=$?
+    if [[ "${identity_status}" == "3" ]]; then
+      remove_owned_pid_file "${pid_file}" "${pid}"
+      return
+    fi
+    if [[ "${identity_status}" == "2" ]] && ! kill -0 "${pid}" >/dev/null 2>&1; then
+      remove_owned_pid_file "${pid_file}" "${pid}"
+      return
+    fi
+    echo "development process identity mismatch" >&2
+    return 1
   fi
-  if [[ "${identity_status}" == "2" ]] && ! kill -0 "${pid}" >/dev/null 2>&1; then
-    rm -f "${pid_file}"
+  if current_identity="$(recorded_process_matches "${pid}" "${expected_config}")"; then
+    if [[ "${current_identity}" != "${recorded_identity}" ]]; then
+      echo "development process identity mismatch" >&2
+      return 1
+    fi
+  else
+    identity_status=$?
+    if [[ "${identity_status}" == "3" ]] || (
+      [[ "${identity_status}" == "2" ]] && ! kill -0 "${pid}" >/dev/null 2>&1
+    ); then
+      remove_owned_pid_file "${pid_file}" "${pid}"
+      return
+    fi
+    echo "development process identity mismatch" >&2
+    return 1
+  fi
+  if ! kill -TERM "${pid}" >/dev/null 2>&1; then
+    if ! kill -0 "${pid}" >/dev/null 2>&1; then
+      remove_owned_pid_file "${pid_file}" "${pid}"
+      return
+    fi
+    echo "development process identity mismatch" >&2
+    return 1
+  fi
+  if wait_for_recorded_process_exit "${pid}" "${expected_config}" "${recorded_identity}"; then
+    remove_owned_pid_file "${pid_file}" "${pid}"
     return
+  else
+    wait_status=$?
   fi
-  echo "development process identity mismatch" >&2
-  return 1
+  if [[ "${wait_status}" == "2" ]]; then
+    echo "development process identity mismatch" >&2
+    return 1
+  fi
+  if identity_status="$(recorded_process_matches "${pid}" "${expected_config}")"; then
+    if [[ "${identity_status}" != "${recorded_identity}" ]]; then
+      echo "development process identity mismatch" >&2
+      return 1
+    fi
+  else
+    wait_status=$?
+    if [[ "${wait_status}" == "3" ]]; then
+      remove_owned_pid_file "${pid_file}" "${pid}"
+      return
+    fi
+    if [[ "${wait_status}" == "2" ]] && ! kill -0 "${pid}" >/dev/null 2>&1; then
+      remove_owned_pid_file "${pid_file}" "${pid}"
+      return
+    fi
+    echo "development process identity mismatch" >&2
+    return 1
+  fi
+  kill -KILL "${pid}" >/dev/null 2>&1 || true
+  wait_for_recorded_process_exit "${pid}" "${expected_config}" "${recorded_identity}" || true
+  remove_owned_pid_file "${pid_file}" "${pid}"
 }
 
 reset_generated_state() {
@@ -472,9 +615,81 @@ write_pid_file() {
 remove_owned_pid_file() {
   local pid_file="$1"
   local pid="$2"
-  if [[ -f "${pid_file}" ]] && [[ "$(cat "${pid_file}")" == "${pid}" ]]; then
-    rm -f "${pid_file}"
-  fi
+  python - "${pid_file}" "${pid}" <<'PY'
+import os
+import stat
+import sys
+
+path, expected = sys.argv[1:]
+try:
+    metadata = os.lstat(path)
+except FileNotFoundError:
+    raise SystemExit(0)
+if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+    raise SystemExit(0)
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+try:
+    descriptor = os.open(path, flags)
+except OSError:
+    raise SystemExit(0)
+try:
+    opened = os.fstat(descriptor)
+    payload = os.read(descriptor, 33)
+finally:
+    os.close(descriptor)
+if (
+    (opened.st_dev, opened.st_ino) == (metadata.st_dev, metadata.st_ino)
+    and payload.decode("ascii", errors="ignore").rstrip("\n") == expected
+):
+    try:
+        current = os.lstat(path)
+    except FileNotFoundError:
+        raise SystemExit(0)
+    if (current.st_dev, current.st_ino) == (metadata.st_dev, metadata.st_ino):
+        os.unlink(path)
+PY
+}
+
+capture_socket_identity() {
+  local socket_path="$1"
+  python - "${socket_path}" "$(id -u)" <<'PY'
+import os
+import stat
+import sys
+
+metadata = os.lstat(sys.argv[1])
+if metadata.st_uid != int(sys.argv[2]) or not stat.S_ISSOCK(metadata.st_mode):
+    raise SystemExit("enrollment socket identity mismatch")
+print(f"{metadata.st_dev}:{metadata.st_ino}:{metadata.st_uid}")
+PY
+}
+
+remove_owned_socket() {
+  local socket_path="$1"
+  local expected_identity="$2"
+  python - "${socket_path}" "${expected_identity}" <<'PY'
+import os
+import stat
+import sys
+
+path, expected = sys.argv[1:]
+try:
+    metadata = os.lstat(path)
+except FileNotFoundError:
+    raise SystemExit(0)
+identity = f"{metadata.st_dev}:{metadata.st_ino}:{metadata.st_uid}"
+if identity == expected and stat.S_ISSOCK(metadata.st_mode):
+    try:
+        current = os.lstat(path)
+    except FileNotFoundError:
+        raise SystemExit(0)
+    if (current.st_dev, current.st_ino, current.st_uid) == (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+    ):
+        os.unlink(path)
+PY
 }
 
 terminate_child() {
@@ -517,6 +732,8 @@ start_all() {
   local control_plane_port="${BACKEND_PORT}"
   local agent_pid=""
   local control_plane_pid=""
+  local agent_socket_identity=""
+  local control_plane_socket_identity=""
   local cleaned_up=0
 
   activate_backend_env
@@ -538,7 +755,13 @@ start_all() {
       terminate_child "${control_plane_pid}"
       remove_owned_pid_file "${DEV_DIR}/control-plane.pid" "${control_plane_pid}"
     fi
-    rm -f "${DEV_DIR}/agent-enrollment.sock" "${DEV_DIR}/manager-enrollment.sock"
+    if [[ -n "${agent_socket_identity}" ]]; then
+      remove_owned_socket "${DEV_DIR}/agent-enrollment.sock" "${agent_socket_identity}"
+    fi
+    if [[ -n "${control_plane_socket_identity}" ]]; then
+      remove_owned_socket \
+        "${DEV_DIR}/manager-enrollment.sock" "${control_plane_socket_identity}"
+    fi
     return "${status}"
   }
   trap cleanup EXIT INT TERM
@@ -553,6 +776,7 @@ start_all() {
   write_pid_file "${DEV_DIR}/agent.pid" "${agent_pid}"
   wait_for_backend
   wait_for_socket "${DEV_DIR}/agent-enrollment.sock"
+  agent_socket_identity="$(capture_socket_identity "${DEV_DIR}/agent-enrollment.sock")"
 
   use_generated_mode_defaults control-plane
   BACKEND_PORT="${control_plane_port}"
@@ -561,6 +785,9 @@ start_all() {
   write_pid_file "${DEV_DIR}/control-plane.pid" "${control_plane_pid}"
   wait_for_backend
   wait_for_socket "${DEV_DIR}/manager-enrollment.sock"
+  control_plane_socket_identity="$(
+    capture_socket_identity "${DEV_DIR}/manager-enrollment.sock"
+  )"
   bootstrap_local_agent
 
   start_frontend
