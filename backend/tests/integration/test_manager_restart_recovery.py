@@ -179,6 +179,62 @@ def _fail_frontend_ps_after_marker(executable: Path, marker: Path) -> None:
     executable.chmod(0o700)
 
 
+def _install_readiness_barrier(
+    executable: Path, entered: Path, release: Path
+) -> None:
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import sys\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        f"entered = Path({str(entered)!r})\n"
+        f"release = Path({str(release)!r})\n"
+        "if (\n"
+        "    sys.argv[1:3] == ['-m', 'ic_env_guard.development.readiness']\n"
+        "    and not entered.exists()\n"
+        "):\n"
+        "    entered.touch()\n"
+        "    while not release.exists():\n"
+        "        time.sleep(0.02)\n"
+        "os.execv(sys.executable, [sys.executable, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+
+
+def _install_frontend_signal_probe(
+    executable: Path, frontend_exited: Path, signal_attempted: Path
+) -> None:
+    executable.write_text(
+        "#!/bin/sh\n"
+        f"if [ -e {str(frontend_exited)!r} ] "
+        "&& { [ \"${3:-}\" = SIGTERM ] || [ \"${3:-}\" = SIGKILL ]; }; then\n"
+        f"  : > {str(signal_attempted)!r}\n"
+        "fi\n"
+        f"exec {sys.executable!r} \"$@\"\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+
+
+def _fail_frontend_metadata_publish(
+    executable: Path, metadata: Path, attempted: Path, frontend_ready: Path
+) -> None:
+    executable.write_text(
+        "#!/bin/sh\n"
+        "for last do :; done\n"
+        f"if [ \"$last\" = {str(metadata)!r} ]; then\n"
+        f"  while [ ! -e {str(frontend_ready)!r} ]; do sleep 0.02; done\n"
+        f"  : > {str(attempted)!r}\n"
+        "  exit 1\n"
+        "fi\n"
+        "exec /bin/mv \"$@\"\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+
+
 def _start_foreign_listener(signal_marker: Path, *, health: bool = False):
     process = subprocess.Popen(
         [
@@ -402,6 +458,52 @@ def test_second_start_all_replaces_the_owned_frontend_and_backend_processes():
 
 
 @pytest.mark.integration
+def test_second_start_all_waits_for_complete_frontend_generation_publication():
+    dev_dir = Path(mkdtemp(prefix="ieg-all-publish-race-", dir="/tmp")).resolve()
+    dev_dir.chmod(0o700)
+    environment, manager_port, agent_port = _launcher_environment(dev_dir)
+    _write_frontend_listener(dev_dir / "bin" / "npm", dev_dir)
+    readiness_entered = dev_dir / "readiness.entered"
+    release_readiness = dev_dir / "readiness.release"
+    _install_readiness_barrier(
+        dev_dir / "bin" / "python", readiness_entered, release_readiness
+    )
+    first = _start_all(environment)
+    second: subprocess.Popen | None = None
+    try:
+        _wait_for_file(readiness_entered, first, timeout=20)
+        original_pids = {
+            int((dev_dir / "agent.pid").read_text()),
+            int((dev_dir / "control-plane.pid").read_text()),
+        }
+        second = _start_all(environment)
+        time.sleep(2)
+
+        assert second.poll() is None
+        assert not (dev_dir / "frontend-run-1.pid").exists()
+        assert all(_pid_exists(pid) for pid in original_pids)
+
+        release_readiness.touch()
+        _wait_for_file(dev_dir / "frontend-run-2.pid", second, timeout=30)
+        _wait_for_health(f"http://127.0.0.1:{manager_port}/healthz", second)
+        _wait_for_health(f"http://127.0.0.1:{agent_port}/healthz", second)
+        first.communicate(timeout=10)
+
+        assert first.returncode is not None
+        assert second.poll() is None
+        metadata_pid = int((dev_dir / "frontend.pid").read_text().split()[0])
+        assert _pid_exists(metadata_pid)
+        assert not _pid_exists(int((dev_dir / "frontend-run-1.pid").read_text()))
+    finally:
+        release_readiness.touch()
+        if first.poll() is None:
+            _stop_all(first)
+        if second is not None and second.poll() is None:
+            _stop_all(second)
+        rmtree(dev_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
 def test_term_launcher_pid_stops_owned_frontend_descendants_and_metadata():
     dev_dir = Path(mkdtemp(prefix="ieg-all-term-", dir="/tmp")).resolve()
     dev_dir.chmod(0o700)
@@ -476,6 +578,181 @@ def test_term_launcher_cleanup_does_not_depend_on_frontend_identity_reprobe():
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("failure", ["identity-capture", "metadata-publish"])
+def test_frontend_startup_failure_cleans_unpublished_process_group(failure):
+    dev_dir = Path(mkdtemp(prefix="ieg-all-frontend-publish-", dir="/tmp")).resolve()
+    dev_dir.chmod(0o700)
+    environment, _, _ = _launcher_environment(dev_dir)
+    _write_frontend_with_descendant(dev_dir / "bin" / "npm", dev_dir)
+    if failure == "identity-capture":
+        ps_failure = dev_dir / "fail-frontend-ps"
+        ps_failure.touch()
+        _fail_frontend_ps_after_marker(dev_dir / "bin" / "ps", ps_failure)
+    else:
+        _fail_frontend_metadata_publish(
+            dev_dir / "bin" / "mv",
+            dev_dir / "frontend.pid",
+            dev_dir / "frontend-publish.attempted",
+            dev_dir / "frontend-descendant.pid",
+        )
+    process = _start_all(environment)
+    descendant_pid = 0
+    try:
+        output = process.communicate(timeout=30)[0]
+        descendant_path = dev_dir / "frontend-descendant.pid"
+        if descendant_path.exists():
+            descendant_pid = int(descendant_path.read_text())
+
+        assert process.returncode != 0, output
+        assert descendant_pid
+        assert not _pid_exists(descendant_pid)
+        assert not (dev_dir / "frontend.pid").exists()
+        if failure == "metadata-publish":
+            assert (dev_dir / "frontend-publish.attempted").exists()
+    finally:
+        if process.poll() is None:
+            _stop_all(process)
+        if descendant_pid and _pid_exists(descendant_pid):
+            try:
+                os.kill(descendant_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        rmtree(dev_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+def test_term_escalates_to_kill_for_stubborn_frontend_group():
+    dev_dir = Path(mkdtemp(prefix="ieg-all-frontend-kill-", dir="/tmp")).resolve()
+    dev_dir.chmod(0o700)
+    environment, _, _ = _launcher_environment(dev_dir)
+    term_observed = dev_dir / "frontend.term-observed"
+    frontend_pid_path = dev_dir / "frontend-stubborn.pid"
+    (dev_dir / "bin" / "npm").write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import signal\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        f"term_observed = Path({str(term_observed)!r})\n"
+        "signal.signal(signal.SIGTERM, lambda *_: term_observed.touch())\n"
+        f"Path({str(frontend_pid_path)!r}).write_text(str(os.getpid()))\n"
+        "while True:\n"
+        "    time.sleep(0.1)\n",
+        encoding="utf-8",
+    )
+    (dev_dir / "bin" / "npm").chmod(0o700)
+    process = _start_all(environment)
+    frontend_pid = 0
+    try:
+        _wait_for_file(dev_dir / "frontend.pid", process)
+        _wait_for_file(frontend_pid_path, process)
+        frontend_pid = int(frontend_pid_path.read_text())
+
+        os.kill(process.pid, signal.SIGTERM)
+        output = process.communicate(timeout=15)[0]
+
+        assert process.returncode == 143, output
+        assert term_observed.exists()
+        assert not _pid_exists(frontend_pid)
+    finally:
+        if process.poll() is None:
+            _stop_all(process)
+        if frontend_pid and _pid_exists(frontend_pid):
+            try:
+                os.kill(frontend_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        rmtree(dev_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+def test_term_launcher_stops_frontend_before_bounded_cleanup_lock_attempt():
+    dev_dir = Path(mkdtemp(prefix="ieg-all-term-lock-", dir="/tmp")).resolve()
+    dev_dir.chmod(0o700)
+    environment, manager_port, agent_port = _launcher_environment(dev_dir)
+    _write_frontend_with_descendant(dev_dir / "bin" / "npm", dev_dir)
+    process = _start_all(environment)
+    keeper: subprocess.Popen | None = None
+    descendant_pid = 0
+    try:
+        _wait_for_health(f"http://127.0.0.1:{manager_port}/healthz", process)
+        _wait_for_health(f"http://127.0.0.1:{agent_port}/healthz", process)
+        _wait_for_file(dev_dir / "frontend.pid", process)
+        descendant_path = dev_dir / "frontend-descendant.pid"
+        _wait_for_file(descendant_path, process)
+        descendant_pid = int(descendant_path.read_text())
+        lock_ready = dev_dir / "external-lock.ready"
+        keeper = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import fcntl,sys,time; from pathlib import Path; "
+                "descriptor=open(sys.argv[1], 'r+'); "
+                "fcntl.flock(descriptor, fcntl.LOCK_EX); "
+                "Path(sys.argv[2]).touch(); time.sleep(60)",
+                str(dev_dir / ".start-all.lock"),
+                str(lock_ready),
+            ]
+        )
+        _wait_for_file(lock_ready, keeper)
+
+        started = time.monotonic()
+        os.kill(process.pid, signal.SIGTERM)
+        output = process.communicate(timeout=10)[0]
+
+        assert time.monotonic() - started < 10
+        assert process.returncode == 143, output
+        assert not _pid_exists(descendant_pid)
+    finally:
+        if keeper is not None and keeper.poll() is None:
+            keeper.kill()
+            keeper.wait(timeout=5)
+        if process.poll() is None:
+            _stop_all(process)
+        if descendant_pid and _pid_exists(descendant_pid):
+            try:
+                os.kill(descendant_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        rmtree(dev_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+def test_naturally_reaped_frontend_is_not_signaled_by_cached_pid():
+    dev_dir = Path(mkdtemp(prefix="ieg-all-reaped-", dir="/tmp")).resolve()
+    dev_dir.chmod(0o700)
+    environment, _, _ = _launcher_environment(dev_dir)
+    frontend_exited = dev_dir / "frontend.exited"
+    signal_attempted = dev_dir / "frontend.signal-attempted"
+    _install_frontend_signal_probe(
+        dev_dir / "bin" / "python", frontend_exited, signal_attempted
+    )
+    (dev_dir / "bin" / "npm").write_text(
+        f"#!{sys.executable}\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        f"metadata = Path({str(dev_dir / 'frontend.pid')!r})\n"
+        "while not metadata.exists():\n"
+        "    time.sleep(0.02)\n"
+        f"Path({str(frontend_exited)!r}).touch()\n",
+        encoding="utf-8",
+    )
+    (dev_dir / "bin" / "npm").chmod(0o700)
+    process = _start_all(environment)
+    try:
+        output = process.communicate(timeout=20)[0]
+
+        assert process.returncode == 0, output
+        assert frontend_exited.exists()
+        assert not signal_attempted.exists()
+        assert not (dev_dir / "frontend.pid").exists()
+    finally:
+        if process.poll() is None:
+            _stop_all(process)
+        rmtree(dev_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
 def test_start_all_does_not_signal_frontend_with_mismatched_identity():
     dev_dir = Path(mkdtemp(prefix="ieg-foreign-frontend-", dir="/tmp")).resolve()
     dev_dir.chmod(0o700)
@@ -496,6 +773,35 @@ def test_start_all_does_not_signal_frontend_with_mismatched_identity():
         if foreign.poll() is None:
             foreign.kill()
             foreign.wait(timeout=5)
+        rmtree(dev_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("unsafe_metadata", ["malformed", "symlink"])
+def test_start_all_rejects_unsafe_frontend_metadata_without_following_it(
+    unsafe_metadata,
+):
+    dev_dir = Path(mkdtemp(prefix="ieg-unsafe-frontend-", dir="/tmp")).resolve()
+    dev_dir.chmod(0o700)
+    environment, _, _ = _launcher_environment(dev_dir)
+    metadata = dev_dir / "frontend.pid"
+    target = dev_dir / "metadata-target"
+    if unsafe_metadata == "malformed":
+        metadata.write_text("malformed\n", encoding="ascii")
+        metadata.chmod(0o600)
+    else:
+        target.write_text("must survive", encoding="utf-8")
+        metadata.symlink_to(target)
+    try:
+        returncode, output = _bounded_all(environment)
+
+        assert returncode is not None
+        assert returncode != 0
+        assert "development frontend identity mismatch" in output
+        if unsafe_metadata == "symlink":
+            assert metadata.is_symlink()
+            assert target.read_text(encoding="utf-8") == "must survive"
+    finally:
         rmtree(dev_dir, ignore_errors=True)
 
 
@@ -1358,9 +1664,7 @@ exit "$status"
 
 
 @pytest.mark.integration
-def test_owned_frontend_cleanup_closes_setsid_race_after_process_classification(
-    tmp_path,
-):
+def test_owned_frontend_cleanup_stops_descendant_process_group(tmp_path):
     ready = tmp_path / "frontend.ready"
     descendant = tmp_path / "frontend.descendant"
     script = f"""
@@ -1387,7 +1691,6 @@ for _ in $(seq 1 100); do
   sleep 0.02
 done
 [[ -e {str(ready)!r} ]]
-owned_frontend_is_group() {{ return 1; }}
 terminate_owned_frontend "$leader"
 child="$(cat {str(descendant)!r})"
 status=0

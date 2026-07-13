@@ -326,16 +326,34 @@ start_tracked_frontend() {
     "${FRONTEND_HOST}" \
     "${FRONTEND_PORT}" <<'PY'
 import os
+import signal
 import subprocess
 import sys
 
 _, frontend_dir, host, port = sys.argv[1:]
+requested_signal = 0
+
+
+def handle_signal(signal_number, _frame):
+    global requested_signal
+    requested_signal = signal_number
+
+
+for signal_number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(signal_number, handle_signal)
 os.setsid()
+if requested_signal:
+    raise SystemExit(128 + requested_signal)
 process = subprocess.Popen(
     ["npm", "run", "dev", "--", "--host", host, "--port", port],
     cwd=frontend_dir,
 )
-raise SystemExit(process.wait())
+if requested_signal:
+    signal.signal(requested_signal, signal.SIG_IGN)
+    os.killpg(os.getpgrp(), requested_signal)
+    signal.signal(requested_signal, handle_signal)
+returncode = process.wait()
+raise SystemExit(128 + requested_signal if requested_signal else returncode)
 PY
 }
 
@@ -1112,48 +1130,12 @@ for target in (lambda: os.kill(pid, signal_number), lambda: os.killpg(pid, signa
 PY
 }
 
-wait_for_owned_frontend_exit() {
-  local pid="$1"
-  local process_alive
-  local group_alive
-  local process_state
-  local target_status
-  for _ in $(seq 1 50); do
-    process_alive=1
-    group_alive=1
-    if process_exists "${pid}"; then
-      process_state="$(ps -ww -o stat= -p "${pid}" 2>/dev/null || true)"
-      if [[ "${process_state}" != Z* ]]; then
-        process_alive=0
-      fi
-    else
-      target_status=$?
-      if [[ "${target_status}" != "1" ]]; then
-        return 2
-      fi
-    fi
-    if frontend_group_exists "${pid}"; then
-      group_alive=0
-    else
-      target_status=$?
-      if [[ "${target_status}" != "1" ]]; then
-        return 2
-      fi
-    fi
-    if [[ "${process_alive}" == "1" && "${group_alive}" == "1" ]]; then
-      return
-    fi
-    sleep 0.1
-  done
-  return 1
-}
-
 terminate_owned_frontend() {
   local pid="$1"
   signal_owned_frontend "${pid}" SIGTERM
-  if ! wait_for_owned_frontend_exit "${pid}"; then
+  if ! wait_for_process_exit "${pid}"; then
     signal_owned_frontend "${pid}" SIGKILL
-    if ! wait_for_owned_frontend_exit "${pid}"; then
+    if ! wait_for_process_exit "${pid}"; then
       echo "development frontend did not exit" >&2
       return 1
     fi
@@ -1499,6 +1481,9 @@ start_all() {
   local control_plane_pid=""
   local frontend_pid=""
   local frontend_identity=""
+  local frontend_reaped=0
+  local agent_reaped=0
+  local control_plane_reaped=0
   local agent_socket_identity=""
   local control_plane_socket_identity=""
   local cleaned_up=0
@@ -1510,6 +1495,7 @@ start_all() {
   local lifecycle_lock_release_timeout=2
   local lifecycle_lock_cleanup_attempts=20
   local lifecycle_lock_cleanup_interval=0.05
+  local lifecycle_lock_cleanup_acquire_timeout=2
 
   activate_backend_env
   prepare_dev_dir_for_reset
@@ -1523,31 +1509,23 @@ start_all() {
     trap - EXIT ERR
     trap '' INT TERM
     cleaned_up=1
-    if [[ -n "${frontend_pid}" && "${lifecycle_lock_held}" != "1" ]]; then
-      if ! acquire_lifecycle_lock; then
-        return 1
-      fi
-    fi
-    if [[ -n "${frontend_pid}" ]]; then
+    if [[ -n "${frontend_pid}" && "${frontend_reaped}" != "1" ]]; then
       if terminate_owned_frontend "${frontend_pid}"; then
-        if [[ -n "${frontend_identity}" ]]; then
-          remove_owned_frontend_metadata \
-            "${frontend_pid} ${frontend_identity}"
-        fi
+        frontend_reaped=1
       else
         cleanup_status=1
       fi
     fi
-    if [[ -n "${agent_pid}" ]]; then
+    if [[ -n "${agent_pid}" && "${agent_reaped}" != "1" ]]; then
       if terminate_child "${agent_pid}"; then
-        remove_owned_pid_file "${DEV_DIR}/agent.pid" "${agent_pid}"
+        agent_reaped=1
       else
         cleanup_status=1
       fi
     fi
-    if [[ -n "${control_plane_pid}" ]]; then
+    if [[ -n "${control_plane_pid}" && "${control_plane_reaped}" != "1" ]]; then
       if terminate_child "${control_plane_pid}"; then
-        remove_owned_pid_file "${DEV_DIR}/control-plane.pid" "${control_plane_pid}"
+        control_plane_reaped=1
       else
         cleanup_status=1
       fi
@@ -1560,10 +1538,35 @@ start_all() {
         cleanup_status=1
       fi
     fi
-    if [[ -n "${agent_socket_identity}" \
+    local cleanup_lock_available=0
+    local shared_cleanup_required=0
+    if [[ -n "${frontend_identity}" \
+      || -n "${agent_pid}" \
+      || -n "${control_plane_pid}" \
+      || -n "${agent_socket_identity}" \
       || -n "${control_plane_socket_identity}" ]]; then
-      if ! acquire_lifecycle_lock; then
-        return 1
+      shared_cleanup_required=1
+    fi
+    if [[ "${lifecycle_lock_held}" == "1" ]]; then
+      cleanup_lock_available=1
+    elif [[ "${shared_cleanup_required}" == "1" ]]; then
+      lifecycle_lock_acquire_timeout="${lifecycle_lock_cleanup_acquire_timeout}"
+      if acquire_lifecycle_lock; then
+        cleanup_lock_available=1
+      else
+        cleanup_status=1
+      fi
+    fi
+    if [[ "${cleanup_lock_available}" == "1" ]]; then
+      if [[ -n "${frontend_identity}" ]]; then
+        remove_owned_frontend_metadata \
+          "${frontend_pid} ${frontend_identity}"
+      fi
+      if [[ -n "${agent_pid}" ]]; then
+        remove_owned_pid_file "${DEV_DIR}/agent.pid" "${agent_pid}"
+      fi
+      if [[ -n "${control_plane_pid}" ]]; then
+        remove_owned_pid_file "${DEV_DIR}/control-plane.pid" "${control_plane_pid}"
       fi
       if [[ -n "${agent_socket_identity}" ]]; then
         remove_owned_socket \
@@ -1643,17 +1646,24 @@ start_all() {
     capture_socket_identity "${DEV_DIR}/manager-enrollment.sock"
   )"
   bootstrap_local_agent
-  release_lifecycle_lock
 
   run_terminal_readiness
   start_tracked_frontend 8>&- 9>&- &
   frontend_pid=$!
   if ! frontend_identity="$(wait_for_frontend_identity "${frontend_pid}")"; then
     echo "frontend child exited before identity capture" >&2
+    cleanup 1 || true
     return 1
   fi
   write_frontend_metadata "${frontend_pid}" "${frontend_identity}"
-  wait "${frontend_pid}"
+  release_lifecycle_lock
+  local frontend_wait_status=0
+  wait "${frontend_pid}" || frontend_wait_status=$?
+  frontend_reaped=1
+  if [[ "${frontend_wait_status}" != "0" ]]; then
+    cleanup "${frontend_wait_status}" || true
+    return "${frontend_wait_status}"
+  fi
   cleanup 0
 }
 
