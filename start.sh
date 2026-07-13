@@ -73,26 +73,42 @@ activate_backend_env() {
   conda activate "${CONDA_ENV_NAME}"
 }
 
+ensure_dev_token() {
+  local token_path="$1"
+  local temporary_path
+
+  if [[ -f "${token_path}" ]] && grep -q '[^[:space:]]' "${token_path}"; then
+    return
+  fi
+
+  umask 077
+  temporary_path="$(mktemp "${token_path}.tmp.XXXXXX")"
+  if ! python - <<'PY' > "${temporary_path}"
+import secrets
+print(secrets.token_urlsafe(32))
+PY
+  then
+    rm -f "${temporary_path}"
+    return 1
+  fi
+  if ! chmod 0600 "${temporary_path}"; then
+    rm -f "${temporary_path}"
+    return 1
+  fi
+  if ! mv -f "${temporary_path}" "${token_path}"; then
+    rm -f "${temporary_path}"
+    return 1
+  fi
+}
+
 ensure_dev_config() {
   mkdir -p "${DEV_DIR}"
   chmod 0700 "${DEV_DIR}"
 
-  if [[ ! -f "${TOKEN_FILE}" ]]; then
-    umask 077
-    python - <<'PY' > "${TOKEN_FILE}"
-import secrets
-print(secrets.token_urlsafe(32))
-PY
-    chmod 0600 "${TOKEN_FILE}"
-  fi
+  ensure_dev_token "${TOKEN_FILE}"
 
-  if [[ "${DEV_CONFIG_MODE}" == "control-plane" && ! -f "${AGENT_TOKEN_FILE}" ]]; then
-    umask 077
-    python - <<'PY' > "${AGENT_TOKEN_FILE}"
-import secrets
-print(secrets.token_urlsafe(32))
-PY
-    chmod 0600 "${AGENT_TOKEN_FILE}"
+  if [[ "${DEV_CONFIG_MODE}" == "control-plane" ]]; then
+    ensure_dev_token "${AGENT_TOKEN_FILE}"
   fi
 
   if [[ ! -f "${CONFIG_FILE}" ]]; then

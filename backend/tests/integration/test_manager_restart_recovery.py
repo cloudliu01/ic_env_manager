@@ -27,7 +27,13 @@ def _wait_for_health(url: str) -> None:
 
 
 @pytest.mark.integration
-def test_manager_development_config_is_restartable_and_isolates_fleet_state(tmp_path):
+@pytest.mark.parametrize("initial_token", ["", " \n"], ids=["zero-byte", "whitespace-only"])
+def test_manager_development_config_repairs_blank_token_and_is_restartable(
+    tmp_path, initial_token
+):
+    token_file = tmp_path / "control-plane.token"
+    token_file.write_text(initial_token, encoding="utf-8")
+    token_file.chmod(0o600)
     executable_dir = tmp_path / "bin"
     executable_dir.mkdir()
     (executable_dir / "python").symlink_to(Path(sys.executable))
@@ -47,6 +53,9 @@ def test_manager_development_config_is_restartable_and_isolates_fleet_state(tmp_
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+    generated_token = token_file.read_text(encoding="utf-8")
+    assert generated_token.strip()
+    assert token_file.stat().st_mode & 0o777 == 0o600
     config = yaml.safe_load((tmp_path / "control-plane.yaml").read_text())
     control_plane = config["control_plane"]
     assert config["mode"] == "control-plane"
@@ -59,7 +68,17 @@ def test_manager_development_config_is_restartable_and_isolates_fleet_state(tmp_
         tmp_path / "manager-enrollment.sock"
     )
     assert "ingest" not in config
-    assert (tmp_path / "control-plane.token").stat().st_mode & 0o777 == 0o600
+
+    restart = subprocess.run(
+        [str(PROJECT_ROOT / "start.sh"), "config", "control-plane"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert restart.returncode == 0, restart.stdout + restart.stderr
+    assert token_file.read_text(encoding="utf-8") == generated_token
 
 
 @pytest.mark.integration
