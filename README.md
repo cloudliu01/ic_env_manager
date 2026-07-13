@@ -51,6 +51,18 @@ The wrapper creates owner-only development files under
 | Agent Local Ingest | `http://127.0.0.1:8767` |
 | Vite development UI | `http://127.0.0.1:5173` |
 
+Each `all` run rebuilds the generated Agent and Manager databases and managed
+Agent credentials. It preserves valid non-empty `agent.token` and
+`control-plane.token` login-token files, so existing local browser sign-ins can
+survive a restart. The wrapper registers `local-agent` through development-only,
+owner-only local v2 enrollment; the same-host flow has no SSH or static Agent
+configuration dependency. Remote Agent enrollment continues to use SSH.
+
+Startup prints `Local Agent enrolled.` after the v2 Registry commit. It prints
+`Local Terminal proxy ready.` only after terminal discovery, creation, resize,
+a command/output sentinel through the Manager WebSocket proxy, and cleanup have
+succeeded. Vite starts after that readiness check.
+
 Open the Vite address and sign in with the token printed from:
 
 ```bash
@@ -125,7 +137,7 @@ control_plane:
 ```
 
 Agents are added to the Manager's SQLite Registry through enrollment or the Web
-UI; a static `agents:` list is compatibility input, not the normal Fleet
+UI; a static `agents:` list is legacy recovery input, not the normal Fleet
 workflow. Complete examples and every supported field are in the
 [configuration guide](docs/guides/configuration.md) and
 [configuration reference](docs/reference/configuration.md).

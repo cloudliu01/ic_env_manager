@@ -41,7 +41,7 @@ Run these commands from the repository root:
 | `./start.sh control-plane` | Generate/validate Manager config; start Manager Public `8765`. |
 | `./start.sh backend` | Start the mode selected by `IC_ENV_GUARD_MODE` or an existing config. |
 | `./start.sh frontend` | Install missing npm dependencies and start Vite `5173`. |
-| `./start.sh all` | Start Manager `8765`, Agent Public `8766`, Agent Ingest `8767`, then Vite. |
+| `./start.sh all` | Rebuild generated Fleet state; start Manager `8765`, Agent Public `8766`, Agent Ingest `8767`; enroll `local-agent`; verify a proxied PTY; then start Vite `5173`. |
 | `./start.sh config [agent\|control-plane]` | Create and validate config without starting a server. |
 | `./start.sh help` | Print current commands and overrides. |
 
@@ -56,7 +56,6 @@ backends.
 | `IC_ENV_GUARD_DEV_DIR` | `/tmp/ic-env-guard-dev` | Generated config/token/state root. |
 | `IC_ENV_GUARD_TOKEN_FILE` | `$IC_ENV_GUARD_DEV_DIR/token` | Token path for generic config/backend. |
 | `IC_ENV_GUARD_CONFIG` | `$IC_ENV_GUARD_DEV_DIR/config.yaml` | Generic config path. |
-| `IC_ENV_GUARD_AGENT_TOKEN_FILE` | `$IC_ENV_GUARD_DEV_DIR/agent.token` | Compatibility Agent token input for local Manager config. |
 | `IC_ENV_GUARD_MODE` | `agent` | Mode for generic config/backend commands. |
 | `IC_ENV_GUARD_HOST` | `127.0.0.1` | Public backend host. |
 | `IC_ENV_GUARD_PORT` | `8765` | Public backend port. |
@@ -91,9 +90,34 @@ configs/tokens with mode `0600`. Depending on the command, it uses:
 /tmp/ic-env-guard-dev/manager-enrollment.sock
 ```
 
-The socket files exist only while their runtime is active. The local Manager
-config may contain a static `agents:` entry solely to bootstrap the demo; the
-Web-managed SQLite Registry is the production Fleet authority.
+The socket files exist only while their runtime is active. Each `all` run
+removes and rebuilds the generated Agent and Manager databases, Manager-managed
+Agent credentials, YAML, sockets, and PID metadata. It preserves valid
+non-empty `agent.token` and `control-plane.token` files; these are the separate
+public login tokens, not the Manager-to-Agent credential. Missing or blank
+login-token files are regenerated.
+
+After the Agent and an empty Manager start, the wrapper registers `local-agent`
+through development-gated, owner-only Unix sockets. The Registry record uses
+enrollment method `local_socket`, source `local_dev_bootstrap`, and transport
+profile `local-loopback-http`. Generated Manager YAML has no static `agents:`
+entry and no `legacy-config-http` dependency. This same-host development flow
+does not require an SSH daemon. Enrollment of remote Agents continues to use
+the bounded SSH workflow described in the [Manager Fleet Guide](manager-fleet.md).
+
+Successful startup includes these messages, in order:
+
+```text
+Local Agent enrolled.
+Local Terminal proxy ready.
+```
+
+The second message appears only after the wrapper has discovered, created, and
+resized a Terminal, observed a deterministic command sentinel through the
+Manager WebSocket proxy, and deleted the Terminal. If either message is
+missing, use the launcher output to identify whether local enrollment or
+Terminal proxy readiness failed. A failed `all` run exits non-zero and stops
+the Agent and Manager processes started by that invocation.
 
 ## Backend Checks
 

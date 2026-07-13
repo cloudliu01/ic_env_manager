@@ -62,7 +62,7 @@ journalctl -u ic-env-guard@manager.service -n 100 --no-pager
 
 Sign in using the Manager token. The Manager Fleet UI, not a static `agents:`
 list, is the normal source of truth. Static entries are accepted only for
-compatibility import and local demo bootstrap.
+legacy recovery import.
 
 ## Add an Agent by Address
 
@@ -141,12 +141,28 @@ For unattended enrollment, configure the dedicated service identity and
 forced-command template described in [Security](security.md#ssh-enrollment).
 Never disable host-key verification to automate enrollment.
 
+## Local Development Enrollment
+
+The repository's `./start.sh all` workflow uses a narrower enrollment path for
+its same-owner, same-host development Agent. The development-gated Manager and
+Agent exchange one bounded request through owner-only Unix sockets, then commit
+`local-agent` to the v2 Registry with enrollment method `local_socket`, source
+`local_dev_bootstrap`, and transport profile `local-loopback-http`.
+
+This path requires neither local SSH nor a static `agents:` entry, is not
+available through public HTTP or WebSocket APIs, and does not make loopback a
+general Agent target. Remote Agent enrollment and rotation continue to use the
+SSH workflows above.
+
 ## Legacy Token Recovery
 
 **Use legacy token instead** is a compatibility and recovery path, not the
 normal enrollment model. Supply the Agent's existing local-admin token once;
 Manager validates it against the chosen endpoint/profile and stores the needed
 credential server-side. The browser clears the submitted secret.
+
+Static `agents:` configuration is likewise a legacy recovery import, not a
+bootstrap mechanism for the current local stack or a normal Registry workflow.
 
 A legacy bearer token proves knowledge of a secret but carries no stable Agent
 instance identity by itself. It can be copied, reused, or presented by a

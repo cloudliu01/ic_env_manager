@@ -102,8 +102,18 @@ For the full local UI workflow:
 ./start.sh all
 ```
 
-Open `http://127.0.0.1:5173`. The default Manager is on `8765`, Agent Public on
-`8766`, and Agent Local Ingest on `8767`.
+The default Manager is on `8765`, Agent Public on `8766`, Agent Local Ingest on
+`8767`, and Vite on `5173`. Each run rebuilds generated Agent/Manager databases
+and managed Agent credentials while preserving valid non-empty `agent.token`
+and `control-plane.token` public login tokens.
+
+The wrapper enrolls `local-agent` into the v2 Registry through owner-only local
+Unix sockets. This same-host development path needs no SSH and does not depend
+on static `agents:` configuration or legacy import; remote Agents still use SSH
+enrollment. Wait for both `Local Agent enrolled.` and
+`Local Terminal proxy ready.`. The latter is printed only after a real PTY
+command and output sentinel succeed through the Manager Terminal proxy. Then
+open `http://127.0.0.1:5173`.
 
 ## Next Steps
 

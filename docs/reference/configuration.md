@@ -12,9 +12,9 @@ absolute must begin at the filesystem root.
 | `server` | Both | See below | Public and Ingest ports must differ on Agent. | Public HTTP/WebSocket listener. |
 | `auth` | Both | Required | Bearer token file must pass permission checks. | Public API/UI authentication. |
 | `state_database` | Agent | `null` | Path; use an absolute owner-controlled path in production. | Agent SQLite state and audit database. |
-| `development` | Manager dev | Secure default | Never enables insecure non-loopback links. | Loopback compatibility switch. |
+| `development` | Manager dev | Secure default | Never enables insecure non-loopback links. | Development-only loopback controls. |
 | `control_plane` | Manager | See below | Absolute storage paths and bounded targets. | Fleet Registry, probes, discovery, proxy limits. |
-| `agents` | Manager migration | `[]` | Unique IDs; enabled entries require safe token files. | Compatibility import only; use SQLite Registry normally. |
+| `agents` | Manager recovery | `[]` | Unique IDs; enabled entries require safe token files. | Legacy recovery import only; use SQLite Registry normally. |
 | `metrics` | Agent | See below | Collection/series bounds. | Prometheus publication and scrape policy. |
 | `terminal` | Agent | See below | Bounded time and replay retention. | PTY session lifecycle. |
 | `enrollment` | Both | See below | Absolute sockets/SSH paths and bounded TTLs. | Agent helper and Manager CLI orchestration. |
@@ -43,6 +43,7 @@ not a Manager-to-Agent transport profile and does not make Local Ingest remote.
 | `auth.mode` | Both | `bearer_token` | Only `bearer_token`. | Select Public authentication. |
 | `auth.token_file` | Both | Required | Safe regular token file; normally `0600`. | Store Public bearer token outside YAML. |
 | `development.allow_insecure_http` | Manager dev | `false` | Only loopback Agent plus loopback Manager. | Opt into local HTTP compatibility. |
+| `development.local_agent_bootstrap` | Manager dev | `false` | Requires control-plane mode, local-only Manager, insecure-development opt-in, and Manager socket. | Enable owner-only local v2 enrollment for the generated development Fleet. |
 
 ## Agent Local Ingest
 
@@ -63,7 +64,7 @@ not a Manager-to-Agent transport profile and does not make Local Ingest remote.
 | `metrics.remote_network_allowlist` | Agent | `[]` | Valid CIDR strings. | Permit remote `/metrics`; local scrapes are default. |
 | `terminal.idle_timeout_minutes` | Agent | `60` | `30..120`. | Close idle PTYs. |
 | `terminal.replay_buffer_bytes` | Agent | `2097152` | `1048576..10485760`. | Bound reconnect replay per session. |
-| `terminal.exited_retention_minutes` | Agent | `30` | `1..120`. | Retain exited session metadata/replay. |
+| `terminal.exited_retention_minutes` | Agent | `30` | `0..120`; `0` purges metadata/replay on the next session list/get. | Retain exited session metadata/replay. |
 | `observations.expired_retention_seconds` | Agent | `86400` | `0..604800`. | Retain expired rows before deletion. |
 | `observations.cleanup_interval_seconds` | Agent | `60` | `1..3600`. | Expired-row cleanup cadence. |
 | `logs.allowed_roots` | Agent | `[]` | Absolute, resolved, deduplicated paths. | Restrict registered/tail-readable files. |
@@ -139,9 +140,10 @@ trusted-LAN profile must also lie inside that profile's CIDRs.
 
 ## Compatibility Agent Entries
 
-Static entries are accepted for migration and local demo bootstrap, then
-imported into the Manager's Web-managed SQLite Registry. Do not maintain them as
-the normal Fleet source of truth.
+Static entries are accepted only for legacy recovery import into the Manager's
+Web-managed SQLite Registry. The current local development stack uses owner-only
+v2 enrollment instead. Do not maintain static entries as the normal Fleet
+source of truth.
 
 | Field | Mode | Default | Constraints | Purpose |
 | --- | --- | --- | --- | --- |
