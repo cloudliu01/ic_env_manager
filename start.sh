@@ -1034,18 +1034,23 @@ start_all() {
   local lifecycle_lock_io_dir=""
   local lifecycle_lock_fds_open=0
   local lifecycle_lock_held=0
+  local lifecycle_lock_acquire_timeout=121
+  local lifecycle_lock_release_timeout=2
+  local lifecycle_lock_cleanup_attempts=20
+  local lifecycle_lock_cleanup_interval=0.05
 
   activate_backend_env
   prepare_dev_dir_for_reset
 
   cleanup() {
-    local status=$?
+    local status="$1"
     local cleanup_status="${status}"
     if [[ "${cleaned_up}" == "1" ]]; then
       return "${status}"
     fi
+    trap - EXIT ERR
+    trap '' INT TERM
     cleaned_up=1
-    trap - EXIT INT TERM
     if [[ -n "${agent_pid}" ]]; then
       if terminate_child "${agent_pid}"; then
         remove_owned_pid_file "${DEV_DIR}/agent.pid" "${agent_pid}"
@@ -1057,6 +1062,14 @@ start_all() {
       if terminate_child "${control_plane_pid}"; then
         remove_owned_pid_file "${DEV_DIR}/control-plane.pid" "${control_plane_pid}"
       else
+        cleanup_status=1
+      fi
+    fi
+    if [[ "${lifecycle_lock_held}" != "1" \
+      && ( -n "${lifecycle_lock_pid}" \
+        || -n "${lifecycle_lock_io_dir}" \
+        || "${lifecycle_lock_fds_open}" == "1" ) ]]; then
+      if ! cleanup_lifecycle_lock_keeper; then
         cleanup_status=1
       fi
     fi
@@ -1074,12 +1087,45 @@ start_all() {
           "${DEV_DIR}/manager-enrollment.sock" "${control_plane_socket_identity}"
       fi
     fi
-    if ! release_lifecycle_lock; then
-      cleanup_status=1
+    if [[ "${lifecycle_lock_held}" == "1" ]]; then
+      if ! release_lifecycle_lock; then
+        cleanup_status=1
+      fi
+    elif [[ -n "${lifecycle_lock_pid}" \
+      || -n "${lifecycle_lock_io_dir}" \
+      || "${lifecycle_lock_fds_open}" == "1" ]]; then
+      if ! cleanup_lifecycle_lock_keeper; then
+        cleanup_status=1
+      fi
     fi
     return "${cleanup_status}"
   }
-  trap cleanup EXIT INT TERM
+
+  handle_exit() {
+    local status=$?
+    if [[ -n "${cleaned_up+x}" ]]; then
+      cleanup "${status}" || true
+    fi
+    trap - EXIT
+    exit "${status}"
+  }
+
+  handle_error() {
+    local status=$?
+    cleanup "${status}" || true
+    exit "${status}"
+  }
+
+  handle_signal() {
+    local status="$1"
+    cleanup "${status}" || true
+    exit "${status}"
+  }
+
+  trap handle_exit EXIT
+  trap handle_error ERR
+  trap 'handle_signal 130' INT
+  trap 'handle_signal 143' TERM
 
   acquire_lifecycle_lock
   reset_generated_state
@@ -1110,6 +1156,7 @@ start_all() {
   release_lifecycle_lock
 
   start_frontend
+  cleanup 0
 }
 
 command="${1:-help}"

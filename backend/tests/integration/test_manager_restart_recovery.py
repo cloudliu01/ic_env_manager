@@ -691,6 +691,118 @@ def test_lifecycle_lock_keeper_failures_are_bounded_clean_and_retryable(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize(
+    ("signal_number", "expected_status"),
+    [(signal.SIGINT, 130), (signal.SIGTERM, 143)],
+    ids=["interrupt", "terminate"],
+)
+def test_start_all_signal_during_lock_handshake_cleans_and_exits(
+    tmp_path, signal_number, expected_status
+):
+    dev_dir = (tmp_path / "development").resolve()
+    dev_dir.mkdir(mode=0o700)
+    ready = dev_dir / "keeper-ready"
+    keeper_pid = dev_dir / "keeper.pid"
+    script = f"""
+source {str(PROJECT_ROOT / 'start.sh')!r} help >/dev/null
+activate_backend_env() {{ :; }}
+prepare_dev_dir_for_reset() {{ :; }}
+lifecycle_lock_keeper() {{
+  exec python - {str(keeper_pid)!r} {str(ready)!r} <<'PY'
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+Path(sys.argv[1]).write_text(str(os.getpid()), encoding="ascii")
+Path(sys.argv[2]).touch()
+time.sleep(30)
+PY
+}}
+start_all
+"""
+    environment = os.environ | {
+        "IC_ENV_GUARD_DEV_DIR": str(dev_dir),
+        "lifecycle_lock_acquire_timeout": "1",
+        "lifecycle_lock_release_timeout": "1",
+        "lifecycle_lock_cleanup_attempts": "2",
+        "lifecycle_lock_cleanup_interval": "0.01",
+    }
+    launcher = subprocess.Popen(
+        ["bash", "-c", script],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        for _ in range(100):
+            if ready.exists() or launcher.poll() is not None:
+                break
+            time.sleep(0.02)
+        assert ready.exists(), launcher.communicate(timeout=1)
+        os.kill(launcher.pid, signal_number)
+        stdout, stderr = launcher.communicate(timeout=5)
+
+        assert launcher.returncode == expected_status, stdout + stderr
+        recorded_keeper = int(keeper_pid.read_text(encoding="ascii"))
+        with pytest.raises(ProcessLookupError):
+            os.kill(recorded_keeper, 0)
+        assert not list(dev_dir.glob(".start-all-lock.*"))
+
+        retry = _run_lifecycle_lock_scenario(dev_dir, "peer-open-failure")
+        assert retry.returncode == 0, retry.stdout + retry.stderr
+    finally:
+        if launcher.poll() is None:
+            os.killpg(launcher.pid, signal.SIGKILL)
+            launcher.communicate(timeout=1)
+
+
+@pytest.mark.integration
+def test_start_all_uses_hard_lifecycle_deadlines_not_environment(tmp_path):
+    dev_dir = (tmp_path / "development").resolve()
+    dev_dir.mkdir(mode=0o700)
+    script = f"""
+source {str(PROJECT_ROOT / 'start.sh')!r} help >/dev/null
+activate_backend_env() {{ :; }}
+prepare_dev_dir_for_reset() {{ :; }}
+acquire_lifecycle_lock() {{
+  printf '%s\n' \
+    "$lifecycle_lock_acquire_timeout" \
+    "$lifecycle_lock_release_timeout" \
+    "$lifecycle_lock_cleanup_attempts" \
+    "$lifecycle_lock_cleanup_interval"
+  return 17
+}}
+start_all
+"""
+    environment = os.environ | {
+        "IC_ENV_GUARD_DEV_DIR": str(dev_dir),
+        "lifecycle_lock_acquire_timeout": "999999999",
+        "lifecycle_lock_release_timeout": "invalid",
+        "lifecycle_lock_cleanup_attempts": "999999999",
+        "lifecycle_lock_cleanup_interval": "invalid",
+    }
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert result.stdout.splitlines() == ["121", "2", "20", "0.05"]
+
+
+@pytest.mark.integration
 def test_recorded_process_identity_change_before_kill_fails_closed():
     dev_dir = Path(mkdtemp(prefix="ieg-reused-process-", dir="/tmp")).resolve()
     dev_dir.chmod(0o700)
