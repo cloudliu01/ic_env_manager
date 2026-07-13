@@ -9,7 +9,6 @@ CONDA_ENV_NAME="${CONDA_ENV_NAME:-venv312}"
 DEV_DIR="${IC_ENV_GUARD_DEV_DIR:-/tmp/ic-env-guard-dev}"
 TOKEN_FILE="${IC_ENV_GUARD_TOKEN_FILE:-${DEV_DIR}/token}"
 CONFIG_FILE="${IC_ENV_GUARD_CONFIG:-${DEV_DIR}/config.yaml}"
-AGENT_TOKEN_FILE="${IC_ENV_GUARD_AGENT_TOKEN_FILE:-${DEV_DIR}/agent.token}"
 DEV_CONFIG_MODE="${IC_ENV_GUARD_MODE:-agent}"
 BACKEND_HOST="${IC_ENV_GUARD_HOST:-127.0.0.1}"
 BACKEND_PORT="${IC_ENV_GUARD_PORT:-8765}"
@@ -36,7 +35,6 @@ Environment overrides:
   IC_ENV_GUARD_DEV_DIR           Dev config/token directory. Default: /tmp/ic-env-guard-dev
   IC_ENV_GUARD_TOKEN_FILE        Token file path. Default: $IC_ENV_GUARD_DEV_DIR/token
   IC_ENV_GUARD_CONFIG            Config path. Default: $IC_ENV_GUARD_DEV_DIR/config.yaml
-  IC_ENV_GUARD_AGENT_TOKEN_FILE  Target agent token for control-plane dev. Default: $IC_ENV_GUARD_DEV_DIR/agent.token
   IC_ENV_GUARD_MODE              Config mode for config/backend commands. Default: agent
   IC_ENV_GUARD_HOST              Backend host. Default: 127.0.0.1
   IC_ENV_GUARD_PORT              Backend port. Default: 8765
@@ -56,6 +54,12 @@ use_mode_defaults() {
   if [[ -z "${IC_ENV_GUARD_TOKEN_FILE:-}" ]]; then
     TOKEN_FILE="${DEV_DIR}/${DEV_CONFIG_MODE}.token"
   fi
+}
+
+use_generated_mode_defaults() {
+  DEV_CONFIG_MODE="$1"
+  CONFIG_FILE="${DEV_DIR}/${DEV_CONFIG_MODE}.yaml"
+  TOKEN_FILE="${DEV_DIR}/${DEV_CONFIG_MODE}.token"
 }
 
 activate_backend_env() {
@@ -107,10 +111,6 @@ ensure_dev_config() {
 
   ensure_dev_token "${TOKEN_FILE}"
 
-  if [[ "${DEV_CONFIG_MODE}" == "control-plane" ]]; then
-    ensure_dev_token "${AGENT_TOKEN_FILE}"
-  fi
-
   if [[ ! -f "${CONFIG_FILE}" ]]; then
     if [[ "${DEV_CONFIG_MODE}" == "control-plane" ]]; then
       cat > "${CONFIG_FILE}" <<YAML
@@ -124,23 +124,22 @@ auth:
   token_file: ${TOKEN_FILE}
 development:
   allow_insecure_http: true
+  local_agent_bootstrap: true
 control_plane:
   audit_database: ${DEV_DIR}/control-plane.db
   credential_directory: ${DEV_DIR}/manager-credentials
   allowed_agent_cidrs:
     - 127.0.0.0/8
-  transport_profiles: []
+  transport_profiles:
+    - id: local-loopback-http
+      type: trusted_lan_http
+      allowed_cidrs:
+        - 127.0.0.0/8
   discovery:
     scopes: []
 enrollment:
   manager_socket_path: ${DEV_DIR}/manager-enrollment.sock
   manager_socket_mode: "0600"
-agents:
-  - id: local-agent
-    name: Local development agent
-    base_url: http://${BACKEND_HOST}:${AGENT_PORT}
-    token_file: ${AGENT_TOKEN_FILE}
-    enabled: true
 YAML
     else
       cat > "${CONFIG_FILE}" <<YAML
@@ -216,9 +215,6 @@ PY
 
   echo "Dev mode:   ${DEV_CONFIG_MODE}"
   echo "Dev token:  ${TOKEN_FILE}"
-  if [[ "${DEV_CONFIG_MODE}" == "control-plane" ]]; then
-    echo "Agent token: ${AGENT_TOKEN_FILE}"
-  fi
   echo "Dev config: ${CONFIG_FILE}"
   python - "${CONFIG_FILE}" <<'PY'
 import sys
@@ -286,7 +282,7 @@ start_backend() {
   if [[ "${DEV_CONFIG_MODE}" == "agent" ]]; then
     echo "Starting Local Ingest listener on http://127.0.0.1:${AGENT_INGEST_PORT}"
   fi
-  python - <<'PY'
+  exec python - "${CONFIG_FILE}" <<'PY'
 import os
 from pathlib import Path
 
@@ -334,37 +330,238 @@ PY
   return 1
 }
 
+wait_for_socket() {
+  local socket_path="$1"
+  echo "Waiting for enrollment socket ${socket_path}..."
+  for _ in $(seq 1 60); do
+    if [[ -S "${socket_path}" ]]; then
+      return
+    fi
+    sleep 0.5
+  done
+  echo "Enrollment socket did not become ready: ${socket_path}" >&2
+  return 1
+}
+
+prepare_dev_dir_for_reset() {
+  DEV_DIR="$(python - "${DEV_DIR}" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+requested = Path(sys.argv[1]).expanduser()
+resolved = requested.resolve()
+home = Path.home().resolve()
+if not resolved.is_absolute() or resolved == Path("/") or resolved == home:
+    raise SystemExit("unsafe development directory")
+resolved.mkdir(mode=0o700, parents=True, exist_ok=True)
+metadata = resolved.stat()
+if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+    raise SystemExit("development directory must be owner-only")
+print(resolved)
+PY
+)"
+}
+
+recorded_process_matches() {
+  local pid="$1"
+  local expected_config="$2"
+  python - "${pid}" "$(id -u)" "${expected_config}" <<'PY'
+import shlex
+import subprocess
+import sys
+
+pid, expected_uid, expected_config = sys.argv[1:]
+result = subprocess.run(
+    ["ps", "-o", "uid=", "-o", "command=", "-p", pid],
+    capture_output=True,
+    text=True,
+)
+if result.returncode != 0 or not result.stdout.strip():
+    raise SystemExit(2)
+uid, command = result.stdout.strip().split(maxsplit=1)
+if uid != expected_uid:
+    raise SystemExit(1)
+try:
+    arguments = shlex.split(command)
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if expected_config in arguments else 1)
+PY
+}
+
+wait_for_process_exit() {
+  local pid="$1"
+  local process_state
+  for _ in $(seq 1 50); do
+    if ! kill -0 "${pid}" >/dev/null 2>&1; then
+      return
+    fi
+    process_state="$(ps -o stat= -p "${pid}" 2>/dev/null || true)"
+    if [[ "${process_state}" == Z* ]]; then
+      return
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+stop_recorded_process() {
+  local pid_file="$1"
+  local expected_config="$2"
+  local pid
+  local identity_status
+
+  if [[ ! -e "${pid_file}" ]]; then
+    return
+  fi
+  pid="$(cat "${pid_file}")"
+  if [[ ! "${pid}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "development process identity mismatch" >&2
+    return 1
+  fi
+  if recorded_process_matches "${pid}" "${expected_config}"; then
+    kill -TERM "${pid}"
+    if ! wait_for_process_exit "${pid}"; then
+      kill -KILL "${pid}" >/dev/null 2>&1 || true
+      wait_for_process_exit "${pid}" || true
+    fi
+    rm -f "${pid_file}"
+    return
+  else
+    identity_status=$?
+  fi
+  if [[ "${identity_status}" == "2" ]] && ! kill -0 "${pid}" >/dev/null 2>&1; then
+    rm -f "${pid_file}"
+    return
+  fi
+  echo "development process identity mismatch" >&2
+  return 1
+}
+
+reset_generated_state() {
+  stop_recorded_process "${DEV_DIR}/agent.pid" "${DEV_DIR}/agent.yaml"
+  stop_recorded_process "${DEV_DIR}/control-plane.pid" "${DEV_DIR}/control-plane.yaml"
+  rm -f \
+    "${DEV_DIR}/state.db" \
+    "${DEV_DIR}/state.db-wal" \
+    "${DEV_DIR}/state.db-shm" \
+    "${DEV_DIR}/state.db-journal" \
+    "${DEV_DIR}/control-plane.db" \
+    "${DEV_DIR}/control-plane.db-wal" \
+    "${DEV_DIR}/control-plane.db-shm" \
+    "${DEV_DIR}/control-plane.db-journal" \
+    "${DEV_DIR}/agent-enrollment.sock" \
+    "${DEV_DIR}/manager-enrollment.sock" \
+    "${DEV_DIR}/agent.pid" \
+    "${DEV_DIR}/control-plane.pid" \
+    "${DEV_DIR}/agent.yaml" \
+    "${DEV_DIR}/control-plane.yaml"
+  rm -rf "${DEV_DIR}/manager-credentials"
+}
+
+write_pid_file() {
+  local pid_file="$1"
+  local pid="$2"
+  umask 077
+  printf '%s\n' "${pid}" > "${pid_file}"
+  chmod 0600 "${pid_file}"
+}
+
+remove_owned_pid_file() {
+  local pid_file="$1"
+  local pid="$2"
+  if [[ -f "${pid_file}" ]] && [[ "$(cat "${pid_file}")" == "${pid}" ]]; then
+    rm -f "${pid_file}"
+  fi
+}
+
+terminate_child() {
+  local pid="$1"
+  if ! kill -0 "${pid}" >/dev/null 2>&1; then
+    wait "${pid}" >/dev/null 2>&1 || true
+    return
+  fi
+  kill -TERM "${pid}" >/dev/null 2>&1 || true
+  if ! wait_for_process_exit "${pid}"; then
+    kill -KILL "${pid}" >/dev/null 2>&1 || true
+    wait_for_process_exit "${pid}" || true
+  fi
+  wait "${pid}" >/dev/null 2>&1 || true
+}
+
+bootstrap_local_agent() {
+  (
+  cd "${BACKEND_DIR}"
+  python - "${DEV_DIR}" "${BACKEND_HOST}" "${AGENT_PORT}" <<'PY'
+import sys
+from pathlib import Path
+from ic_env_guard.systemd.cli import ctl_main
+
+dev_dir = Path(sys.argv[1])
+raise SystemExit(ctl_main([
+    "agent", "bootstrap-local",
+    "--manager-socket", str(dev_dir / "manager-enrollment.sock"),
+    "--agent-socket", str(dev_dir / "agent-enrollment.sock"),
+    "--base-url", f"http://{sys.argv[2]}:{sys.argv[3]}",
+    "--transport-profile", "local-loopback-http",
+    "--agent-id", "local-agent",
+    "--display-name", "Local development agent",
+]))
+PY
+  )
+}
+
 start_all() {
   local control_plane_port="${BACKEND_PORT}"
   local agent_pid=""
   local control_plane_pid=""
+  local cleaned_up=0
 
   activate_backend_env
+  prepare_dev_dir_for_reset
+  reset_generated_state
 
   cleanup() {
+    local status=$?
+    if [[ "${cleaned_up}" == "1" ]]; then
+      return "${status}"
+    fi
+    cleaned_up=1
+    trap - EXIT INT TERM
     if [[ -n "${agent_pid}" ]]; then
-      kill "${agent_pid}" >/dev/null 2>&1 || true
+      terminate_child "${agent_pid}"
+      remove_owned_pid_file "${DEV_DIR}/agent.pid" "${agent_pid}"
     fi
     if [[ -n "${control_plane_pid}" ]]; then
-      kill "${control_plane_pid}" >/dev/null 2>&1 || true
+      terminate_child "${control_plane_pid}"
+      remove_owned_pid_file "${DEV_DIR}/control-plane.pid" "${control_plane_pid}"
     fi
+    rm -f "${DEV_DIR}/agent-enrollment.sock" "${DEV_DIR}/manager-enrollment.sock"
+    return "${status}"
   }
   trap cleanup EXIT INT TERM
 
-  use_mode_defaults agent
+  use_generated_mode_defaults agent
   BACKEND_PORT="${AGENT_PORT}"
   if [[ -z "${IC_ENV_GUARD_AGENT_INGEST_PORT:-}" ]]; then
     AGENT_INGEST_PORT=8767
   fi
   start_backend &
   agent_pid=$!
+  write_pid_file "${DEV_DIR}/agent.pid" "${agent_pid}"
   wait_for_backend
+  wait_for_socket "${DEV_DIR}/agent-enrollment.sock"
 
-  use_mode_defaults control-plane
+  use_generated_mode_defaults control-plane
   BACKEND_PORT="${control_plane_port}"
   start_backend &
   control_plane_pid=$!
+  write_pid_file "${DEV_DIR}/control-plane.pid" "${control_plane_pid}"
   wait_for_backend
+  wait_for_socket "${DEV_DIR}/manager-enrollment.sock"
+  bootstrap_local_agent
 
   start_frontend
 }
