@@ -315,13 +315,30 @@ start_frontend() {
 }
 
 wait_for_backend() {
+  local expected_pid="$1"
+  local process_status
   echo "Waiting for backend readiness..."
   for _ in $(seq 1 60); do
+    if process_exists "${expected_pid}"; then
+      :
+    else
+      process_status=$?
+      if [[ "${process_status}" == "1" ]]; then
+        echo "backend child exited before readiness" >&2
+      else
+        echo "backend child state is unknown" >&2
+      fi
+      return 1
+    fi
     if python - <<PY >/dev/null 2>&1
 from urllib.request import urlopen
 urlopen("http://${BACKEND_HOST}:${BACKEND_PORT}/healthz", timeout=1).read()
 PY
     then
+      if ! process_exists "${expected_pid}"; then
+        echo "backend child exited before readiness" >&2
+        return 1
+      fi
       return
     fi
     sleep 0.5
@@ -864,9 +881,43 @@ stop_recorded_process() {
   return 1
 }
 
-reset_generated_state() {
+stop_recorded_backends() {
   stop_recorded_process "${DEV_DIR}/agent.pid" "${DEV_DIR}/agent.yaml"
   stop_recorded_process "${DEV_DIR}/control-plane.pid" "${DEV_DIR}/control-plane.yaml"
+}
+
+validate_development_ports_available() {
+  python - \
+    "${BACKEND_HOST}" "${AGENT_PORT}" \
+    "127.0.0.1" "${AGENT_INGEST_PORT}" \
+    "${BACKEND_HOST}" "$1" \
+    "${FRONTEND_HOST}" "${FRONTEND_PORT}" <<'PY'
+import socket
+import sys
+
+reservations = []
+try:
+    arguments = sys.argv[1:]
+    for host, port_text in zip(arguments[::2], arguments[1::2], strict=True):
+        port = int(port_text)
+        if not 1 <= port <= 65535:
+            raise ValueError
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        reservation = socket.socket(family, socket.SOCK_STREAM)
+        reservations.append(reservation)
+        reservation.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        reservation.bind((host, port))
+        reservation.listen()
+except (OSError, ValueError):
+    print("development port already in use", file=sys.stderr)
+    raise SystemExit(1)
+finally:
+    for reservation in reservations:
+        reservation.close()
+PY
+}
+
+reset_generated_state() {
   rm -f \
     "${DEV_DIR}/state.db" \
     "${DEV_DIR}/state.db-wal" \
@@ -1138,17 +1189,19 @@ start_all() {
   trap 'handle_signal 143' TERM
 
   acquire_lifecycle_lock
+  if [[ -z "${IC_ENV_GUARD_AGENT_INGEST_PORT:-}" ]]; then
+    AGENT_INGEST_PORT=8767
+  fi
+  stop_recorded_backends
+  validate_development_ports_available "${control_plane_port}"
   reset_generated_state
 
   use_generated_mode_defaults agent
   BACKEND_PORT="${AGENT_PORT}"
-  if [[ -z "${IC_ENV_GUARD_AGENT_INGEST_PORT:-}" ]]; then
-    AGENT_INGEST_PORT=8767
-  fi
   start_backend 8>&- 9>&- &
   agent_pid=$!
   write_pid_file "${DEV_DIR}/agent.pid" "${agent_pid}"
-  wait_for_backend
+  wait_for_backend "${agent_pid}"
   wait_for_socket "${DEV_DIR}/agent-enrollment.sock"
   agent_socket_identity="$(capture_socket_identity "${DEV_DIR}/agent-enrollment.sock")"
 
@@ -1157,7 +1210,7 @@ start_all() {
   start_backend 8>&- 9>&- &
   control_plane_pid=$!
   write_pid_file "${DEV_DIR}/control-plane.pid" "${control_plane_pid}"
-  wait_for_backend
+  wait_for_backend "${control_plane_pid}"
   wait_for_socket "${DEV_DIR}/manager-enrollment.sock"
   control_plane_socket_identity="$(
     capture_socket_identity "${DEV_DIR}/manager-enrollment.sock"

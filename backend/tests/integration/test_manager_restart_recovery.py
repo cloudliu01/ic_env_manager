@@ -97,6 +97,36 @@ def _bounded_all(environment: dict[str, str], timeout: float = 3) -> tuple[int |
     return process.returncode, output
 
 
+def _start_foreign_listener(signal_marker: Path, *, health: bool = False):
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal,socket,sys; from pathlib import Path; "
+            "marker=Path(sys.argv[1]); health=sys.argv[2] == 'health'; "
+            "listener=socket.socket(); listener.bind(('127.0.0.1', 0)); "
+            "listener.listen(); print(listener.getsockname()[1], flush=True); "
+            "signal.signal(signal.SIGTERM, lambda *_: (marker.touch(), sys.exit(0))); "
+            "signal.signal(signal.SIGINT, lambda *_: (marker.touch(), sys.exit(0))); "
+            "response=(b'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n' "
+            "b'Connection: close\\r\\n\\r\\nOK'); "
+            "\nwhile True:\n"
+            " connection,_=listener.accept()\n"
+            " with connection:\n"
+            "  if health:\n"
+            "   connection.recv(4096); connection.sendall(response)\n",
+            str(signal_marker),
+            "health" if health else "raw",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout is not None
+    port = int(process.stdout.readline())
+    return process, port
+
+
 def _wait_for_local_agent(
     database: Path, process: subprocess.Popen | None = None
 ) -> tuple[str, str, str]:
@@ -306,6 +336,136 @@ def test_start_all_rejects_unrelated_recorded_process_without_signaling_it():
         unrelated.terminate()
         unrelated.wait(timeout=5)
         rmtree(dev_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("port_variable", "serves_health"),
+    [
+        ("IC_ENV_GUARD_AGENT_PORT", True),
+        ("IC_ENV_GUARD_PORT", False),
+        ("IC_ENV_GUARD_AGENT_INGEST_PORT", False),
+        ("IC_ENV_GUARD_FRONTEND_PORT", False),
+    ],
+    ids=["agent", "manager", "ingest", "frontend"],
+)
+def test_start_all_rejects_occupied_port_before_reset_without_signaling_listener(
+    port_variable, serves_health
+):
+    dev_dir = Path(mkdtemp(prefix="ieg-occupied-port-", dir="/tmp")).resolve()
+    dev_dir.chmod(0o700)
+    preserved_files = {
+        "state.db": b"preserved Agent state",
+        "control-plane.db": b"preserved Manager state",
+        "agent.yaml": b"preserved Agent config",
+        "control-plane.yaml": b"preserved Manager config",
+        "agent.token": b"preserved Agent token\n",
+        "control-plane.token": b"preserved Manager token\n",
+    }
+    for name, payload in preserved_files.items():
+        path = dev_dir / name
+        path.write_bytes(payload)
+        path.chmod(0o600)
+    credentials = dev_dir / "manager-credentials"
+    credentials.mkdir(mode=0o700)
+    credential = credentials / "managed.credential"
+    credential.write_bytes(b"preserved managed credential")
+    credential.chmod(0o600)
+    enrollment_sockets: list[socket.socket] = []
+    socket_identities = {}
+    for name in ("agent-enrollment.sock", "manager-enrollment.sock"):
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(dev_dir / name))
+        listener.listen()
+        enrollment_sockets.append(listener)
+        metadata = (dev_dir / name).lstat()
+        socket_identities[name] = (metadata.st_dev, metadata.st_ino)
+    signal_marker = dev_dir / "foreign-listener.signaled"
+    foreign, occupied_port = _start_foreign_listener(
+        signal_marker, health=serves_health
+    )
+    environment, _, _ = _launcher_environment(dev_dir)
+    environment[port_variable] = str(occupied_port)
+    try:
+        started = time.monotonic()
+        returncode, output = _bounded_all(environment, timeout=5)
+
+        assert time.monotonic() - started < 7
+        assert returncode is not None
+        assert returncode != 0
+        assert "development port already in use" in output
+        assert foreign.poll() is None
+        assert not signal_marker.exists()
+        for name, payload in preserved_files.items():
+            assert (dev_dir / name).read_bytes() == payload
+        assert credential.read_bytes() == b"preserved managed credential"
+        for name, identity in socket_identities.items():
+            metadata = (dev_dir / name).lstat()
+            assert (metadata.st_dev, metadata.st_ino) == identity
+    finally:
+        if foreign.poll() is None:
+            foreign.kill()
+            foreign.wait(timeout=5)
+        for listener in enrollment_sockets:
+            listener.close()
+        rmtree(dev_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+def test_backend_readiness_rejects_exited_captured_child_despite_foreign_health(
+    tmp_path,
+):
+    marker = tmp_path / "foreign-listener.signaled"
+    foreign, port = _start_foreign_listener(marker, health=True)
+    script = f"""
+source {str(PROJECT_ROOT / 'start.sh')!r} help >/dev/null
+BACKEND_HOST=127.0.0.1
+BACKEND_PORT={port}
+false &
+child=$!
+wait "$child" || true
+wait_for_backend "$child"
+"""
+    try:
+        result = subprocess.run(
+            ["bash", "-c", script],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+
+        assert result.returncode != 0
+        assert "backend child exited before readiness" in result.stderr
+        assert foreign.poll() is None
+        assert not marker.exists()
+    finally:
+        if foreign.poll() is None:
+            foreign.kill()
+            foreign.wait(timeout=5)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("invalid_ports", [False, True], ids=["duplicate", "invalid"])
+def test_start_all_rejects_invalid_or_duplicate_ports_before_reset(
+    tmp_path, invalid_ports
+):
+    dev_dir = (tmp_path / "development").resolve()
+    dev_dir.mkdir(mode=0o700)
+    state = dev_dir / "state.db"
+    state.write_bytes(b"must survive port validation")
+    environment, _, _ = _launcher_environment(dev_dir)
+    if invalid_ports:
+        environment["IC_ENV_GUARD_AGENT_INGEST_PORT"] = "invalid"
+    else:
+        environment["IC_ENV_GUARD_FRONTEND_PORT"] = environment["IC_ENV_GUARD_PORT"]
+
+    returncode, output = _bounded_all(environment)
+
+    assert returncode is not None
+    assert returncode != 0
+    assert "development port already in use" in output
+    assert state.read_bytes() == b"must survive port validation"
 
 
 def test_reset_validation_uses_passwd_home_before_any_directory_mutation():
