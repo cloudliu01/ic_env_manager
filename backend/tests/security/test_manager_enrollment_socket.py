@@ -2,14 +2,18 @@ import asyncio
 import json
 import os
 import shutil
+import socket
 import stat
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import monotonic
 from types import SimpleNamespace
 
 import pytest
 
+import ic_env_guard.enrollment.local_socket as local_socket_module
+from ic_env_guard.enrollment.local_socket import LocalEnrollmentSocketClient
 from ic_env_guard.enrollment.manager_socket import (
     MAX_HEADER_BYTES,
     ManagerEnrollmentSocket,
@@ -77,6 +81,13 @@ def _local_request(socket_dir):
     }
 
 
+def _owner_socket(path, *, mode=0o600):
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    path.chmod(mode)
+    return listener
+
+
 async def _send_local_frame(server, payload):
     reader, writer = await asyncio.open_unix_connection(server.path)
     writer.write(payload)
@@ -92,6 +103,8 @@ async def _send_local_frame(server, payload):
 @pytest.mark.security
 async def test_manager_socket_owner_can_bootstrap_local_agent(socket_dir):
     orchestrator = Orchestrator()
+    agent_listener = _owner_socket(socket_dir / "agent-enrollment.sock")
+    local_socket_client = LocalEnrollmentSocketClient(socket_dir)
     server = ManagerEnrollmentSocket(
         path=socket_dir / "manager.sock",
         mode=0o600,
@@ -99,6 +112,7 @@ async def test_manager_socket_owner_can_bootstrap_local_agent(socket_dir):
         allowed_uid=os.geteuid(),
         peer_authorizer=lambda _socket: True,
         local_bootstrap_enabled=True,
+        local_socket_client=local_socket_client,
     )
     await server.start()
     request = _local_request(socket_dir)
@@ -109,6 +123,7 @@ async def test_manager_socket_owner_can_bootstrap_local_agent(socket_dir):
         )
     finally:
         await server.stop()
+        agent_listener.close()
 
     assert response == {
         "protocol": "manager-local-bootstrap.result.v1",
@@ -149,6 +164,7 @@ async def test_manager_local_bootstrap_rejects_invalid_request_without_dispatch(
     socket_dir, payload_mutator
 ):
     orchestrator = Orchestrator()
+    agent_listener = _owner_socket(socket_dir / "agent-enrollment.sock")
     server = ManagerEnrollmentSocket(
         path=socket_dir / "manager.sock",
         mode=0o600,
@@ -156,6 +172,7 @@ async def test_manager_local_bootstrap_rejects_invalid_request_without_dispatch(
         allowed_uid=os.geteuid(),
         peer_authorizer=lambda _socket: True,
         local_bootstrap_enabled=True,
+        local_socket_client=LocalEnrollmentSocketClient(socket_dir),
     )
     await server.start()
     request = payload_mutator(_local_request(socket_dir), socket_dir)
@@ -166,6 +183,125 @@ async def test_manager_local_bootstrap_rejects_invalid_request_without_dispatch(
         )
     finally:
         await server.stop()
+        agent_listener.close()
+
+    assert response == {"error": "invalid_request"}
+    assert orchestrator.local_bootstraps == []
+
+
+@pytest.mark.security
+@pytest.mark.parametrize(
+    "unsafe_leaf",
+    ("nul", "symlink", "missing", "non-socket", "unsafe-mode", "foreign-owner"),
+)
+async def test_manager_local_bootstrap_reuses_exact_socket_preflight_before_dispatch(
+    socket_dir, monkeypatch, unsafe_leaf
+):
+    orchestrator = Orchestrator()
+    local_socket_client = LocalEnrollmentSocketClient(socket_dir)
+    server = ManagerEnrollmentSocket(
+        path=socket_dir / "manager.sock",
+        mode=0o600,
+        orchestrator=orchestrator,
+        allowed_uid=os.geteuid(),
+        peer_authorizer=lambda _socket: True,
+        local_bootstrap_enabled=True,
+        local_socket_client=local_socket_client,
+    )
+    listener = None
+    path = socket_dir / "unsafe-agent.sock"
+    if unsafe_leaf == "nul":
+        submitted_path = f"{path}\x00tail"
+    elif unsafe_leaf == "symlink":
+        target = socket_dir / "target"
+        target.write_text("not-a-socket", encoding="utf-8")
+        path.symlink_to(target)
+        submitted_path = str(path)
+    elif unsafe_leaf == "missing":
+        submitted_path = str(path)
+    elif unsafe_leaf == "non-socket":
+        path.write_text("not-a-socket", encoding="utf-8")
+        path.chmod(0o600)
+        submitted_path = str(path)
+    else:
+        listener = _owner_socket(
+            path, mode=0o660 if unsafe_leaf == "unsafe-mode" else 0o600
+        )
+        submitted_path = str(path)
+    await server.start()
+    if unsafe_leaf == "foreign-owner":
+        owner_uid = os.geteuid()
+        effective_uids = iter((owner_uid, owner_uid + 1))
+        monkeypatch.setattr(
+            local_socket_module.os, "geteuid", lambda: next(effective_uids)
+        )
+    request = {**_local_request(socket_dir), "agent_socket_path": submitted_path}
+    try:
+        response = await _send_local_frame(
+            server,
+            json.dumps(request, separators=(",", ":")).encode() + b"\n",
+        )
+    finally:
+        await server.stop()
+        if listener is not None:
+            listener.close()
+
+    assert response == {"error": "invalid_request"}
+    assert orchestrator.local_bootstraps == []
+
+
+@pytest.mark.security
+@pytest.mark.parametrize(
+    "candidate_url",
+    (
+        "HTTP://127.0.0.1:8766",
+        " http://127.0.0.1:8766",
+        "\x00http://127.0.0.1:8766",
+        "http://127.0.0.1:8766\n",
+        "http://127.0.0.1:0",
+        "http://127.0.0.1",
+        "http://127.0.0.1:8766/",
+        "http://127.0.0.1:8766?query=value",
+        "http://127.0.0.1:8766#fragment",
+        "http://user@127.0.0.1:8766",
+    ),
+    ids=(
+        "uppercase-scheme",
+        "leading-space",
+        "leading-c0",
+        "trailing-newline",
+        "port-zero",
+        "missing-port",
+        "path",
+        "query",
+        "fragment",
+        "userinfo",
+    ),
+)
+async def test_manager_local_bootstrap_requires_exact_canonical_url_before_dispatch(
+    socket_dir, candidate_url
+):
+    orchestrator = Orchestrator()
+    agent_listener = _owner_socket(socket_dir / "agent-enrollment.sock")
+    server = ManagerEnrollmentSocket(
+        path=socket_dir / "manager.sock",
+        mode=0o600,
+        orchestrator=orchestrator,
+        allowed_uid=os.geteuid(),
+        peer_authorizer=lambda _socket: True,
+        local_bootstrap_enabled=True,
+        local_socket_client=LocalEnrollmentSocketClient(socket_dir),
+    )
+    await server.start()
+    request = {**_local_request(socket_dir), "base_url": candidate_url}
+    try:
+        response = await _send_local_frame(
+            server,
+            json.dumps(request, separators=(",", ":")).encode() + b"\n",
+        )
+    finally:
+        await server.stop()
+        agent_listener.close()
 
     assert response == {"error": "invalid_request"}
     assert orchestrator.local_bootstraps == []
@@ -250,6 +386,191 @@ async def test_manager_local_bootstrap_rejects_group_only_peer(socket_dir):
 
     assert response == {"error": "unauthorized_peer"}
     assert orchestrator.local_bootstraps == []
+
+
+@pytest.mark.security
+async def test_manager_deadline_covers_exhausted_semaphore(socket_dir):
+    server = ManagerEnrollmentSocket(
+        path=socket_dir / "manager.sock",
+        mode=0o600,
+        orchestrator=Orchestrator(),
+        allowed_uid=os.geteuid(),
+        peer_authorizer=lambda _socket: True,
+        max_concurrency=1,
+        io_timeout_seconds=1.0,
+        result_timeout_seconds=0.08,
+    )
+    await server.start()
+    first_reader, first_writer = await asyncio.open_unix_connection(server.path)
+    await asyncio.sleep(0.01)
+    started = monotonic()
+    second_reader, second_writer = await asyncio.open_unix_connection(server.path)
+    try:
+        assert await asyncio.wait_for(second_reader.read(), timeout=0.25) == b""
+        assert monotonic() - started < 0.2
+    finally:
+        first_writer.close()
+        second_writer.close()
+        await asyncio.gather(
+            first_writer.wait_closed(),
+            second_writer.wait_closed(),
+            return_exceptions=True,
+        )
+        await server.stop()
+        assert await first_reader.read() == b""
+
+
+@pytest.mark.security
+async def test_manager_deadline_is_not_reset_before_ssh_result_read(socket_dir):
+    server = ManagerEnrollmentSocket(
+        path=socket_dir / "manager.sock",
+        mode=0o600,
+        orchestrator=Orchestrator(),
+        allowed_uid=os.geteuid(),
+        peer_authorizer=lambda _socket: True,
+        io_timeout_seconds=0.2,
+        result_timeout_seconds=0.15,
+    )
+    await server.start()
+    reader, writer = await asyncio.open_unix_connection(server.path)
+    started = monotonic()
+    await asyncio.sleep(0.1)
+    writer.write(
+        json.dumps(
+            {
+                "protocol": "manager-cli-enrollment.header.v1",
+                "enrollment_id": "enrollment-1",
+                "ssh": "edaops@agent.example:2222",
+                "pinned_address": "10.20.30.40",
+            }
+        ).encode()
+        + b"\n"
+    )
+    await writer.drain()
+    try:
+        ready = await asyncio.wait_for(_line(reader), timeout=0.1)
+        assert ready["protocol"] == "manager-cli-enrollment.ready.v1"
+        assert await asyncio.wait_for(reader.read(), timeout=0.12) == b""
+        assert monotonic() - started < 0.21
+        assert len(server.orchestrator.begins) == 1
+        assert len(server.orchestrator.aborts) == 1
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        await server.stop()
+
+
+@pytest.mark.security
+async def test_manager_local_deadline_bounds_cancellation_cleanup_and_never_completes(
+    socket_dir,
+):
+    class SlowCancellationOrchestrator(Orchestrator):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+            self.cleaned = asyncio.Event()
+            self.completions = 0
+
+        async def bootstrap_local(self, request, context):
+            self.local_bootstraps.append((request, context))
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                await asyncio.sleep(0.15)
+                self.cleaned.set()
+                raise
+            self.completions += 1
+            return SimpleNamespace(agent_id=request.agent_id, revision=1)
+
+    orchestrator = SlowCancellationOrchestrator()
+    agent_listener = _owner_socket(socket_dir / "agent-enrollment.sock")
+    server = ManagerEnrollmentSocket(
+        path=socket_dir / "manager.sock",
+        mode=0o600,
+        orchestrator=orchestrator,
+        allowed_uid=os.geteuid(),
+        peer_authorizer=lambda _socket: True,
+        io_timeout_seconds=0.2,
+        result_timeout_seconds=0.05,
+        cancellation_cleanup_seconds=0.02,
+        local_bootstrap_enabled=True,
+        local_socket_client=LocalEnrollmentSocketClient(socket_dir),
+    )
+    await server.start()
+    reader, writer = await asyncio.open_unix_connection(server.path)
+    writer.write(json.dumps(_local_request(socket_dir)).encode() + b"\n")
+    writer.write_eof()
+    await writer.drain()
+    started = monotonic()
+    try:
+        await asyncio.wait_for(orchestrator.started.wait(), timeout=0.1)
+        assert await asyncio.wait_for(reader.read(), timeout=0.15) == b""
+        assert monotonic() - started < 0.12
+        assert orchestrator.cancelled.is_set()
+        assert orchestrator.completions == 0
+        await asyncio.wait_for(orchestrator.cleaned.wait(), timeout=0.3)
+        assert orchestrator.completions == 0
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        await server.stop()
+        agent_listener.close()
+
+
+@pytest.mark.security
+async def test_manager_shutdown_cancels_local_orchestration_task(socket_dir):
+    class BlockingOrchestrator(Orchestrator):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+            self.completions = 0
+
+        async def bootstrap_local(self, request, context):
+            self.local_bootstraps.append((request, context))
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            self.completions += 1
+            return SimpleNamespace(agent_id=request.agent_id, revision=1)
+
+    orchestrator = BlockingOrchestrator()
+    agent_listener = _owner_socket(socket_dir / "agent-enrollment.sock")
+    server = ManagerEnrollmentSocket(
+        path=socket_dir / "manager.sock",
+        mode=0o600,
+        orchestrator=orchestrator,
+        allowed_uid=os.geteuid(),
+        peer_authorizer=lambda _socket: True,
+        io_timeout_seconds=0.05,
+        result_timeout_seconds=1.0,
+        cancellation_cleanup_seconds=0.02,
+        local_bootstrap_enabled=True,
+        local_socket_client=LocalEnrollmentSocketClient(socket_dir),
+    )
+    await server.start()
+    reader, writer = await asyncio.open_unix_connection(server.path)
+    writer.write(json.dumps(_local_request(socket_dir)).encode() + b"\n")
+    writer.write_eof()
+    await writer.drain()
+    try:
+        await asyncio.wait_for(orchestrator.started.wait(), timeout=0.1)
+        await asyncio.wait_for(server.stop(), timeout=0.2)
+        assert orchestrator.cancelled.is_set()
+        assert orchestrator.completions == 0
+        assert await reader.read() == b""
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        if server.healthy:
+            await server.stop()
+        agent_listener.close()
 
 
 @pytest.mark.security

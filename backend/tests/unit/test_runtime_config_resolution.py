@@ -101,6 +101,10 @@ def test_local_bootstrap_composition_follows_development_gate(tmp_path):
         assert enabled_client._allowed_root == runtime.resolve()
         assert enabled_container.enrollment_orchestrator._local_bootstrap_enabled is True
         assert enabled_container.manager_enrollment_socket._local_bootstrap_enabled is True
+        assert (
+            enabled_container.manager_enrollment_socket._local_socket_client
+            is enabled_client
+        )
 
         assert disabled_container.enrollment_orchestrator._local_socket_client is None
         assert disabled_container.enrollment_orchestrator._local_bootstrap_enabled is False

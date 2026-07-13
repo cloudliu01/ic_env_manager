@@ -87,8 +87,11 @@ class LocalEnrollmentSocketClient:
             validation_target=validation_target,
         )
 
-    def _exchange(self, socket_path: Path, payload: bytes) -> bytes:
+    def preflight(self, socket_path: Path) -> None:
         self._validate_socket_path(socket_path)
+
+    def _exchange(self, socket_path: Path, payload: bytes) -> bytes:
+        self.preflight(socket_path)
         deadline = monotonic() + self._timeout_seconds
         timed_out = False
         unavailable = False

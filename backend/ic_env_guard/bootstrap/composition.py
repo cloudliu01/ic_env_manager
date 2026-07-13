@@ -470,6 +470,7 @@ def build_manager_container(config: AppConfig) -> ManagerContainer:
             allowed_uid=os.geteuid(),
             allowed_gid=config.enrollment.manager_socket_gid,
             local_bootstrap_enabled=local_bootstrap_enabled,
+            local_socket_client=local_socket_client,
         )
         if config.enrollment.manager_socket_path is not None
         else None

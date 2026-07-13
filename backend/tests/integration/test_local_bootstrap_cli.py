@@ -2,12 +2,21 @@ import json
 import os
 import shutil
 import socket
+import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
+from ic_env_guard.enrollment.local_cli import (
+    LOCAL_BOOTSTRAP_TIMEOUT_SECONDS,
+    run_local_bootstrap,
+)
+from ic_env_guard.enrollment.manager_socket import (
+    DEFAULT_MANAGER_OPERATION_TIMEOUT_SECONDS,
+)
 from ic_env_guard.systemd.cli import ctl_main
 
 
@@ -123,4 +132,60 @@ def test_guardctl_local_bootstrap_normalizes_server_error(capsys):
         assert len(received) == 1
     finally:
         _finish_manager(manager_socket, thread)
+        shutil.rmtree(socket_dir, ignore_errors=True)
+
+
+def test_local_cli_default_deadline_exceeds_manager_operation_deadline():
+    assert (
+        LOCAL_BOOTSTRAP_TIMEOUT_SECONDS
+        > DEFAULT_MANAGER_OPERATION_TIMEOUT_SECONDS
+    )
+
+
+@pytest.mark.integration
+def test_local_cli_uses_one_injected_deadline_for_slow_drip(capsys):
+    socket_dir = Path(tempfile.mkdtemp(prefix="ieg-local-cli-", dir="/tmp"))
+    socket_dir.chmod(0o700)
+    manager_socket = socket_dir / "manager.sock"
+    ready = threading.Event()
+
+    def manager():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(str(manager_socket))
+            os.chmod(manager_socket, 0o600)
+            listener.listen(1)
+            ready.set()
+            with listener.accept()[0] as connection:
+                _read_line(connection)
+                assert connection.recv(1) == b""
+                for value in b'{"protocol":"manager-local-bootstrap.result.v1"}\n':
+                    try:
+                        connection.sendall(bytes((value,)))
+                    except OSError:
+                        break
+                    time.sleep(0.02)
+
+    thread = threading.Thread(target=manager)
+    thread.start()
+    assert ready.wait(2)
+    try:
+        assert (
+            run_local_bootstrap(
+                manager_socket=manager_socket,
+                agent_socket=socket_dir / "agent.sock",
+                base_url="http://127.0.0.1:8766",
+                transport_profile="local-loopback-http",
+                agent_id="local-agent",
+                display_name="Local development agent",
+                stdout=sys.stdout,
+                stderr=sys.stderr,
+                timeout_seconds=0.05,
+            )
+            == 1
+        )
+        output = capsys.readouterr()
+        assert output.out == ""
+        assert output.err == "ic-env-guardctl: local bootstrap failed\n"
+    finally:
+        thread.join(2)
         shutil.rmtree(socket_dir, ignore_errors=True)

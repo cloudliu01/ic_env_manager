@@ -122,6 +122,24 @@ def _assert_safe_error(error, code, *forbidden):
 
 
 @pytest.mark.security
+def test_local_client_exposes_synchronous_socket_path_preflight(socket_dir):
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    socket_path = socket_dir / "enrollment.sock"
+    listener.bind(str(socket_path))
+    socket_path.chmod(0o600)
+    client = LocalEnrollmentSocketClient(socket_dir)
+    try:
+        assert client.preflight(socket_path) is None
+        socket_path.chmod(0o660)
+        with pytest.raises(LocalEnrollmentSocketError) as caught:
+            client.preflight(socket_path)
+    finally:
+        listener.close()
+
+    _assert_safe_error(caught.value, "local_socket_path_rejected", socket_path)
+
+
+@pytest.mark.security
 @pytest.mark.parametrize("failure", ("missing", "symlink_loop"))
 def test_local_client_constructor_maps_root_resolution_failures_without_path_leaks(
     tmp_path, failure

@@ -5,8 +5,12 @@ from pathlib import Path
 from time import monotonic
 from typing import Any, TextIO
 
+from ic_env_guard.enrollment.manager_socket import (
+    DEFAULT_MANAGER_OPERATION_TIMEOUT_SECONDS,
+)
+
 MAX_LOCAL_FRAME_BYTES = 2048
-LOCAL_BOOTSTRAP_TIMEOUT_SECONDS = 3.0
+LOCAL_BOOTSTRAP_TIMEOUT_SECONDS = DEFAULT_MANAGER_OPERATION_TIMEOUT_SECONDS + 5.0
 
 
 class LocalBootstrapCliError(Exception):
