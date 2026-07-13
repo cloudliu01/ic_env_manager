@@ -1,16 +1,19 @@
 import logging
 import re
 from collections.abc import Mapping
+from urllib.parse import unquote_plus
 
-_TICKET_QUERY_PARAMETER = re.compile(
-    r"([?&]ticket=)[^&#\s\"']*",
-    flags=re.IGNORECASE,
-)
+_QUERY_PARAMETER = re.compile(r"([?&])([^=&#\s\"']+)=([^&#\s\"']*)")
 _UVICORN_LOGGERS = ("uvicorn.error", "uvicorn.access")
 
 
 def _redact_ticket(value: str) -> str:
-    return _TICKET_QUERY_PARAMETER.sub(r"\1<redacted>", value)
+    def redact_parameter(match: re.Match[str]) -> str:
+        if unquote_plus(match.group(2)).casefold() != "ticket":
+            return match.group(0)
+        return f"{match.group(1)}{match.group(2)}=<redacted>"
+
+    return _QUERY_PARAMETER.sub(redact_parameter, value)
 
 
 class TerminalTicketRedactionFilter(logging.Filter):

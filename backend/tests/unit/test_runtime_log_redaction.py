@@ -1,4 +1,5 @@
 import logging
+from urllib.parse import parse_qsl
 
 import pytest
 
@@ -65,6 +66,65 @@ def test_percent_encoded_ticket_values_are_fully_redacted(path):
     rendered = record.getMessage()
     assert "percent" not in rendered
     assert "ticket=<redacted>" in rendered
+
+
+@pytest.mark.unit
+@pytest.mark.security
+@pytest.mark.parametrize(
+    ("name", "message", "args", "raw_query", "expected_path"),
+    [
+        (
+            "uvicorn.error",
+            '%s - "WebSocket %s" [accepted]',
+            ("127.0.0.1:1234", "/ws?%74icket=encoded-key-synthetic&safe=1"),
+            "%74icket=encoded-key-synthetic&safe=1",
+            "/ws?%74icket=<redacted>&safe=1",
+        ),
+        (
+            "uvicorn.access",
+            '%s - "%s %s HTTP/%s" %d',
+            (
+                "127.0.0.1:1234",
+                "GET",
+                "/terminal?safe=1&ti%63ket=encoded-key-synthetic#fragment",
+                "1.1",
+                200,
+            ),
+            "safe=1&ti%63ket=encoded-key-synthetic",
+            "/terminal?safe=1&ti%63ket=<redacted>#fragment",
+        ),
+    ],
+)
+def test_percent_encoded_ticket_keys_are_redacted(
+    name, message, args, raw_query, expected_path
+):
+    parsed = dict(parse_qsl(raw_query))
+    assert parsed["ticket"] == "encoded-key-synthetic"
+    record = _record(name, message, args)
+
+    TerminalTicketRedactionFilter().filter(record)
+
+    rendered = record.getMessage()
+    assert "encoded-key-synthetic" not in rendered
+    assert expected_path in rendered
+
+
+@pytest.mark.unit
+@pytest.mark.security
+def test_preformatted_message_redacts_each_encoded_ticket_key():
+    record = _record(
+        "uvicorn.error",
+        'WebSocket /ws?%74icket=first-synthetic&safe=%2F&TI%43KET=second-synthetic '
+        "[accepted]",
+        (),
+    )
+
+    TerminalTicketRedactionFilter().filter(record)
+
+    assert record.getMessage() == (
+        "WebSocket /ws?%74icket=<redacted>&safe=%2F&TI%43KET=<redacted> "
+        "[accepted]"
+    )
 
 
 @pytest.mark.unit
