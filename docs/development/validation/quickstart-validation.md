@@ -1,6 +1,6 @@
 # Quickstart Validation
 
-This document records the end-to-end MVP scenarios from `specs/001-linux-host-agent/quickstart.md` and maps them to automated tests or manual platform checks.
+This document records the end-to-end MVP scenarios from `docs/development/specs/001-linux-host-agent/quickstart.md` and maps them to automated tests or manual platform checks.
 
 ## 1. Install and start agent
 
@@ -8,7 +8,7 @@ Coverage:
 
 - `backend/tests/integration/test_packaging_runtime.py`
 - `backend/tests/integration/test_systemd_unit.py`
-- `docs/operations/platform-validation.md`
+- `docs/development/validation/platform-validation.md`
 
 Manual systemd validation is still required on CentOS 7, RHEL 8, and Ubuntu 24.04.
 
