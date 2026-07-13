@@ -9,7 +9,7 @@ from ic_env_guard.agents.client import AgentHttpClient
 from ic_env_guard.agents.registry import AgentRegistry
 from ic_env_guard.api.agent_http import get_agent_http_client
 from ic_env_guard.api.agent_proxy import get_agent_http_proxy
-from ic_env_guard.api.agents import get_agent_availability
+from ic_env_guard.api.agents import get_agent_availability, get_agent_registry
 from ic_env_guard.config.models import (
     AgentConfig,
     AppConfig,
@@ -55,21 +55,18 @@ def _control_plane_config(tmp_path):
     return AppConfig(
         auth=AuthConfig(token_file=_token_file(tmp_path)),
         mode="control-plane",
-        control_plane=ControlPlaneConfig(
-            audit_database=tmp_path / "control-plane.db",
-            allowed_agent_cidrs=["10.20.30.0/24"],
-        ),
+        control_plane=ControlPlaneConfig(audit_database=tmp_path / "control-plane.db"),
         agents=[
             AgentConfig(
                 id="lab-01",
                 name="Lab 01",
-                base_url="https://10.20.30.1:8765",
+                base_url="https://lab-01.example",
                 token_file=_token_file(tmp_path, "lab-01.token"),
             ),
             AgentConfig(
                 id="disabled",
                 name="Disabled",
-                base_url="https://10.20.30.2:8765",
+                base_url="https://disabled.example",
                 enabled=False,
             ),
         ],
@@ -285,6 +282,73 @@ def test_persisted_capability_cannot_bypass_disabled_local_gate(
     assert dispatched == []
 
 
+@pytest.mark.contract
+def test_persisted_legacy_config_triple_uses_direct_monitoring_route(tmp_path):
+    dispatched = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        dispatched.append(request.url.path)
+        return httpx.Response(200, json=_snapshot("local-agent"))
+
+    app, _credential_ref = _local_monitoring_app(tmp_path, handler)
+    with app.state.container.database_engine.begin() as connection:
+        connection.exec_driver_sql(
+            "UPDATE agents SET source='config_import', "
+            "enrollment_method='legacy_admin_token', "
+            "transport_profile_id='legacy-config-http' "
+            "WHERE agent_id='local-agent'"
+        )
+    client = TestClient(app)
+    response = client.get(
+        "/api/agents/local-agent/monitoring/snapshot",
+        headers={"Authorization": "Bearer secret-token"},
+    )
+    client.close()
+
+    assert response.status_code == 200
+    assert response.json()["host_id"] == "local-agent"
+    assert dispatched == ["/api/monitoring/local"]
+
+
+@pytest.mark.contract
+def test_forged_legacy_markers_with_managed_profile_stay_on_monitoring_proxy(
+    tmp_path, monkeypatch
+):
+    dispatched = []
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        dispatched.append(True)
+        return httpx.Response(200, json=_snapshot("local-agent"))
+
+    app, _credential_ref = _local_monitoring_app(tmp_path, handler)
+    with app.state.container.database_engine.begin() as connection:
+        connection.exec_driver_sql(
+            "UPDATE agents SET source='config_import', "
+            "enrollment_method='legacy_admin_token', "
+            "transport_profile_id='alternate-loopback-http' "
+            "WHERE agent_id='local-agent'"
+        )
+    reads = []
+    original_read = app.state.container.credential_store.read
+
+    def tracked_read(reference):
+        reads.append(reference)
+        return original_read(reference)
+
+    monkeypatch.setattr(app.state.container.credential_store, "read", tracked_read)
+    client = TestClient(app)
+    response = client.get(
+        "/api/agents/local-agent/monitoring/snapshot",
+        headers={"Authorization": "Bearer secret-token"},
+    )
+    client.close()
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "target_address_forbidden"
+    assert reads == []
+    assert dispatched == []
+
+
 def _snapshot(host_id="lab-01"):
     return {
         "host_id": host_id,
@@ -410,13 +474,10 @@ def test_agent_monitoring_snapshot_dispatches_to_selected_agent(tmp_path):
 
     config = _control_plane_config(tmp_path)
     app = create_app(config=config)
-    runtime_client = app.state.container.agent_client.clone_with_transport(
-        httpx.MockTransport(handler)
-    )
-    app.dependency_overrides[get_agent_http_client] = lambda: runtime_client
-    app.dependency_overrides[get_agent_http_proxy] = lambda: (
-        app.state.container.agent_http_proxy.with_runtime(
-            runtime_client, app.state.container.agent_availability
+    app.dependency_overrides[get_agent_registry] = lambda: AgentRegistry(config.agents)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(
+            httpx.MockTransport(handler)
         )
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
@@ -451,13 +512,10 @@ def test_agent_monitoring_snapshot_preserves_upstream_status(tmp_path):
 
     config = _control_plane_config(tmp_path)
     app = create_app(config=config)
-    runtime_client = app.state.container.agent_client.clone_with_transport(
-        httpx.MockTransport(capability_handler)
-    )
-    app.dependency_overrides[get_agent_http_client] = lambda: runtime_client
-    app.dependency_overrides[get_agent_http_proxy] = lambda: (
-        app.state.container.agent_http_proxy.with_runtime(
-            runtime_client, app.state.container.agent_availability
+    app.dependency_overrides[get_agent_registry] = lambda: AgentRegistry(config.agents)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(
+            httpx.MockTransport(capability_handler)
         )
     )
     app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
@@ -472,6 +530,39 @@ def test_agent_monitoring_snapshot_preserves_upstream_status(tmp_path):
     assert response.json()["error"] == "agent degraded"
     assert response.json()["agent_id"] == "lab-01"
     assert response.json()["correlation_id"]
+
+
+@pytest.mark.contract
+def test_legacy_agent_monitoring_timeout_preserves_error_and_audit(tmp_path):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("agent timed out", request=request)
+
+    config = _control_plane_config(tmp_path)
+    app = create_app(config=config)
+    app.dependency_overrides[get_agent_registry] = lambda: AgentRegistry(config.agents)
+    app.dependency_overrides[get_agent_http_client] = (
+        lambda: app.state.container.agent_client.clone_with_transport(
+            httpx.MockTransport(handler)
+        )
+    )
+    app.dependency_overrides[get_agent_availability] = lambda: _ready_availability(config)
+
+    with TestClient(app) as client:
+        headers = {"Authorization": "Bearer secret-token"}
+        response = client.get(
+            "/api/agents/lab-01/monitoring/snapshot", headers=headers
+        )
+        audit = client.get(
+            "/api/control-plane/audit",
+            headers=headers,
+            params={"agent_id": "lab-01", "operation": "monitoring.snapshot"},
+        ).json()["events"]
+
+    assert response.status_code == 504
+    assert response.json()["error"] == "agent_timeout"
+    assert audit[0]["result"] == "failed"
+    assert audit[0]["failure_category"] == "agent_timeout"
+    assert audit[0]["dispatch_state"] == "unknown"
 
 
 @pytest.mark.contract
