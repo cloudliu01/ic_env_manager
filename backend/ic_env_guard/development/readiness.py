@@ -1,5 +1,7 @@
 import argparse
 import asyncio
+import os
+import stat
 import sys
 import time
 from pathlib import Path
@@ -8,15 +10,52 @@ from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 import httpx
 import websockets
 
-from ic_env_guard.auth.token import load_bearer_token, validate_token_file_permissions
-
 READINESS_TIMEOUT_SECONDS = 10.0
 CLEANUP_TIMEOUT_SECONDS = 2.0
+TOKEN_FILE_MAX_BYTES = 4096
+MAX_SENTINEL_OUTPUT_BYTES = 1024 * 1024
 SENTINEL = "__LOCAL_V2_TERMINAL_OK__"
 
 
 class ReadinessError(Exception):
     pass
+
+
+class StableArgumentParser(argparse.ArgumentParser):
+    def error(self, _message: str) -> None:
+        raise ReadinessError("invalid arguments")
+
+
+def _validate_token_metadata(metadata) -> None:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+        or not 0 <= metadata.st_size <= TOKEN_FILE_MAX_BYTES
+    ):
+        raise ReadinessError("invalid token file")
+
+
+def _load_readiness_token(path: Path) -> str:
+    descriptor = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+        )
+        _validate_token_metadata(os.fstat(descriptor))
+        payload = os.read(descriptor, TOKEN_FILE_MAX_BYTES + 1)
+        if len(payload) > TOKEN_FILE_MAX_BYTES:
+            raise ReadinessError("invalid token file")
+        token = payload.decode("utf-8").strip()
+        if not token:
+            raise ReadinessError("invalid token file")
+        return token
+    except (OSError, UnicodeError, ReadinessError) as exc:
+        raise ReadinessError("invalid token file") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _remaining(deadline: float) -> float:
@@ -117,12 +156,19 @@ async def _verify_websocket(
         await asyncio.wait_for(
             websocket.send(f"printf '{SENTINEL}\\n'\r"), timeout=_remaining(deadline)
         )
-        received = ""
-        while SENTINEL not in received:
+        received_bytes = 0
+        sentinel_tail = ""
+        while True:
             message = await asyncio.wait_for(websocket.recv(), timeout=_remaining(deadline))
             if not isinstance(message, str):
                 raise ReadinessError("unexpected Terminal frame")
-            received += message
+            received_bytes += len(message.encode("utf-8"))
+            if received_bytes > MAX_SENTINEL_OUTPUT_BYTES:
+                raise ReadinessError("Terminal output limit exceeded")
+            combined = sentinel_tail + message
+            if SENTINEL in combined:
+                return
+            sentinel_tail = combined[-(len(SENTINEL) - 1) :]
     finally:
         if websocket is not None:
             await asyncio.wait_for(websocket.close(), timeout=CLEANUP_TIMEOUT_SECONDS)
@@ -193,7 +239,7 @@ async def _verify(manager_url: str, token: str, agent_id: str) -> None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser()
+    parser = StableArgumentParser()
     parser.add_argument("--manager-url", required=True)
     parser.add_argument("--token-file", required=True, type=Path)
     parser.add_argument("--agent-id", required=True)
@@ -201,10 +247,9 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
     try:
-        validate_token_file_permissions(args.token_file)
-        token = load_bearer_token(args.token_file)
+        args = _parser().parse_args(argv)
+        token = _load_readiness_token(args.token_file)
         asyncio.run(_verify(args.manager_url, token, args.agent_id))
     except Exception:
         print("Local Terminal proxy readiness failed.", file=sys.stderr)

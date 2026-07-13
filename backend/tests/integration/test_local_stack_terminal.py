@@ -25,13 +25,25 @@ MANAGER_TOKEN = "local-stack-manager-token"
 AGENT_TOKEN = "local-stack-agent-token"
 
 
-def _unused_port() -> int:
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return listener.getsockname()[1]
+def _reserve_ports() -> tuple[dict[str, int], list[socket.socket]]:
+    reservations: list[socket.socket] = []
+    ports: dict[str, int] = {}
+    try:
+        for name in ("manager", "agent", "ingest", "frontend"):
+            listener = socket.socket()
+            listener.bind(("127.0.0.1", 0))
+            reservations.append(listener)
+            ports[name] = listener.getsockname()[1]
+    except Exception:
+        for listener in reservations:
+            listener.close()
+        raise
+    return ports, reservations
 
 
-def _launcher_environment(dev_dir: Path) -> tuple[dict[str, str], dict[str, int]]:
+def _launcher_environment(
+    dev_dir: Path,
+) -> tuple[dict[str, str], dict[str, int], list[socket.socket]]:
     executable_dir = dev_dir / "bin"
     executable_dir.mkdir()
     python = executable_dir / "python"
@@ -41,12 +53,7 @@ def _launcher_environment(dev_dir: Path) -> tuple[dict[str, str], dict[str, int]
     npm.write_text("#!/bin/sh\nwhile :; do sleep 1; done\n", encoding="utf-8")
     npm.chmod(0o700)
 
-    ports = {
-        "manager": _unused_port(),
-        "agent": _unused_port(),
-        "ingest": _unused_port(),
-        "frontend": _unused_port(),
-    }
+    ports, reservations = _reserve_ports()
     environment = os.environ | {
         "CONDA_DEFAULT_ENV": "venv312",
         "SKIP_INSTALL": "1",
@@ -57,10 +64,43 @@ def _launcher_environment(dev_dir: Path) -> tuple[dict[str, str], dict[str, int]
         "IC_ENV_GUARD_FRONTEND_PORT": str(ports["frontend"]),
         "PATH": f"{executable_dir}:{os.environ['PATH']}",
     }
-    return environment, ports
+    return environment, ports, reservations
 
 
-def _start_all(environment: dict[str, str]) -> subprocess.Popen:
+def test_launcher_environment_reserves_four_distinct_ports(tmp_path):
+    dev_dir = tmp_path / "dev"
+    dev_dir.mkdir(mode=0o700)
+
+    _environment, ports, reservations = _launcher_environment(dev_dir)
+    try:
+        assert len(set(ports.values())) == 4
+        assert len(reservations) == 4
+        assert all(listener.fileno() >= 0 for listener in reservations)
+    finally:
+        for listener in reservations:
+            listener.close()
+
+
+def test_full_stack_cleanup_removes_dev_dir_when_stop_fails(tmp_path, monkeypatch):
+    dev_dir = tmp_path / "dev"
+    dev_dir.mkdir()
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_stop_all",
+        lambda _process: (_ for _ in ()).throw(RuntimeError("stop failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="stop failed"):
+        _cleanup_full_stack(object(), dev_dir, "")
+
+    assert not dev_dir.exists()
+
+
+def _start_all(
+    environment: dict[str, str], reservations: list[socket.socket]
+) -> subprocess.Popen:
+    for listener in reservations:
+        listener.close()
     return subprocess.Popen(
         [str(PROJECT_ROOT / "start.sh"), "all"],
         cwd=PROJECT_ROOT,
@@ -101,6 +141,25 @@ def _stop_all(process: subprocess.Popen) -> str:
     except subprocess.TimeoutExpired:
         os.killpg(process.pid, signal.SIGKILL)
         return process.communicate(timeout=5)[0]
+
+
+def _cleanup_full_stack(
+    process: subprocess.Popen | None, dev_dir: Path, startup_output: str
+) -> None:
+    try:
+        if process is None:
+            return
+        output = startup_output + _stop_all(process)
+        assert MANAGER_TOKEN not in output
+        assert AGENT_TOKEN not in output
+        assert process.poll() is not None
+        assert not (dev_dir / "agent.pid").exists()
+        assert not (dev_dir / "control-plane.pid").exists()
+        assert not (dev_dir / "agent-enrollment.sock").exists()
+        assert not (dev_dir / "manager-enrollment.sock").exists()
+    finally:
+        rmtree(dev_dir)
+        assert not dev_dir.exists()
 
 
 def _request(
@@ -272,11 +331,12 @@ def test_start_all_verifies_and_exposes_manager_terminal_proxy():
         token_file.write_text(f"{token}\n", encoding="utf-8")
         token_file.chmod(0o600)
 
-    environment, ports = _launcher_environment(dev_dir)
-    process = _start_all(environment)
+    environment, ports, reservations = _launcher_environment(dev_dir)
+    process = None
     startup_output = ""
     manager_url = f"http://127.0.0.1:{ports['manager']}"
     try:
+        process = _start_all(environment, reservations)
         startup_output = _wait_for_readiness(process)
         assert "Starting frontend" not in startup_output
 
@@ -327,12 +387,6 @@ def test_start_all_verifies_and_exposes_manager_terminal_proxy():
             asyncio.run(_reuse_ticket(manager_url, MANAGER_TOKEN, terminal_id, ticket))
         assert _json(manager_url, MANAGER_TOKEN, "GET", terminal_path) == {"terminals": []}
     finally:
-        output = startup_output + _stop_all(process)
-        assert MANAGER_TOKEN not in output
-        assert AGENT_TOKEN not in output
-        assert process.poll() is not None
-        assert not (dev_dir / "agent.pid").exists()
-        assert not (dev_dir / "control-plane.pid").exists()
-        assert not (dev_dir / "agent-enrollment.sock").exists()
-        assert not (dev_dir / "manager-enrollment.sock").exists()
-        rmtree(dev_dir, ignore_errors=True)
+        for listener in reservations:
+            listener.close()
+        _cleanup_full_stack(process, dev_dir, startup_output)
