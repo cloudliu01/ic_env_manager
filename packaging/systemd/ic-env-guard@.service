@@ -1,6 +1,6 @@
 [Unit]
 Description=IC Design Environment Guard Agent (%i)
-Documentation=file:/usr/share/doc/ic-env-guard/agent-v2-operations.md
+Documentation=file:/usr/share/doc/ic-env-guard/guides/agent-deployment.md
 Wants=network-online.target
 After=network-online.target
 

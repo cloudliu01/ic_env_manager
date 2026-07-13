@@ -2,7 +2,7 @@
 # Keep the explicit User/Group: omitting them would run the Agent as root.
 [Unit]
 Description=DEPRECATED compatibility IC Design Environment Guard Agent
-Documentation=file:/usr/share/doc/ic-env-guard/lifecycle.md
+Documentation=file:/usr/share/doc/ic-env-guard/guides/agent-deployment.md
 Wants=network-online.target
 After=network-online.target
 
