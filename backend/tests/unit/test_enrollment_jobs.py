@@ -590,6 +590,25 @@ def test_public_projection_exposes_real_in_progress_phase(setup):
     assert phases["transport"]["status"] == "pending"
 
 
+@pytest.mark.parametrize(
+    ("state", "code"),
+    (
+        (EnrollmentState.EXPIRED, "agent_enrollment_expired"),
+        (EnrollmentState.CANCELLED, "agent_enrollment_cancelled"),
+    ),
+)
+def test_lifecycle_end_does_not_invent_a_network_failure(setup, state, code):
+    jobs, _repository, _engine = setup
+    ended = replace(jobs.create(ssh_request(), now=NOW), state=state)
+
+    result = EnrollmentPublicResult(ended).to_public_dict()
+    phases = result["preview"]["phases"]
+
+    assert result["last_error_code"] == code
+    assert phases["network"] == {"status": "success", "code": None}
+    assert not any(phase["status"] == "failure" for phase in phases.values())
+
+
 def test_journal_serialization_contains_no_secret_shaped_fields(setup):
     jobs, repository, _engine = setup
     job = jobs.create(ssh_request(), now=NOW)

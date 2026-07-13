@@ -135,14 +135,16 @@ class EnrollmentPublicResult:
             failure_code = "agent_enrollment_expired"
         elif state is EnrollmentState.CANCELLED and not failure_code:
             failure_code = "agent_enrollment_cancelled"
-        terminal_failure = state in {
+        terminal_failure = state is EnrollmentState.FAILED
+        lifecycle_end = state in {
             EnrollmentState.CANCELLED,
             EnrollmentState.EXPIRED,
-            EnrollmentState.FAILED,
         }
         failed_phase = _failure_phase(failure_code) if terminal_failure else None
         failed_index = PHASES.index(failed_phase) if failed_phase else -1
         progress_index = _progress_index(self.job)
+        if lifecycle_end:
+            progress_index = 2 if self.job.credential_temp_ref else 1
         for index, name in enumerate(PHASES):
             status = "success" if index < progress_index else "pending"
             code = None
@@ -153,6 +155,8 @@ class EnrollmentPublicResult:
                     status, code = "failure", failure_code
                 else:
                     status = "skipped"
+            elif lifecycle_end and index >= progress_index:
+                status = "skipped"
             elif validation is not None:
                 status = "success"
                 if (
@@ -189,7 +193,7 @@ class EnrollmentPublicResult:
             "enrollment_id": self.job.enrollment_id,
             "state": _PUBLIC_STATE.get(state, state.value),
             "expires_at": self.job.expires_at.isoformat().replace("+00:00", "Z"),
-            "last_error_code": self.job.last_error_code,
+            "last_error_code": failure_code,
             "preview": {"agent": agent, "phases": phases},
         }
         if (

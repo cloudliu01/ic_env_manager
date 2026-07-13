@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '../src/app/App';
@@ -148,6 +148,31 @@ describe('Add agent flow', () => {
     expect(screen.queryByLabelText('SSH user')).toBeNull();
     expect(screen.getByLabelText('Legacy admin token')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Start enrollment' })).toBeNull();
+  });
+
+  it('keeps legacy recovery selected after failure when no SSH path exists', async () => {
+    apiRequest.mockImplementation(async (path: string) => {
+      if (path === '/api/v2/runtime') return { mode: 'manager', capabilities: ['agent-registry.v2'] };
+      if (path === '/api/v2/transport-profiles') return { profiles: [{ id: 'system-tls', type: 'verified_tls', security_label: 'Verified TLS', warning: null }] };
+      if (path === '/api/v2/agents/validate') throw new Error('invalid legacy token');
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.type(await screen.findByLabelText('Agent URL'), 'https://10.0.0.4:8765');
+    await user.type(screen.getByLabelText('Legacy admin token'), 'bad-token');
+    await user.click(screen.getByRole('button', { name: 'Validate legacy token' }));
+
+    expect(await screen.findByLabelText('Legacy admin token')).toBeTruthy();
+    expect(screen.queryByLabelText('SSH user')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Start enrollment' })).toBeNull();
+  });
+
+  it('defaults an IPv6 URL to an unbracketed SSH host', async () => {
+    render(<App />);
+    fireEvent.change(await screen.findByLabelText('Agent URL'), { target: { value: 'https://[2001:db8::1]:8765' } });
+
+    expect((screen.getByLabelText('SSH host') as HTMLInputElement).value).toBe('2001:db8::1');
   });
 
   it('rehydrates a discovery candidate from its opaque URL id after refresh', async () => {

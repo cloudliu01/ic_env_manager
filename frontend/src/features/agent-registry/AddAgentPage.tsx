@@ -50,7 +50,10 @@ export function AddAgentPage({ sshEnrollmentAvailable = true }: { sshEnrollmentA
     setValues((current) => {
       if (field === 'baseUrl') {
         let hostname = '';
-        try { hostname = new URL(value).hostname; } catch { /* keep the last valid derived host while typing */ }
+        try {
+          hostname = new URL(value).hostname;
+          if (hostname.startsWith('[') && hostname.endsWith(']')) hostname = hostname.slice(1, -1);
+        } catch { /* keep the last valid derived host while typing */ }
         if (hostname && (!current.sshHost || current.sshHost === derivedSshHost.current)) {
           derivedSshHost.current = hostname;
           return { ...current, baseUrl: value, sshHost: hostname };
@@ -71,7 +74,7 @@ export function AddAgentPage({ sshEnrollmentAvailable = true }: { sshEnrollmentA
     try {
       const created = legacy ? await validateLegacyAgent({ base_url: values.baseUrl, transport_profile_id: values.profile, token: legacyToken }) : await createEnrollment({ base_url: values.baseUrl, ...(values.displayName.trim() ? { display_name: values.displayName.trim() } : {}), transport_profile_id: values.profile, ssh: { user: values.sshUser, host: values.sshHost, port: Number(values.sshPort) }, ...(discoveryResultId ? { discovery_result_id: discoveryResultId } : {}) });
       const next = new URLSearchParams(params); next.set('enrollment', created.enrollment_id); setParams(next, { replace: true });
-    } catch { setSubmitError('Enrollment could not start. Review the details and retry.'); } finally { if (legacy) { setLegacyToken(''); setLegacy(false); } setSubmitting(false); }
+    } catch { setSubmitError('Enrollment could not start. Review the details and retry.'); } finally { if (legacy) { setLegacyToken(''); if (sshEnrollmentAvailable) setLegacy(false); } setSubmitting(false); }
   };
   const onSaved = () => { void client.invalidateQueries({ queryKey: agentKeys.all }); void client.invalidateQueries({ queryKey: fleetKeys.all }); navigate('/fleet'); };
   const profiles = transportProfiles.data?.profiles ?? [{ id: 'system-tls', type: 'verified_tls' as const, security_label: 'Verified TLS', warning: null }];
