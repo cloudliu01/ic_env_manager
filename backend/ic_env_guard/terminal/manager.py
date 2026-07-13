@@ -63,12 +63,16 @@ class TerminalManager:
         shell: str = "/bin/sh",
         idle_timeout_minutes: int = 60,
         replay_buffer_bytes: int = 2 * 1024 * 1024,
+        exited_retention_minutes: int = 30,
     ) -> None:
         if idle_timeout_minutes < 30 or idle_timeout_minutes > 120:
             raise ValueError("idle_timeout_minutes must be between 30 and 120")
+        if exited_retention_minutes < 0 or exited_retention_minutes > 120:
+            raise ValueError("exited_retention_minutes must be between 0 and 120")
         self.shell = shell
         self.idle_timeout_minutes = idle_timeout_minutes
         self.replay_buffer_bytes = replay_buffer_bytes
+        self.exited_retention_minutes = exited_retention_minutes
         self.sessions: dict[str, TerminalSession] = {}
         self._buffers: dict[str, ReplayBuffer] = {}
 
@@ -105,10 +109,12 @@ class TerminalManager:
 
     def list(self) -> list[TerminalSession]:
         self._poll_exits()
+        self._purge_expired()
         return list(self.sessions.values())
 
     def get(self, terminal_id: str) -> TerminalSession:
         self._poll_exits()
+        self._purge_expired()
         try:
             return self.sessions[terminal_id]
         except KeyError:
@@ -213,6 +219,19 @@ class TerminalManager:
                 and not session.process.isalive()
             ):
                 self._mark_exited(session, "shell_exited")
+
+    def _purge_expired(self) -> None:
+        now = time.time()
+        retention_seconds = self.exited_retention_minutes * 60
+        for terminal_id, session in list(self.sessions.items()):
+            terminal_at = (
+                session.closed_at
+                if session.status == "closed"
+                else session.exited_at if session.status == "exited" else None
+            )
+            if terminal_at is not None and now - terminal_at >= retention_seconds:
+                del self.sessions[terminal_id]
+                self._buffers.pop(terminal_id, None)
 
     def _mark_exited(self, session: TerminalSession, reason: str) -> None:
         session.status = "exited"

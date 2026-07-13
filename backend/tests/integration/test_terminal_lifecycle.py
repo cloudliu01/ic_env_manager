@@ -44,6 +44,30 @@ def test_terminal_idle_cleanup_times_out_session():
 
 
 @pytest.mark.integration
+def test_terminal_zero_retention_purges_closed_session_and_buffer_on_list():
+    manager = TerminalManager(shell="/bin/sh", exited_retention_minutes=0)
+    session = manager.create_terminal(title="transient")
+    manager.close(session.id)
+
+    assert manager.list() == []
+    assert session.id not in manager.sessions
+    assert session.id not in manager._buffers
+
+
+@pytest.mark.integration
+def test_terminal_get_purges_exited_session_after_retention():
+    manager = TerminalManager(shell="/bin/sh", exited_retention_minutes=1)
+    session = manager.create_terminal(title="expired")
+    manager.close(session.id)
+    session.status = "exited"
+    session.exited_at = time.time() - 61
+
+    with pytest.raises(KeyError):
+        manager.get(session.id)
+    assert session.id not in manager._buffers
+
+
+@pytest.mark.integration
 def test_terminal_pty_inherits_runtime_user_permissions():
     manager = TerminalManager(shell="/bin/sh")
     session = manager.create_terminal(

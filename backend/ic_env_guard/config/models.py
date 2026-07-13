@@ -92,7 +92,7 @@ class MetricsConfig(BaseModel):
 class TerminalConfig(BaseModel):
     idle_timeout_minutes: int = Field(default=60, ge=30, le=120)
     replay_buffer_bytes: int = Field(default=2 * 1024 * 1024, ge=1024 * 1024, le=10 * 1024 * 1024)
-    exited_retention_minutes: int = Field(default=30, ge=1, le=120)
+    exited_retention_minutes: int = Field(default=30, ge=0, le=120)
 
 
 class IngestConfig(BaseModel):

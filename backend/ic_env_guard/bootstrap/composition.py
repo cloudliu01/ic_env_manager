@@ -26,6 +26,7 @@ from ic_env_guard.config.models import (
     LogsConfig,
     MetricsConfig,
     ServiceConfig,
+    TerminalConfig,
 )
 from ic_env_guard.db.control_plane_migrations import run_control_plane_migrations
 from ic_env_guard.db.migrations import run_migrations
@@ -210,7 +211,12 @@ def build_agent_container(
     )
     database_engine = create_sqlite_engine(state_database)
     session_factory = create_session_factory(database_engine)
-    terminal_manager = TerminalManager()
+    terminal_config = config.terminal if config else TerminalConfig()
+    terminal_manager = TerminalManager(
+        idle_timeout_minutes=terminal_config.idle_timeout_minutes,
+        replay_buffer_bytes=terminal_config.replay_buffer_bytes,
+        exited_retention_minutes=terminal_config.exited_retention_minutes,
+    )
     service_manager = ServiceManager(
         [_service_runtime(service) for service in config.services] if config else []
     )

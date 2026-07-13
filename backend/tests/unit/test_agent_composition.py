@@ -20,6 +20,7 @@ from ic_env_guard.config.models import (
     LogsConfig,
     ObservationConfig,
     ServerConfig,
+    TerminalConfig,
     TrustedLanHttpServerConfig,
 )
 from ic_env_guard.enrollment.manager_socket import ManagerEnrollmentSocket
@@ -60,6 +61,8 @@ def test_new_agent_configuration_models_enforce_documented_bounds():
     assert EnrollmentConfig().pending_ttl_seconds == 600
     assert EnrollmentConfig(pending_ttl_seconds=60).pending_ttl_seconds == 60
     assert EnrollmentConfig(pending_ttl_seconds=900).pending_ttl_seconds == 900
+    assert TerminalConfig().exited_retention_minutes == 30
+    assert TerminalConfig(exited_retention_minutes=0).exited_retention_minutes == 0
     assert "supplementary" in (
         EnrollmentConfig.model_fields["manager_socket_gid"].description or ""
     ).lower()
@@ -76,6 +79,8 @@ def test_new_agent_configuration_models_enforce_documented_bounds():
         EnrollmentConfig(pending_ttl_seconds=59)
     with pytest.raises(ValueError):
         EnrollmentConfig(pending_ttl_seconds=901)
+    with pytest.raises(ValueError):
+        TerminalConfig(exited_retention_minutes=-1)
 
 @pytest.mark.unit
 def test_trusted_lan_capability_is_config_derived_without_disclosing_cidrs(tmp_path):
@@ -102,7 +107,14 @@ def test_trusted_lan_capability_is_config_derived_without_disclosing_cidrs(tmp_p
 
 @pytest.mark.unit
 def test_build_agent_container_constructs_agent_dependencies(tmp_path):
-    config = AppConfig(auth=AuthConfig(token_file=_token_file(tmp_path)))
+    config = AppConfig(
+        auth=AuthConfig(token_file=_token_file(tmp_path)),
+        terminal=TerminalConfig(
+            idle_timeout_minutes=30,
+            replay_buffer_bytes=1024 * 1024,
+            exited_retention_minutes=7,
+        ),
+    )
     state_database = tmp_path / "state.db"
 
     container = build_agent_container(config, state_database)
@@ -110,6 +122,9 @@ def test_build_agent_container_constructs_agent_dependencies(tmp_path):
     assert isinstance(container, AgentContainer)
     assert container.config is config
     assert isinstance(container.terminal_manager, TerminalManager)
+    assert container.terminal_manager.idle_timeout_minutes == 30
+    assert container.terminal_manager.replay_buffer_bytes == 1024 * 1024
+    assert container.terminal_manager.exited_retention_minutes == 7
     assert isinstance(container.service_manager, ServiceManager)
     assert container.session_factory.kw["bind"] is container.database_engine
     assert state_database.exists()

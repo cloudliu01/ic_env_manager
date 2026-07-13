@@ -222,6 +222,7 @@ def test_start_all_runs_isolated_agent_and_manager_lifecycle(tmp_path):
         manager = yaml.safe_load((dev_dir / "control-plane.yaml").read_text())
         assert agent["server"]["port"] == agent_port
         assert agent["state_database"] == str(dev_dir / "state.db")
+        assert agent["terminal"]["exited_retention_minutes"] == 0
         assert manager["server"]["port"] == manager_port
         assert manager["control_plane"]["audit_database"] == str(dev_dir / "control-plane.db")
         assert manager["control_plane"]["credential_directory"] == str(
@@ -1162,3 +1163,14 @@ def test_recorded_process_inspection_requests_untruncated_ps_without_shlex():
 
     assert '["ps", "-ww"' in inspection
     assert "shlex" not in inspection
+
+
+def test_start_all_runs_terminal_readiness_after_bootstrap_and_before_frontend():
+    launcher = (PROJECT_ROOT / "start.sh").read_text(encoding="utf-8")
+    start_all = launcher.split("start_all() {", 1)[1].split('\n}\n\ncommand="', 1)[0]
+
+    bootstrap_position = start_all.index("bootstrap_local_agent")
+    readiness_position = start_all.index("run_terminal_readiness")
+    frontend_position = start_all.index("start_frontend")
+
+    assert bootstrap_position < readiness_position < frontend_position

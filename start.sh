@@ -161,7 +161,7 @@ ingest:
 terminal:
   idle_timeout_minutes: 60
   replay_buffer_bytes: 2097152
-  exited_retention_minutes: 30
+  exited_retention_minutes: 0
 services: []
 YAML
     fi
@@ -1023,6 +1023,16 @@ PY
   )
 }
 
+run_terminal_readiness() {
+  (
+  cd "${BACKEND_DIR}"
+  python -m ic_env_guard.development.readiness \
+    --manager-url "http://${BACKEND_HOST}:${BACKEND_PORT}" \
+    --token-file "${DEV_DIR}/control-plane.token" \
+    --agent-id local-agent
+  )
+}
+
 start_all() {
   local control_plane_port="${BACKEND_PORT}"
   local agent_pid=""
@@ -1155,6 +1165,7 @@ start_all() {
   bootstrap_local_agent
   release_lifecycle_lock
 
+  run_terminal_readiness
   start_frontend
   cleanup 0
 }
