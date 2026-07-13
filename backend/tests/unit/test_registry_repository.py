@@ -17,6 +17,7 @@ from ic_env_guard.fleet.models import (
     RegistryInvariantError,
     RevisionConflict,
 )
+from ic_env_guard.fleet.registered_target import LOCAL_BOOTSTRAP_SOURCE
 from ic_env_guard.storage.enrollment_journal import EnrollmentJournalRepository
 from ic_env_guard.storage.manager_registry import (
     AgentStatusRepository,
@@ -117,6 +118,49 @@ def test_registry_requires_identity_except_for_legacy_config_import(repositories
         )
     )
     assert imported.instance_id is None
+
+
+@pytest.mark.unit
+def test_registry_accepts_local_socket_bootstrap_source_pair(repositories):
+    registry, _, _ = repositories
+    record = agent_record(
+        normalized_endpoint="http://127.0.0.1:8766",
+        transport_profile_id="local-loopback-http",
+        enrollment_method=EnrollmentMethod.LOCAL_SOCKET,
+        source=LOCAL_BOOTSTRAP_SOURCE,
+    )
+
+    assert registry.create(record) == record
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("source", ("config_import", "manual", "discovery"))
+def test_registry_rejects_local_socket_with_nonbootstrap_source(repositories, source):
+    registry, _, _ = repositories
+
+    with pytest.raises(RegistryInvariantError, match="source"):
+        registry.create(
+            agent_record(enrollment_method=EnrollmentMethod.LOCAL_SOCKET, source=source)
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "method",
+    (
+        EnrollmentMethod.SSH_AUTO,
+        EnrollmentMethod.SSH_CLI,
+        EnrollmentMethod.SSH_SERVICE_KEY,
+        EnrollmentMethod.LEGACY_ADMIN_TOKEN,
+    ),
+)
+def test_registry_rejects_bootstrap_source_with_nonlocal_method(repositories, method):
+    registry, _, _ = repositories
+
+    with pytest.raises(RegistryInvariantError, match="source"):
+        registry.create(
+            agent_record(enrollment_method=method, source=LOCAL_BOOTSTRAP_SOURCE)
+        )
 
 
 @pytest.mark.unit

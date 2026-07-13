@@ -77,6 +77,76 @@ class AgentTargetPolicy:
         safety = self.validate_safety(endpoint)
         return self.resolve_validated(safety, profile)
 
+    def resolve_local_socket(
+        self, endpoint: str, profile: TransportProfile
+    ) -> ValidatedTarget:
+        _scheme, hostname, _port = _parse_endpoint(endpoint)
+        try:
+            address = ip_address(hostname)
+        except ValueError:
+            raise TargetPolicyError(
+                "target_url_invalid", "the local Agent URL must use a literal IP address"
+            ) from None
+        return self.revalidate_local_socket_target(endpoint, profile, str(address))
+
+    def revalidate_local_socket_target(
+        self, endpoint: str, profile: TransportProfile, stored_ip: str
+    ) -> ValidatedTarget:
+        scheme, hostname, port = _parse_endpoint(endpoint)
+        if scheme != "http" or not isinstance(profile, TrustedLanHttpProfile):
+            raise TargetPolicyError(
+                "transport_profile_mismatch",
+                "the Agent URL does not match its transport profile",
+            )
+        try:
+            endpoint_address = ip_address(hostname)
+        except ValueError:
+            raise TargetPolicyError(
+                "target_url_invalid", "the local Agent URL must use a literal IP address"
+            ) from None
+        if str(endpoint_address) != hostname:
+            raise TargetPolicyError(
+                "target_url_invalid", "the local Agent URL must use a canonical IP address"
+            )
+        try:
+            address = ip_address(stored_ip)
+        except ValueError:
+            raise TargetPolicyError(
+                "target_address_forbidden", "the stored local Agent address is invalid"
+            ) from None
+        if (
+            str(address) != stored_ip
+            or not address.is_loopback
+            or address != endpoint_address
+        ):
+            raise TargetPolicyError(
+                "target_address_forbidden", "the local Agent address is forbidden"
+            )
+        if (address, port) in self._self_targets:
+            raise TargetPolicyError("target_is_manager", "the Agent target is the Manager")
+        if not _in_any(address, self._allowed) or not _in_any(
+            address, tuple(profile.allowed_cidrs)
+        ):
+            raise TargetPolicyError(
+                "target_address_not_allowed", "the Agent address is outside the allowlist"
+            )
+        explicit_host = _url_host(hostname)
+        default_port = 443 if scheme == "https" else 80
+        return ValidatedTarget(
+            normalized_endpoint=f"{scheme}://{explicit_host}:{port}",
+            scheme=scheme,
+            hostname=hostname,
+            port=port,
+            resolved_addresses=(address,),
+            pinned_address=address,
+            host_header=(
+                explicit_host if port == default_port else f"{explicit_host}:{port}"
+            ),
+            sni_hostname=None,
+            warning_code="trusted_lan_http_unencrypted",
+            profile=profile,
+        )
+
     def revalidate_pinned_target(
         self, endpoint: str, profile: TransportProfile, stored_ip: str
     ) -> ValidatedTarget:

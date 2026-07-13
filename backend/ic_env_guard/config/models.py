@@ -72,6 +72,7 @@ class AuthConfig(BaseModel):
 
 class DevelopmentConfig(BaseModel):
     allow_insecure_http: bool = False
+    local_agent_bootstrap: bool = False
 
 
 class MetricsConfig(BaseModel):
@@ -520,6 +521,16 @@ class AppConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_security(self) -> "AppConfig":
+        if self.development.local_agent_bootstrap and (
+            self.mode != "control-plane"
+            or not self.server.is_local_only
+            or not self.development.allow_insecure_http
+            or self.enrollment.manager_socket_path is None
+        ):
+            raise ValueError(
+                "local Agent bootstrap requires a local control plane, insecure "
+                "development HTTP opt-in, and a Manager enrollment socket"
+            )
         if self.mode == "agent" and self.server.port == self.ingest.port:
             raise ValueError("public and ingest ports must differ")
         if not self.server.is_local_only:

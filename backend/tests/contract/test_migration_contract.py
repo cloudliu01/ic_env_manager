@@ -164,7 +164,7 @@ def test_discovery_migration_downgrade_is_forward_only(tmp_path):
     finally:
         connection.close()
 
-    assert version == 12
+    assert version == 13
     assert {"discovery_jobs", "discovery_results"} <= tables
 
 
@@ -252,7 +252,7 @@ def test_discovery_dispatch_downgrade_is_forward_only_without_mutation(tmp_path)
     try:
         with pytest.raises(sqlite3.NotSupportedError, match="forward-only"):
             migration.downgrade(connection)
-        assert connection.execute("PRAGMA user_version").fetchone() == (12,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (13,)
         assert connection.execute(
             "SELECT * FROM schema_versions ORDER BY version"
         ).fetchall() == before
@@ -507,7 +507,7 @@ def test_legacy_manual_migration_preserves_rows_indexes_fks_and_checks(tmp_path)
             item[2] == "agents" and item[6] == "CASCADE"
             for item in connection.execute("PRAGMA foreign_key_list(agent_status)")
         )
-        assert connection.execute("PRAGMA user_version").fetchone() == (12,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (13,)
         status_indexes = {
             row[1] for row in connection.execute("PRAGMA index_list(agent_status)")
         }
@@ -842,7 +842,7 @@ def test_validated_address_migration_preserves_legal_pending_ssh_row(tmp_path):
     run_control_plane_migrations(db_path)
     connection = sqlite3.connect(db_path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone() == (12,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (13,)
         assert connection.execute(
             "SELECT validated_http_address FROM agent_enrollment_jobs"
         ).fetchone() == (None,)
@@ -899,7 +899,7 @@ def test_validated_address_downgrade_is_forward_only_without_mutation(tmp_path):
     try:
         with pytest.raises(sqlite3.NotSupportedError):
             migration.downgrade(connection)
-        assert connection.execute("PRAGMA user_version").fetchone() == (12,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (13,)
         assert connection.execute(
             "SELECT * FROM schema_versions ORDER BY version"
         ).fetchall() == before
@@ -925,7 +925,7 @@ def test_cli_resume_migration_adds_peer_bound_durable_claim_fields(tmp_path):
             "cli_pinned_address",
             "cli_accept_receipt",
         } <= columns
-        assert connection.execute("PRAGMA user_version").fetchone() == (12,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (13,)
     finally:
         connection.close()
 
@@ -990,11 +990,289 @@ def test_rotation_tombstone_migration_is_idempotent_and_forward_only(tmp_path):
             row[1] for row in connection.execute("PRAGMA table_info(agent_enrollment_jobs)")
         }
         assert "replace_agent_tombstone" in columns
-        assert connection.execute("PRAGMA user_version").fetchone() == (12,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (13,)
         migration = _load_migration(
             CONTROL_PLANE_MIGRATIONS / "0012_rotation_agent_tombstone.py"
         )
         with pytest.raises(sqlite3.NotSupportedError, match="forward-only"):
             migration.downgrade(connection)
+    finally:
+        connection.close()
+
+
+@pytest.mark.contract
+def test_local_socket_migration_preserves_schema_and_enforces_managed_identity(tmp_path):
+    db_path = tmp_path / "control-plane.db"
+    connection = sqlite3.connect(db_path)
+    try:
+        _run_control_plane_through(connection, "0012_rotation_agent_tombstone.py")
+        connection.execute(
+            "INSERT INTO agents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "ssh-01",
+                "11111111-1111-4111-8111-111111111111",
+                "SSH Agent",
+                "https://ssh.example:8765",
+                "a" * 48,
+                "remote-ssh",
+                "system-tls",
+                "ssh_auto",
+                1,
+                "manual",
+                1,
+                "2026-07-13T12:00:00.000000Z",
+                "2026-07-13T12:00:00.000000Z",
+            ),
+        )
+        connection.execute(
+            """INSERT INTO agent_enrollment_jobs (
+                enrollment_id, manager_id, state, normalized_endpoint,
+                transport_profile_id, ssh_user, ssh_host, ssh_port, enrollment_method,
+                save_requested, expires_at, created_at, updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "ssh-enrollment",
+                "22222222-2222-4222-8222-222222222222",
+                "pending",
+                "https://ssh.example:8765",
+                "system-tls",
+                "edaops",
+                "ssh.example",
+                22,
+                "ssh_auto",
+                0,
+                "2026-07-13T12:10:00.000000Z",
+                "2026-07-13T12:00:00.000000Z",
+                "2026-07-13T12:00:00.000000Z",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO agent_removal_jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "remove-ssh",
+                "ssh-01",
+                1,
+                "a" * 48,
+                "remote-ssh",
+                "https://ssh.example:8765",
+                "system-tls",
+                "ssh_auto",
+                "pending",
+                0,
+                1,
+                None,
+                "2026-07-13T12:00:00.000000Z",
+                "2026-07-13T12:00:00.000000Z",
+            ),
+        )
+        tables = ("agents", "agent_enrollment_jobs", "agent_removal_jobs")
+        before_columns = {
+            table: tuple(connection.execute(f"PRAGMA table_info({table})"))
+            for table in tables
+        }
+        before_indexes = {
+            table: tuple(
+                connection.execute(
+                    "SELECT name,sql FROM sqlite_master "
+                    "WHERE type='index' AND tbl_name=? AND sql IS NOT NULL ORDER BY name",
+                    (table,),
+                )
+            )
+            for table in tables
+        }
+        before_fks = {
+            table: tuple(connection.execute(f"PRAGMA foreign_key_list({table})"))
+            for table in tables
+        }
+        connection.commit()
+    finally:
+        connection.close()
+
+    run_control_plane_migrations(db_path)
+    run_control_plane_migrations(db_path)
+
+    connection = sqlite3.connect(db_path)
+    connection.execute("PRAGMA foreign_keys=ON")
+    try:
+        assert {
+            table: tuple(connection.execute(f"PRAGMA table_info({table})"))
+            for table in tables
+        } == before_columns
+        assert {
+            table: tuple(
+                connection.execute(
+                    "SELECT name,sql FROM sqlite_master "
+                    "WHERE type='index' AND tbl_name=? AND sql IS NOT NULL ORDER BY name",
+                    (table,),
+                )
+            )
+            for table in tables
+        } == before_indexes
+        assert {
+            table: tuple(connection.execute(f"PRAGMA foreign_key_list({table})"))
+            for table in tables
+        } == before_fks
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("SELECT agent_id FROM agents").fetchone() == ("ssh-01",)
+        assert connection.execute(
+            "SELECT enrollment_id FROM agent_enrollment_jobs"
+        ).fetchone() == ("ssh-enrollment",)
+        assert connection.execute(
+            "SELECT removal_id FROM agent_removal_jobs"
+        ).fetchone() == ("remove-ssh",)
+
+        connection.execute(
+            "INSERT INTO agents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "local-agent",
+                "33333333-3333-4333-8333-333333333333",
+                "Local Agent",
+                "http://127.0.0.1:8766",
+                "b" * 48,
+                "remote-local",
+                "local-loopback-http",
+                "local_socket",
+                1,
+                "local_dev_bootstrap",
+                1,
+                "2026-07-13T12:00:00.000000Z",
+                "2026-07-13T12:00:00.000000Z",
+            ),
+        )
+        connection.execute(
+            """INSERT INTO agent_enrollment_jobs (
+                enrollment_id, manager_id, state, normalized_endpoint,
+                transport_profile_id, enrollment_method, save_requested,
+                expires_at, created_at, updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "local-enrollment",
+                "22222222-2222-4222-8222-222222222222",
+                "pending",
+                "http://127.0.0.1:8766",
+                "local-loopback-http",
+                "local_socket",
+                0,
+                "2026-07-13T12:10:00.000000Z",
+                "2026-07-13T12:00:00.000000Z",
+                "2026-07-13T12:00:00.000000Z",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO agent_removal_jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "remove-local",
+                "local-agent",
+                1,
+                "b" * 48,
+                "remote-local",
+                "http://127.0.0.1:8766",
+                "local-loopback-http",
+                "local_socket",
+                "pending",
+                1,
+                2,
+                None,
+                "2026-07-13T12:00:00.000000Z",
+                "2026-07-13T12:00:00.000000Z",
+            ),
+        )
+        connection.commit()
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO agents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "bad-local",
+                    None,
+                    "Bad Local",
+                    "http://127.0.0.1:8767",
+                    "c" * 48,
+                    None,
+                    "local-loopback-http",
+                    "local_socket",
+                    1,
+                    "local_dev_bootstrap",
+                    1,
+                    "2026-07-13T12:00:00.000000Z",
+                    "2026-07-13T12:00:00.000000Z",
+                ),
+            )
+        connection.rollback()
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """INSERT INTO agent_enrollment_jobs (
+                    enrollment_id, manager_id, state, normalized_endpoint,
+                    transport_profile_id, ssh_user, ssh_host, ssh_port,
+                    enrollment_method, save_requested, expires_at, created_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    "bad-local-enrollment",
+                    "22222222-2222-4222-8222-222222222222",
+                    "pending",
+                    "http://127.0.0.1:8767",
+                    "local-loopback-http",
+                    "edaops",
+                    "127.0.0.1",
+                    22,
+                    "local_socket",
+                    0,
+                    "2026-07-13T12:10:00.000000Z",
+                    "2026-07-13T12:00:00.000000Z",
+                    "2026-07-13T12:00:00.000000Z",
+                ),
+            )
+        connection.rollback()
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """INSERT INTO agent_enrollment_jobs (
+                    enrollment_id, manager_id, state, normalized_endpoint,
+                    transport_profile_id, requested_display_name, enrollment_method,
+                    credential_temp_ref, save_requested, expires_at, created_at, updated_at,
+                    validated_http_address
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    "bad-local-activation",
+                    "22222222-2222-4222-8222-222222222222",
+                    "activation_requested",
+                    "http://127.0.0.1:8767",
+                    "local-loopback-http",
+                    "Bad Local",
+                    "local_socket",
+                    "d" * 48,
+                    1,
+                    "2026-07-13T12:10:00.000000Z",
+                    "2026-07-13T12:00:00.000000Z",
+                    "2026-07-13T12:00:00.000000Z",
+                    "127.0.0.1",
+                ),
+            )
+        connection.rollback()
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """INSERT INTO agent_enrollment_jobs (
+                    enrollment_id, manager_id, state, normalized_endpoint,
+                    transport_profile_id, enrollment_method, save_requested,
+                    expires_at, created_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    "bad-ssh-enrollment",
+                    "22222222-2222-4222-8222-222222222222",
+                    "pending",
+                    "https://bad.example:8765",
+                    "system-tls",
+                    "ssh_auto",
+                    0,
+                    "2026-07-13T12:10:00.000000Z",
+                    "2026-07-13T12:00:00.000000Z",
+                    "2026-07-13T12:00:00.000000Z",
+                ),
+            )
+        connection.rollback()
+        assert connection.execute("PRAGMA user_version").fetchone() == (13,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM schema_versions "
+            "WHERE version='0013_local_socket_bootstrap' AND result='success'"
+        ).fetchone() == (1,)
     finally:
         connection.close()

@@ -110,9 +110,12 @@ def _validate_job(job: EnrollmentJob) -> None:
     if not job.normalized_endpoint or not job.transport_profile_id:
         raise RegistryInvariantError("enrollment target fields must not be empty")
     ssh_fields = (job.ssh_user, job.ssh_host, job.ssh_port)
-    if job.enrollment_method is EnrollmentMethod.LEGACY_ADMIN_TOKEN:
+    if job.enrollment_method in {
+        EnrollmentMethod.LEGACY_ADMIN_TOKEN,
+        EnrollmentMethod.LOCAL_SOCKET,
+    }:
         if any(value is not None for value in ssh_fields):
-            raise RegistryInvariantError("legacy enrollment must not contain SSH fields")
+            raise RegistryInvariantError("non-SSH enrollment must not contain SSH fields")
     elif any(value is None for value in ssh_fields):
         raise RegistryInvariantError("SSH enrollment requires all SSH fields")
     if job.ssh_port is not None and not 1 <= job.ssh_port <= 65535:

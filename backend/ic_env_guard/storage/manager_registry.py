@@ -26,6 +26,7 @@ from ic_env_guard.fleet.models import (
     RegistryInvariantError,
     RevisionConflict,
 )
+from ic_env_guard.fleet.registered_target import LOCAL_BOOTSTRAP_SOURCE
 from ic_env_guard.storage.mutation_fence import assert_agent_mutation_allowed
 
 _AGENT_COLUMNS = (
@@ -146,7 +147,14 @@ def _validate_record(record: AgentRecord) -> None:
         raise RegistryInvariantError("agent endpoint is not canonical")
     if record.revision < 1:
         raise RegistryInvariantError("agent revision must be positive")
-    if record.source not in {"config_import", "manual", "discovery"}:
+    local_socket = record.enrollment_method is EnrollmentMethod.LOCAL_SOCKET
+    local_bootstrap_source = record.source == LOCAL_BOOTSTRAP_SOURCE
+    if record.source not in {
+        "config_import",
+        "manual",
+        "discovery",
+        LOCAL_BOOTSTRAP_SOURCE,
+    } or local_socket != local_bootstrap_source:
         raise RegistryInvariantError("invalid agent source")
     legacy_agent = record.enrollment_method is EnrollmentMethod.LEGACY_ADMIN_TOKEN
     if record.instance_id is None and not legacy_agent:

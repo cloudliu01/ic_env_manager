@@ -1,6 +1,6 @@
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -99,6 +99,7 @@ def test_create_capacity_ttl_and_cancel_are_durable_cas(setup):
     first = jobs.create(ssh_request(), now=NOW)
 
     assert first.state is EnrollmentState.PENDING
+    assert str(UUID(first.enrollment_id)) == first.enrollment_id
     assert first.expires_at == NOW + timedelta(minutes=10)
     with pytest.raises(EnrollmentConflict, match="agent_enrollment_capacity"):
         jobs.create(ssh_request(display_name="Second"), now=NOW)
@@ -106,6 +107,21 @@ def test_create_capacity_ttl_and_cancel_are_durable_cas(setup):
     cancelled = jobs.cancel(first.enrollment_id, now=NOW + timedelta(seconds=1))
     assert cancelled.state is EnrollmentState.CANCELLED
     assert repository.get(first.enrollment_id).state is EnrollmentState.CANCELLED
+
+
+@pytest.mark.unit
+def test_local_socket_enrollment_has_no_ssh_fields(setup):
+    jobs, _repository, _engine = setup
+    job = jobs.create(
+        EnrollmentJobRequest(
+            normalized_endpoint="http://127.0.0.1:8766",
+            transport_profile_id="local-loopback-http",
+            enrollment_method=EnrollmentMethod.LOCAL_SOCKET,
+        ),
+        enrollment_id="local-agent",
+    )
+    assert job.enrollment_id == "local-agent"
+    assert (job.ssh_user, job.ssh_host, job.ssh_port) == (None, None, None)
 
 
 def test_expired_job_releases_capacity_and_cannot_be_cancelled(setup):

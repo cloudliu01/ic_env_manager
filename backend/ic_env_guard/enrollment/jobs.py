@@ -88,12 +88,13 @@ class EnrollmentJobs:
         self,
         request: EnrollmentJobRequest,
         *,
+        enrollment_id: str | None = None,
         now: datetime | None = None,
         state: EnrollmentState = EnrollmentState.PENDING,
     ) -> EnrollmentJob:
         now = now or datetime.now(UTC)
         job = EnrollmentJob(
-            enrollment_id=str(uuid4()),
+            enrollment_id=enrollment_id if enrollment_id is not None else str(uuid4()),
             manager_id=self.manager_id,
             state=state,
             normalized_endpoint=request.normalized_endpoint,

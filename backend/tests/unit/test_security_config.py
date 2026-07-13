@@ -159,6 +159,20 @@ def test_loopback_http_requires_development_exception_and_local_bind(tmp_path):
 
 
 @pytest.mark.unit
+def test_local_bootstrap_requires_local_manager_and_insecure_dev_opt_in(tmp_path):
+    token = _token_file(tmp_path)
+    with pytest.raises(ValueError, match="local Agent bootstrap"):
+        AppConfig(
+            mode="control-plane",
+            server=ServerConfig(bind="0.0.0.0", remote_bind_enabled=True),
+            auth=AuthConfig(token_file=token),
+            development=DevelopmentConfig(
+                allow_insecure_http=True, local_agent_bootstrap=True
+            ),
+        )
+
+
+@pytest.mark.unit
 @pytest.mark.security
 def test_enabled_agents_require_owner_only_token_file(tmp_path):
     token_file = _token_file(tmp_path)

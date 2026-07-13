@@ -24,6 +24,7 @@ class EnrollmentMethod(str, Enum):
     SSH_AUTO = "ssh_auto"
     SSH_CLI = "ssh_cli"
     SSH_SERVICE_KEY = "ssh_service_key"
+    LOCAL_SOCKET = "local_socket"
     LEGACY_ADMIN_TOKEN = "legacy_admin_token"
 
 

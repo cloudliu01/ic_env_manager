@@ -1,7 +1,11 @@
+from dataclasses import replace
+from datetime import UTC, datetime
 from ipaddress import ip_address
 
 import pytest
 
+from ic_env_guard.fleet.models import AgentRecord, EnrollmentMethod
+from ic_env_guard.fleet.registered_target import resolve_registered_target
 from ic_env_guard.fleet.target_policy import AgentTargetPolicy, TargetPolicyError
 from ic_env_guard.fleet.transport import TrustedLanHttpProfile, VerifiedTlsProfile
 
@@ -9,6 +13,29 @@ VERIFIED_TLS = VerifiedTlsProfile(id="system-tls")
 TRUSTED_LAN = TrustedLanHttpProfile(
     id="lab-http", allowed_cidrs=["10.20.30.0/24", "fd20:30::/64"]
 )
+LOCAL_HTTP = TrustedLanHttpProfile(
+    id="local-loopback-http", allowed_cidrs=["127.0.0.0/8"]
+)
+
+
+def _agent_record(**changes):
+    values = {
+        "agent_id": "local-agent",
+        "instance_id": "11111111-1111-4111-8111-111111111111",
+        "display_name": "Local Agent",
+        "normalized_endpoint": "http://127.0.0.1:8766",
+        "credential_ref": "a" * 48,
+        "remote_credential_id": "local-credential",
+        "transport_profile_id": "local-loopback-http",
+        "enrollment_method": EnrollmentMethod.LOCAL_SOCKET,
+        "enabled": True,
+        "source": "local_dev_bootstrap",
+        "revision": 1,
+        "created_at": datetime(2026, 7, 13, tzinfo=UTC),
+        "updated_at": datetime(2026, 7, 13, tzinfo=UTC),
+    }
+    values.update(changes)
+    return AgentRecord(**values)
 
 
 def _policy(answers=("10.20.30.10",)):
@@ -17,6 +44,71 @@ def _policy(answers=("10.20.30.10",)):
         resolver=lambda _host, _port: answers,
         self_targets=[("10.20.30.1", 8765), ("fd20:30::1", 8765)],
     )
+
+
+@pytest.mark.unit
+def test_local_socket_target_accepts_literal_loopback_only():
+    policy = AgentTargetPolicy(
+        allowed_agent_cidrs=["127.0.0.0/8"],
+        self_targets=[("127.0.0.1", 8765)],
+    )
+
+    target = policy.resolve_local_socket("http://127.0.0.1:8766", LOCAL_HTTP)
+
+    assert str(target.pinned_address) == "127.0.0.1"
+    assert target.normalized_endpoint == "http://127.0.0.1:8766"
+    with pytest.raises(TargetPolicyError, match="target_address_forbidden"):
+        policy.resolve("http://127.0.0.1:8766", LOCAL_HTTP)
+    with pytest.raises(TargetPolicyError, match="target_url_invalid"):
+        policy.resolve_local_socket("http://localhost:8766", LOCAL_HTTP)
+    with pytest.raises(TargetPolicyError, match="target_address_forbidden"):
+        policy.resolve_local_socket("http://10.0.0.9:8766", LOCAL_HTTP)
+    with pytest.raises(TargetPolicyError, match="target_is_manager"):
+        policy.resolve_local_socket("http://127.0.0.1:8765", LOCAL_HTTP)
+
+
+@pytest.mark.unit
+def test_local_socket_target_requires_trusted_lan_http_profile():
+    policy = AgentTargetPolicy(
+        allowed_agent_cidrs=["127.0.0.0/8"],
+        self_targets=[("127.0.0.1", 8765)],
+    )
+
+    with pytest.raises(TargetPolicyError, match="transport_profile_mismatch"):
+        policy.resolve_local_socket("https://127.0.0.1:8766", VERIFIED_TLS)
+
+
+@pytest.mark.unit
+def test_registered_local_target_requires_gate_method_source_and_profile():
+    policy = AgentTargetPolicy(
+        allowed_agent_cidrs=["127.0.0.0/8"],
+        self_targets=[("127.0.0.1", 8765)],
+    )
+    record = _agent_record(
+        normalized_endpoint="http://127.0.0.1:8766",
+        enrollment_method=EnrollmentMethod.LOCAL_SOCKET,
+        source="local_dev_bootstrap",
+        transport_profile_id="local-loopback-http",
+    )
+
+    target = resolve_registered_target(
+        policy, record, LOCAL_HTTP, local_bootstrap_enabled=True
+    )
+    assert target.port == 8766
+
+    for changed in (
+        replace(record, enrollment_method=EnrollmentMethod.SSH_AUTO),
+        replace(record, source="manual"),
+        replace(record, transport_profile_id="another-profile"),
+    ):
+        with pytest.raises(TargetPolicyError):
+            resolve_registered_target(
+                policy, changed, LOCAL_HTTP, local_bootstrap_enabled=True
+            )
+    with pytest.raises(TargetPolicyError, match="target_address_forbidden"):
+        resolve_registered_target(
+            policy, record, LOCAL_HTTP, local_bootstrap_enabled=False
+        )
 
 
 @pytest.mark.unit
