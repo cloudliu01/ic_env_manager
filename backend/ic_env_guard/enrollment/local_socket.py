@@ -30,7 +30,14 @@ class LocalEnrollmentSocketClient:
     def __init__(self, allowed_root: Path, timeout_seconds: float = 3.0) -> None:
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive and finite")
-        self._allowed_root = allowed_root.resolve(strict=True)
+        resolved_root = None
+        try:
+            resolved_root = allowed_root.resolve(strict=True)
+        except (OSError, RuntimeError):
+            pass
+        if resolved_root is None:
+            raise LocalEnrollmentSocketError("local_socket_path_rejected")
+        self._allowed_root = resolved_root
         self._timeout_seconds = timeout_seconds
 
     async def issue(
@@ -41,6 +48,7 @@ class LocalEnrollmentSocketClient:
         enrollment_id: str,
         validation_target: ValidatedTarget,
     ) -> EnrollmentHelperResult:
+        request = None
         try:
             request = EnrollmentRequest(
                 protocol="manager-enrollment.v1",
@@ -48,17 +56,23 @@ class LocalEnrollmentSocketClient:
                 enrollment_id=enrollment_id,
             )
         except (ValidationError, ValueError):
-            raise LocalEnrollmentSocketError("local_enrollment_request_invalid") from None
+            pass
+        if request is None:
+            raise LocalEnrollmentSocketError("local_enrollment_request_invalid")
         payload = request.model_dump_json().encode("ascii")
         if len(payload) > MAX_REQUEST_BYTES:
             raise LocalEnrollmentSocketError("local_enrollment_request_invalid")
 
         response = await asyncio.to_thread(self._exchange, socket_path, payload)
+        parsed = None
+        token = None
         try:
             parsed = parse_response(response)
             token = parsed.token.encode("ascii")
         except (EnrollmentProtocolError, UnicodeEncodeError):
-            raise LocalEnrollmentSocketError("local_enrollment_protocol_error") from None
+            pass
+        if parsed is None or token is None:
+            raise LocalEnrollmentSocketError("local_enrollment_protocol_error")
         if parsed.expires_at <= datetime.now(UTC):
             raise LocalEnrollmentSocketError("local_credential_expired")
         return EnrollmentHelperResult(
@@ -72,6 +86,8 @@ class LocalEnrollmentSocketClient:
     def _exchange(self, socket_path: Path, payload: bytes) -> bytes:
         self._validate_socket_path(socket_path)
         deadline = monotonic() + self._timeout_seconds
+        timed_out = False
+        unavailable = False
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 self._set_remaining_timeout(client, deadline)
@@ -88,9 +104,13 @@ class LocalEnrollmentSocketClient:
                         break
                     response.extend(chunk)
         except TimeoutError:
-            raise LocalEnrollmentSocketError("local_socket_timeout") from None
+            timed_out = True
         except OSError:
-            raise LocalEnrollmentSocketError("local_socket_unavailable") from None
+            unavailable = True
+        if timed_out:
+            raise LocalEnrollmentSocketError("local_socket_timeout")
+        if unavailable:
+            raise LocalEnrollmentSocketError("local_socket_unavailable")
         if len(response) > MAX_RESPONSE_BYTES:
             raise LocalEnrollmentSocketError("local_socket_response_too_large")
         return bytes(response)
@@ -103,12 +123,15 @@ class LocalEnrollmentSocketClient:
         client.settimeout(remaining)
 
     def _validate_socket_path(self, socket_path: Path) -> None:
+        path_error = False
         try:
             parent = socket_path.parent.resolve(strict=True)
             root_metadata = self._allowed_root.lstat()
             socket_metadata = socket_path.lstat()
-        except OSError:
-            raise LocalEnrollmentSocketError("local_socket_path_rejected") from None
+        except (OSError, RuntimeError):
+            path_error = True
+        if path_error:
+            raise LocalEnrollmentSocketError("local_socket_path_rejected")
         if parent != self._allowed_root:
             raise LocalEnrollmentSocketError("local_socket_path_rejected")
         if not _is_owner_only(root_metadata, stat.S_ISDIR):

@@ -9,6 +9,7 @@ from shutil import rmtree
 
 import pytest
 
+import ic_env_guard.enrollment.local_socket as local_socket_module
 from ic_env_guard.enrollment.local_socket import (
     LocalEnrollmentSocketClient,
     LocalEnrollmentSocketError,
@@ -103,9 +104,79 @@ def _one_shot_server(
 def _assert_safe_error(error, code, *forbidden):
     assert error.code == code
     assert error.args == (code,)
-    rendered = str(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    chain = []
+    current = error
+    while current is not None and id(current) not in {id(item) for item in chain}:
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    rendered = " ".join(
+        part
+        for item in chain
+        for part in (type(item).__name__, str(item), repr(item.args))
+    )
     for value in forbidden:
-        assert value not in rendered
+        assert str(value) not in rendered
+
+
+@pytest.mark.security
+@pytest.mark.parametrize("failure", ("missing", "symlink_loop"))
+def test_local_client_constructor_maps_root_resolution_failures_without_path_leaks(
+    tmp_path, failure
+):
+    configured_root = tmp_path / "configured-private-root"
+    if failure == "symlink_loop":
+        other = tmp_path / "configured-private-root-other"
+        configured_root.symlink_to(other)
+        other.symlink_to(configured_root)
+
+    with pytest.raises(LocalEnrollmentSocketError) as caught:
+        LocalEnrollmentSocketClient(configured_root)
+
+    _assert_safe_error(
+        caught.value,
+        "local_socket_path_rejected",
+        configured_root,
+        tmp_path,
+    )
+
+
+@pytest.mark.security
+async def test_local_client_maps_invalid_request_without_retaining_validation_error(
+    socket_dir,
+):
+    invalid_manager_id = "private-invalid-manager-id"
+
+    with pytest.raises(LocalEnrollmentSocketError) as caught:
+        await LocalEnrollmentSocketClient(socket_dir).issue(
+            socket_path=socket_dir / "must-not-dispatch.sock",
+            manager_id=invalid_manager_id,
+            enrollment_id="local-agent",
+            validation_target=_local_target(),
+        )
+
+    _assert_safe_error(
+        caught.value,
+        "local_enrollment_request_invalid",
+        invalid_manager_id,
+        socket_dir,
+    )
+
+
+@pytest.mark.security
+async def test_local_client_maps_missing_socket_without_retaining_path_error(socket_dir):
+    socket_path = socket_dir / "private-missing-socket.sock"
+
+    with pytest.raises(LocalEnrollmentSocketError) as caught:
+        await LocalEnrollmentSocketClient(socket_dir).issue(
+            socket_path=socket_path,
+            manager_id=MANAGER_ID,
+            enrollment_id="local-agent",
+            validation_target=_local_target(),
+        )
+
+    _assert_safe_error(caught.value, "local_socket_path_rejected", socket_path)
 
 
 @pytest.mark.security
@@ -194,6 +265,38 @@ async def test_local_client_rejects_group_or_world_access_before_dispatch(
         listener.close()
 
     _assert_safe_error(caught.value, "local_socket_path_rejected", str(socket_path))
+
+
+@pytest.mark.security
+@pytest.mark.parametrize("foreign_object", ("root", "socket"))
+async def test_local_client_rejects_foreign_effective_user_ownership_before_dispatch(
+    socket_dir, monkeypatch, foreign_object
+):
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    socket_path = socket_dir / "enrollment.sock"
+    listener.bind(str(socket_path))
+    socket_path.chmod(0o600)
+    owner_uid = socket_dir.stat().st_uid
+    if foreign_object == "root":
+        monkeypatch.setattr(local_socket_module.os, "geteuid", lambda: owner_uid + 1)
+    else:
+        effective_uids = iter((owner_uid, owner_uid + 1))
+        monkeypatch.setattr(
+            local_socket_module.os, "geteuid", lambda: next(effective_uids)
+        )
+
+    try:
+        with pytest.raises(LocalEnrollmentSocketError) as caught:
+            await LocalEnrollmentSocketClient(socket_dir).issue(
+                socket_path=socket_path,
+                manager_id=MANAGER_ID,
+                enrollment_id="local-agent",
+                validation_target=_local_target(),
+            )
+    finally:
+        listener.close()
+
+    _assert_safe_error(caught.value, "local_socket_path_rejected", socket_path)
 
 
 @pytest.mark.security
