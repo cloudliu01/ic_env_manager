@@ -24,7 +24,7 @@ def test_discovery_migration_extends_complete_0009_chain(tmp_path):
     run_control_plane_migrations(database)
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (12,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (13,)
         tables = {
             row[0]
             for row in connection.execute(
