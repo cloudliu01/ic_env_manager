@@ -19,14 +19,20 @@ async def _pump_terminal_output(
     terminal_id: str,
 ) -> None:
     while True:
-        output = await asyncio.to_thread(
-            manager.read_available,
-            terminal_id,
-            POLL_INTERVAL_SECONDS,
-        )
+        try:
+            output = await asyncio.to_thread(
+                manager.read_available,
+                terminal_id,
+                POLL_INTERVAL_SECONDS,
+            )
+        except KeyError:
+            return
         if output:
             await websocket.send_text(output)
-        session = manager.get(terminal_id)
+        try:
+            session = manager.get(terminal_id)
+        except KeyError:
+            return
         if session.status != "running":
             break
         await asyncio.sleep(POLL_INTERVAL_SECONDS)

@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 import anyio
@@ -5,7 +6,9 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.testclient import WebSocketTestSession
 
+from ic_env_guard.api.terminal_ws import _pump_terminal_output
 from ic_env_guard.main import create_app
+from ic_env_guard.terminal.manager import TerminalManager
 
 
 @pytest.fixture
@@ -44,6 +47,24 @@ def receive_until(
         received += message["text"]
 
     return received
+
+
+@pytest.mark.contract
+def test_terminal_websocket_output_pump_stops_when_closed_session_is_purged(
+    monkeypatch,
+):
+    manager = TerminalManager(shell="/bin/sh", exited_retention_minutes=0)
+    session = manager.create_terminal(title="teardown-race")
+
+    def close_during_read(terminal_id, _timeout):
+        manager.close(terminal_id)
+        return ""
+
+    monkeypatch.setattr(manager, "read_available", close_during_read)
+
+    asyncio.run(_pump_terminal_output(object(), manager, session.id))
+
+    assert session.id not in manager.sessions
 
 
 @pytest.mark.contract
