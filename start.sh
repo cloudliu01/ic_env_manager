@@ -334,26 +334,13 @@ import time
 
 _, frontend_dir, host, port, skip_install = sys.argv[1:]
 requested_signal = 0
-active_group = None
 phase_timeout = 1.0
 poll_interval = 0.05
-
-
-def signal_group(pgid, signal_number):
-    try:
-        os.killpg(pgid, signal_number)
-    except OSError as error:
-        if error.errno == getattr(os, "ESRCH", 3):
-            return True
-        return False
-    return True
 
 
 def handle_signal(signal_number, _frame):
     global requested_signal
     requested_signal = signal_number
-    if active_group is not None:
-        signal_group(active_group, signal_number)
 
 
 for signal_number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
@@ -363,70 +350,80 @@ if requested_signal:
     raise SystemExit(128 + requested_signal)
 
 
-def group_exists(pgid):
+def group_members():
     try:
-        os.killpg(pgid, 0)
-    except OSError as error:
-        if error.errno == getattr(os, "ESRCH", 3):
-            return False
+        probe = subprocess.Popen(
+            ["ps", "-ww", "-axo", "pid=,pgid=,stat="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError:
+        return None
+    try:
+        stdout, _ = probe.communicate(timeout=phase_timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            probe.kill()
+            probe.communicate(timeout=phase_timeout)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return None
+    if probe.returncode != 0:
+        return None
+    members = []
+    for line in stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            return None
+        try:
+            pid, pgid = int(parts[0]), int(parts[1])
+        except ValueError:
+            return None
+        state = parts[2]
+        if (
+            pgid == os.getpgrp()
+            and pid not in {os.getpid(), probe.pid}
+            and not state.startswith("Z")
+        ):
+            members.append(pid)
+    return members
+
+
+def cleanup_residual_group():
+    members = group_members()
+    if members == []:
         return True
-    return True
-
-
-def wait_for_group_exit(pgid, timeout):
-    deadline = time.monotonic() + timeout
+    previous_term = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        os.killpg(os.getpgrp(), signal.SIGTERM)
+    except OSError:
+        signal.signal(signal.SIGTERM, previous_term)
+        return False
+    deadline = time.monotonic() + phase_timeout
     while time.monotonic() < deadline:
-        if not group_exists(pgid):
+        members = group_members()
+        if members == []:
+            signal.signal(signal.SIGTERM, previous_term)
             return True
         time.sleep(poll_interval)
-    return not group_exists(pgid)
-
-
-def cleanup_group(pgid):
-    if not group_exists(pgid):
-        return True
-    signal_group(pgid, signal.SIGTERM)
-    if wait_for_group_exit(pgid, phase_timeout):
-        return True
-    signal_group(pgid, signal.SIGKILL)
-    return wait_for_group_exit(pgid, phase_timeout)
-
-
-def wait_for_process(process):
-    escalation_deadline = None
-    kill_sent = False
-    while process.poll() is None:
-        if requested_signal:
-            if escalation_deadline is None:
-                signal_group(process.pid, requested_signal)
-                escalation_deadline = time.monotonic() + phase_timeout
-            elif time.monotonic() >= escalation_deadline:
-                if kill_sent:
-                    return None
-                signal_group(process.pid, signal.SIGKILL)
-                kill_sent = True
-                escalation_deadline = time.monotonic() + phase_timeout
-        time.sleep(poll_interval)
-    return process.returncode
+    try:
+        os.killpg(os.getpgrp(), signal.SIGKILL)
+    except OSError:
+        signal.signal(signal.SIGTERM, previous_term)
+        return False
+    return False
 
 
 def run_npm(arguments):
-    global active_group
     if requested_signal:
         return 128 + requested_signal, True
     process = subprocess.Popen(
         ["npm", *arguments],
         cwd=frontend_dir,
-        start_new_session=True,
     )
-    active_group = process.pid
-    if requested_signal:
-        signal_group(active_group, requested_signal)
-    returncode = wait_for_process(process)
-    cleaned = cleanup_group(active_group)
-    active_group = None
-    if returncode is None:
-        return 125, False
+    returncode = process.wait()
+    cleaned = cleanup_residual_group()
     return returncode, cleaned
 
 
@@ -764,6 +761,30 @@ print(hashlib.sha256(identity.encode("utf-8")).hexdigest())
 PY
 }
 
+recorded_process_identity_with_retry() {
+  local pid="$1"
+  local expected_config="$2"
+  local current_identity
+  local identity_status
+  for _ in $(seq 1 10); do
+    if current_identity="$(recorded_process_matches "${pid}" "${expected_config}")"; then
+      printf '%s\n' "${current_identity}"
+      return
+    else
+      identity_status=$?
+    fi
+    if [[ "${identity_status}" != "2" ]]; then
+      return "${identity_status}"
+    fi
+    if process_exists "${pid}"; then
+      sleep 0.05
+      continue
+    fi
+    return 2
+  done
+  return 2
+}
+
 frontend_process_matches() {
   local pid="$1"
   python - "${pid}" "$(id -u)" "${DEV_DIR}/frontend-runtime" <<'PY'
@@ -1067,7 +1088,9 @@ stop_recorded_process() {
     echo "development process identity mismatch" >&2
     return 1
   fi
-  if recorded_identity="$(recorded_process_matches "${pid}" "${expected_config}")"; then
+  if recorded_identity="$(
+    recorded_process_identity_with_retry "${pid}" "${expected_config}"
+  )"; then
     if [[ -n "${expected_identity}" \
       && "${recorded_identity}" != "${expected_identity}" ]]; then
       return 2
@@ -1092,7 +1115,9 @@ stop_recorded_process() {
     echo "development process identity mismatch" >&2
     return 1
   fi
-  if current_identity="$(recorded_process_matches "${pid}" "${expected_config}")"; then
+  if current_identity="$(
+    recorded_process_identity_with_retry "${pid}" "${expected_config}"
+  )"; then
     if [[ "${current_identity}" != "${recorded_identity}" ]]; then
       echo "development process identity mismatch" >&2
       return 1
@@ -1265,15 +1290,57 @@ PY
 
 terminate_owned_frontend() {
   local pid="$1"
-  signal_owned_frontend "${pid}" SIGTERM
-  if ! wait_for_process_exit "${pid}"; then
-    signal_owned_frontend "${pid}" SIGKILL
+  local leader_reaped="${2:-0}"
+  local group_status
+  if [[ "${leader_reaped}" != "1" ]]; then
+    signal_owned_frontend "${pid}" SIGTERM
     if ! wait_for_process_exit "${pid}"; then
-      echo "development frontend did not exit" >&2
+      signal_owned_frontend "${pid}" SIGKILL
+      if ! wait_for_process_exit "${pid}"; then
+        echo "development frontend did not exit" >&2
+        return 1
+      fi
+    fi
+    wait "${pid}" >/dev/null 2>&1 || true
+    leader_reaped=1
+  fi
+  if frontend_group_exists "${pid}"; then
+    :
+  else
+    group_status=$?
+    if [[ "${group_status}" == "1" ]]; then
+      return
+    fi
+    echo "development frontend group state is unknown" >&2
+    return 1
+  fi
+  signal_frontend_group "${pid}" SIGTERM
+  if wait_for_owned_frontend_group_exit "${pid}"; then
+    return
+  fi
+  signal_frontend_group "${pid}" SIGKILL
+  if ! wait_for_owned_frontend_group_exit "${pid}"; then
+    echo "development frontend did not exit" >&2
+    return 1
+  fi
+}
+
+wait_for_owned_frontend_group_exit() {
+  local pid="$1"
+  local group_status
+  for _ in $(seq 1 50); do
+    if frontend_group_exists "${pid}"; then
+      :
+    else
+      group_status=$?
+      if [[ "${group_status}" == "1" ]]; then
+        return
+      fi
       return 1
     fi
-  fi
-  wait "${pid}" >/dev/null 2>&1 || true
+    sleep 0.1
+  done
+  return 1
 }
 
 wait_for_frontend_group_exit() {
@@ -1866,6 +1933,10 @@ start_all() {
   local frontend_wait_status=0
   wait "${frontend_pid}" || frontend_wait_status=$?
   frontend_reaped=1
+  if ! terminate_owned_frontend "${frontend_pid}" 1; then
+    cleanup 1 || true
+    return 1
+  fi
   if [[ "${frontend_wait_status}" != "0" ]]; then
     cleanup "${frontend_wait_status}" || true
     return "${frontend_wait_status}"
