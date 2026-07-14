@@ -53,7 +53,7 @@ vi.mock('../src/features/terminal/api', () => ({
   resizeTerminal: vi.fn(async () => undefined),
 }));
 
-vi.mock('xterm', () => {
+vi.mock('@xterm/xterm', () => {
   class MockTerminal {
     rows = 24;
     cols = 80;
