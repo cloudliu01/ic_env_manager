@@ -315,7 +315,6 @@ start_frontend() {
 }
 
 start_tracked_frontend() {
-  ensure_frontend_deps
   export IC_ENV_GUARD_HOST="${BACKEND_HOST}"
   export IC_ENV_GUARD_PORT="${BACKEND_PORT}"
 
@@ -324,13 +323,16 @@ start_tracked_frontend() {
     "${DEV_DIR}/frontend-runtime" \
     "${FRONTEND_DIR}" \
     "${FRONTEND_HOST}" \
-    "${FRONTEND_PORT}" <<'PY'
+    "${FRONTEND_PORT}" \
+    "${SKIP_INSTALL:-0}" <<'PY'
 import os
+from pathlib import Path
 import signal
 import subprocess
 import sys
+import time
 
-_, frontend_dir, host, port = sys.argv[1:]
+_, frontend_dir, host, port, skip_install = sys.argv[1:]
 requested_signal = 0
 
 
@@ -344,15 +346,68 @@ for signal_number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
 os.setsid()
 if requested_signal:
     raise SystemExit(128 + requested_signal)
-process = subprocess.Popen(
-    ["npm", "run", "dev", "--", "--host", host, "--port", port],
-    cwd=frontend_dir,
-)
-if requested_signal:
+
+
+def forward_pending_signal():
+    if not requested_signal:
+        return
     signal.signal(requested_signal, signal.SIG_IGN)
     os.killpg(os.getpgrp(), requested_signal)
     signal.signal(requested_signal, handle_signal)
-returncode = process.wait()
+
+
+def group_members():
+    probe = subprocess.Popen(
+        ["ps", "-ww", "-axo", "pid=,pgid=,stat="],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout, _ = probe.communicate()
+    if probe.returncode != 0:
+        return None
+    members = []
+    for line in stdout.splitlines():
+        parts = line.split(maxsplit=2)
+        if len(parts) != 3:
+            return None
+        pid, pgid, state = parts
+        try:
+            parsed_pid, parsed_pgid = int(pid), int(pgid)
+        except ValueError:
+            return None
+        if parsed_pgid == os.getpgrp() and parsed_pid not in {
+            os.getpid(),
+            probe.pid,
+        } and not state.startswith("Z"):
+            members.append(parsed_pid)
+    return members
+
+
+def wait_for_group_drain():
+    while group_members() != []:
+        time.sleep(0.05)
+
+
+def run_npm(arguments):
+    process = subprocess.Popen(["npm", *arguments], cwd=frontend_dir)
+    forward_pending_signal()
+    returncode = process.wait()
+    wait_for_group_drain()
+    return returncode
+
+
+if skip_install != "1" and not (Path(frontend_dir) / "node_modules").is_dir():
+    print("Installing frontend dependencies...", flush=True)
+    install_returncode = run_npm(["install"])
+    if install_returncode != 0 or requested_signal:
+        raise SystemExit(
+            128 + requested_signal if requested_signal else install_returncode
+        )
+
+if requested_signal:
+    raise SystemExit(128 + requested_signal)
+returncode = run_npm(["run", "dev", "--", "--host", host, "--port", port])
 raise SystemExit(128 + requested_signal if requested_signal else returncode)
 PY
 }
@@ -439,7 +494,10 @@ PY
 }
 
 lifecycle_lock_keeper() {
-  exec python - "${DEV_DIR}/.start-all.lock" "$(id -u)" \
+  exec python - \
+    "${DEV_DIR}/.start-all.lock" \
+    "$(id -u)" \
+    "${lifecycle_lock_acquire_timeout:-121}" \
     3<"${lifecycle_lock_io_dir}/control" \
     4>"${lifecycle_lock_io_dir}/status" <<'PY'
 import fcntl
@@ -454,7 +512,7 @@ def fail(message):
     raise SystemExit(message)
 
 
-path, expected_uid = sys.argv[1], int(sys.argv[2])
+path, expected_uid, outer_timeout = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
 flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 created = False
 try:
@@ -479,7 +537,7 @@ try:
     ):
         fail("development lifecycle lock is unsafe")
 
-    deadline = time.monotonic() + 120.0
+    deadline = time.monotonic() + max(0.0, outer_timeout - 0.1)
     while True:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1503,6 +1561,8 @@ start_all() {
   cleanup() {
     local status="$1"
     local cleanup_status="${status}"
+    local cleanup_started_with_lock="${lifecycle_lock_held}"
+    local recorded_child_pid
     if [[ "${cleaned_up}" == "1" ]]; then
       return "${status}"
     fi
@@ -1512,20 +1572,6 @@ start_all() {
     if [[ -n "${frontend_pid}" && "${frontend_reaped}" != "1" ]]; then
       if terminate_owned_frontend "${frontend_pid}"; then
         frontend_reaped=1
-      else
-        cleanup_status=1
-      fi
-    fi
-    if [[ -n "${agent_pid}" && "${agent_reaped}" != "1" ]]; then
-      if terminate_child "${agent_pid}"; then
-        agent_reaped=1
-      else
-        cleanup_status=1
-      fi
-    fi
-    if [[ -n "${control_plane_pid}" && "${control_plane_reaped}" != "1" ]]; then
-      if terminate_child "${control_plane_pid}"; then
-        control_plane_reaped=1
       else
         cleanup_status=1
       fi
@@ -1558,6 +1604,41 @@ start_all() {
       fi
     fi
     if [[ "${cleanup_lock_available}" == "1" ]]; then
+      if [[ -n "${agent_pid}" && "${agent_reaped}" != "1" ]]; then
+        if [[ "${cleanup_started_with_lock}" == "1" ]]; then
+          recorded_child_pid="${agent_pid}"
+        elif recorded_child_pid="$(read_pid_metadata "${DEV_DIR}/agent.pid")"; then
+          :
+        else
+          recorded_child_pid=""
+        fi
+        if [[ "${recorded_child_pid}" == "${agent_pid}" ]]; then
+          if terminate_child "${agent_pid}"; then
+            agent_reaped=1
+          else
+            cleanup_status=1
+          fi
+        fi
+      fi
+      if [[ -n "${control_plane_pid}" \
+        && "${control_plane_reaped}" != "1" ]]; then
+        if [[ "${cleanup_started_with_lock}" == "1" ]]; then
+          recorded_child_pid="${control_plane_pid}"
+        elif recorded_child_pid="$(
+          read_pid_metadata "${DEV_DIR}/control-plane.pid"
+        )"; then
+          :
+        else
+          recorded_child_pid=""
+        fi
+        if [[ "${recorded_child_pid}" == "${control_plane_pid}" ]]; then
+          if terminate_child "${control_plane_pid}"; then
+            control_plane_reaped=1
+          else
+            cleanup_status=1
+          fi
+        fi
+      fi
       if [[ -n "${frontend_identity}" ]]; then
         remove_owned_frontend_metadata \
           "${frontend_pid} ${frontend_identity}"
