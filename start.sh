@@ -334,11 +334,26 @@ import time
 
 _, frontend_dir, host, port, skip_install = sys.argv[1:]
 requested_signal = 0
+active_group = None
+phase_timeout = 1.0
+poll_interval = 0.05
+
+
+def signal_group(pgid, signal_number):
+    try:
+        os.killpg(pgid, signal_number)
+    except OSError as error:
+        if error.errno == getattr(os, "ESRCH", 3):
+            return True
+        return False
+    return True
 
 
 def handle_signal(signal_number, _frame):
     global requested_signal
     requested_signal = signal_number
+    if active_group is not None:
+        signal_group(active_group, signal_number)
 
 
 for signal_number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
@@ -348,67 +363,93 @@ if requested_signal:
     raise SystemExit(128 + requested_signal)
 
 
-def forward_pending_signal():
-    if not requested_signal:
-        return
-    signal.signal(requested_signal, signal.SIG_IGN)
-    os.killpg(os.getpgrp(), requested_signal)
-    signal.signal(requested_signal, handle_signal)
+def group_exists(pgid):
+    try:
+        os.killpg(pgid, 0)
+    except OSError as error:
+        if error.errno == getattr(os, "ESRCH", 3):
+            return False
+        return True
+    return True
 
 
-def group_members():
-    probe = subprocess.Popen(
-        ["ps", "-ww", "-axo", "pid=,pgid=,stat="],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    stdout, _ = probe.communicate()
-    if probe.returncode != 0:
-        return None
-    members = []
-    for line in stdout.splitlines():
-        parts = line.split(maxsplit=2)
-        if len(parts) != 3:
-            return None
-        pid, pgid, state = parts
-        try:
-            parsed_pid, parsed_pgid = int(pid), int(pgid)
-        except ValueError:
-            return None
-        if parsed_pgid == os.getpgrp() and parsed_pid not in {
-            os.getpid(),
-            probe.pid,
-        } and not state.startswith("Z"):
-            members.append(parsed_pid)
-    return members
+def wait_for_group_exit(pgid, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not group_exists(pgid):
+            return True
+        time.sleep(poll_interval)
+    return not group_exists(pgid)
 
 
-def wait_for_group_drain():
-    while group_members() != []:
-        time.sleep(0.05)
+def cleanup_group(pgid):
+    if not group_exists(pgid):
+        return True
+    signal_group(pgid, signal.SIGTERM)
+    if wait_for_group_exit(pgid, phase_timeout):
+        return True
+    signal_group(pgid, signal.SIGKILL)
+    return wait_for_group_exit(pgid, phase_timeout)
+
+
+def wait_for_process(process):
+    escalation_deadline = None
+    kill_sent = False
+    while process.poll() is None:
+        if requested_signal:
+            if escalation_deadline is None:
+                signal_group(process.pid, requested_signal)
+                escalation_deadline = time.monotonic() + phase_timeout
+            elif time.monotonic() >= escalation_deadline:
+                if kill_sent:
+                    return None
+                signal_group(process.pid, signal.SIGKILL)
+                kill_sent = True
+                escalation_deadline = time.monotonic() + phase_timeout
+        time.sleep(poll_interval)
+    return process.returncode
 
 
 def run_npm(arguments):
-    process = subprocess.Popen(["npm", *arguments], cwd=frontend_dir)
-    forward_pending_signal()
-    returncode = process.wait()
-    wait_for_group_drain()
-    return returncode
+    global active_group
+    if requested_signal:
+        return 128 + requested_signal, True
+    process = subprocess.Popen(
+        ["npm", *arguments],
+        cwd=frontend_dir,
+        start_new_session=True,
+    )
+    active_group = process.pid
+    if requested_signal:
+        signal_group(active_group, requested_signal)
+    returncode = wait_for_process(process)
+    cleaned = cleanup_group(active_group)
+    active_group = None
+    if returncode is None:
+        return 125, False
+    return returncode, cleaned
 
 
 if skip_install != "1" and not (Path(frontend_dir) / "node_modules").is_dir():
     print("Installing frontend dependencies...", flush=True)
-    install_returncode = run_npm(["install"])
-    if install_returncode != 0 or requested_signal:
+    install_returncode, install_cleaned = run_npm(["install"])
+    if install_returncode != 0 or not install_cleaned or requested_signal:
         raise SystemExit(
-            128 + requested_signal if requested_signal else install_returncode
+            128 + requested_signal
+            if requested_signal
+            else install_returncode if install_returncode != 0 else 125
         )
 
 if requested_signal:
     raise SystemExit(128 + requested_signal)
-returncode = run_npm(["run", "dev", "--", "--host", host, "--port", port])
-raise SystemExit(128 + requested_signal if requested_signal else returncode)
+returncode, cleaned = run_npm(
+    ["run", "dev", "--", "--host", host, "--port", port]
+)
+raise SystemExit(
+    128 + requested_signal
+    if requested_signal
+    else returncode if cleaned else 125
+)
 PY
 }
 
@@ -712,7 +753,7 @@ if result.returncode != 0 or not result.stdout.strip():
     raise SystemExit(2)
 parts = result.stdout.strip().split(maxsplit=7)
 if len(parts) != 8:
-    raise SystemExit(1)
+    raise SystemExit(4)
 uid, *start_fields, state, command = parts
 if state.startswith("Z"):
     raise SystemExit(3)
@@ -905,12 +946,16 @@ wait_for_recorded_process_exit() {
       fi
     else
       identity_status=$?
+      if [[ "${identity_status}" == "1" ]]; then
+        return 2
+      fi
       if [[ "${identity_status}" == "3" ]]; then
         return
       fi
       if [[ "${identity_status}" == "2" ]]; then
         if process_exists "${pid}"; then
-          return 2
+          sleep 0.1
+          continue
         else
           process_status=$?
         fi
@@ -918,7 +963,7 @@ wait_for_recorded_process_exit() {
           return
         fi
       fi
-      return 2
+      return 3
     fi
     sleep 0.1
   done
@@ -1004,6 +1049,7 @@ PY
 stop_recorded_process() {
   local pid_file="$1"
   local expected_config="$2"
+  local expected_identity="${3:-}"
   local pid
   local identity_status
   local recorded_identity
@@ -1022,7 +1068,10 @@ stop_recorded_process() {
     return 1
   fi
   if recorded_identity="$(recorded_process_matches "${pid}" "${expected_config}")"; then
-    :
+    if [[ -n "${expected_identity}" \
+      && "${recorded_identity}" != "${expected_identity}" ]]; then
+      return 2
+    fi
   else
     identity_status=$?
     if [[ "${identity_status}" == "3" ]]; then
@@ -1081,23 +1130,32 @@ stop_recorded_process() {
     echo "development process identity mismatch" >&2
     return 1
   fi
-  if wait_for_recorded_process_exit "${pid}" "${expected_config}" "${recorded_identity}"; then
+  if wait_for_recorded_process_exit \
+    "${pid}" "${expected_config}" "${recorded_identity}"; then
     remove_owned_pid_file "${pid_file}" "${pid}"
     return
   else
     wait_status=$?
   fi
   if [[ "${wait_status}" == "2" ]]; then
+    remove_owned_pid_file "${pid_file}" "${pid}"
+    return
+  fi
+  if [[ "${wait_status}" == "3" ]]; then
     echo "development process identity mismatch" >&2
     return 1
   fi
-  if identity_status="$(recorded_process_matches "${pid}" "${expected_config}")"; then
-    if [[ "${identity_status}" != "${recorded_identity}" ]]; then
-      echo "development process identity mismatch" >&2
-      return 1
+  if current_identity="$(recorded_process_matches "${pid}" "${expected_config}")"; then
+    if [[ "${current_identity}" != "${recorded_identity}" ]]; then
+      remove_owned_pid_file "${pid_file}" "${pid}"
+      return
     fi
   else
     wait_status=$?
+    if [[ "${wait_status}" == "1" ]]; then
+      remove_owned_pid_file "${pid_file}" "${pid}"
+      return
+    fi
     if [[ "${wait_status}" == "3" ]]; then
       remove_owned_pid_file "${pid_file}" "${pid}"
       return
@@ -1116,14 +1174,31 @@ stop_recorded_process() {
     echo "development process identity mismatch" >&2
     return 1
   fi
-  kill -KILL "${pid}" >/dev/null 2>&1 || true
-  if wait_for_recorded_process_exit "${pid}" "${expected_config}" "${recorded_identity}"; then
+  if ! kill -KILL "${pid}" >/dev/null 2>&1; then
+    if process_exists "${pid}"; then
+      echo "development process identity mismatch" >&2
+      return 1
+    else
+      process_status=$?
+    fi
+    if [[ "${process_status}" == "1" ]]; then
+      remove_owned_pid_file "${pid_file}" "${pid}"
+      return
+    fi
+    echo "development process identity mismatch" >&2
+    return 1
+  fi
+  if wait_for_recorded_process_exit \
+    "${pid}" "${expected_config}" "${recorded_identity}"; then
     remove_owned_pid_file "${pid_file}" "${pid}"
     return
   else
     wait_status=$?
   fi
   if [[ "${wait_status}" == "2" ]]; then
+    remove_owned_pid_file "${pid_file}" "${pid}"
+    return
+  elif [[ "${wait_status}" == "3" ]]; then
     echo "development process identity mismatch" >&2
   else
     echo "development process did not exit" >&2
@@ -1330,8 +1405,13 @@ stop_recorded_frontend() {
 }
 
 stop_recorded_backends() {
-  stop_recorded_process "${DEV_DIR}/agent.pid" "${DEV_DIR}/agent.yaml"
-  stop_recorded_process "${DEV_DIR}/control-plane.pid" "${DEV_DIR}/control-plane.yaml"
+  if ! stop_recorded_process "${DEV_DIR}/agent.pid" "${DEV_DIR}/agent.yaml"; then
+    return 1
+  fi
+  if ! stop_recorded_process \
+    "${DEV_DIR}/control-plane.pid" "${DEV_DIR}/control-plane.yaml"; then
+    return 1
+  fi
 }
 
 validate_development_ports_available() {
@@ -1542,6 +1622,8 @@ start_all() {
   local frontend_reaped=0
   local agent_reaped=0
   local control_plane_reaped=0
+  local agent_process_identity=""
+  local control_plane_process_identity=""
   local agent_socket_identity=""
   local control_plane_socket_identity=""
   local cleaned_up=0
@@ -1563,6 +1645,9 @@ start_all() {
     local cleanup_status="${status}"
     local cleanup_started_with_lock="${lifecycle_lock_held}"
     local recorded_child_pid
+    local child_cleanup_status
+    local agent_cleanup_owned=0
+    local control_plane_cleanup_owned=0
     if [[ "${cleaned_up}" == "1" ]]; then
       return "${status}"
     fi
@@ -1613,10 +1698,26 @@ start_all() {
           recorded_child_pid=""
         fi
         if [[ "${recorded_child_pid}" == "${agent_pid}" ]]; then
-          if terminate_child "${agent_pid}"; then
+          if [[ "${cleanup_started_with_lock}" == "1" \
+            && -z "${agent_process_identity}" ]]; then
+            if terminate_child "${agent_pid}"; then
+              agent_reaped=1
+              agent_cleanup_owned=1
+            else
+              cleanup_status=1
+            fi
+          elif stop_recorded_process \
+            "${DEV_DIR}/agent.pid" \
+            "${DEV_DIR}/agent.yaml" \
+            "${agent_process_identity}"; then
+            wait "${agent_pid}" >/dev/null 2>&1 || true
             agent_reaped=1
+            agent_cleanup_owned=1
           else
-            cleanup_status=1
+            child_cleanup_status=$?
+            if [[ "${child_cleanup_status}" != "2" ]]; then
+              cleanup_status=1
+            fi
           fi
         fi
       fi
@@ -1632,10 +1733,26 @@ start_all() {
           recorded_child_pid=""
         fi
         if [[ "${recorded_child_pid}" == "${control_plane_pid}" ]]; then
-          if terminate_child "${control_plane_pid}"; then
+          if [[ "${cleanup_started_with_lock}" == "1" \
+            && -z "${control_plane_process_identity}" ]]; then
+            if terminate_child "${control_plane_pid}"; then
+              control_plane_reaped=1
+              control_plane_cleanup_owned=1
+            else
+              cleanup_status=1
+            fi
+          elif stop_recorded_process \
+            "${DEV_DIR}/control-plane.pid" \
+            "${DEV_DIR}/control-plane.yaml" \
+            "${control_plane_process_identity}"; then
+            wait "${control_plane_pid}" >/dev/null 2>&1 || true
             control_plane_reaped=1
+            control_plane_cleanup_owned=1
           else
-            cleanup_status=1
+            child_cleanup_status=$?
+            if [[ "${child_cleanup_status}" != "2" ]]; then
+              cleanup_status=1
+            fi
           fi
         fi
       fi
@@ -1643,10 +1760,11 @@ start_all() {
         remove_owned_frontend_metadata \
           "${frontend_pid} ${frontend_identity}"
       fi
-      if [[ -n "${agent_pid}" ]]; then
+      if [[ -n "${agent_pid}" && "${agent_cleanup_owned}" == "1" ]]; then
         remove_owned_pid_file "${DEV_DIR}/agent.pid" "${agent_pid}"
       fi
-      if [[ -n "${control_plane_pid}" ]]; then
+      if [[ -n "${control_plane_pid}" \
+        && "${control_plane_cleanup_owned}" == "1" ]]; then
         remove_owned_pid_file "${DEV_DIR}/control-plane.pid" "${control_plane_pid}"
       fi
       if [[ -n "${agent_socket_identity}" ]]; then
@@ -1713,6 +1831,9 @@ start_all() {
   agent_pid=$!
   write_pid_file "${DEV_DIR}/agent.pid" "${agent_pid}"
   wait_for_backend "${agent_pid}"
+  agent_process_identity="$(
+    recorded_process_matches "${agent_pid}" "${DEV_DIR}/agent.yaml"
+  )"
   wait_for_socket "${DEV_DIR}/agent-enrollment.sock"
   agent_socket_identity="$(capture_socket_identity "${DEV_DIR}/agent-enrollment.sock")"
 
@@ -1722,6 +1843,10 @@ start_all() {
   control_plane_pid=$!
   write_pid_file "${DEV_DIR}/control-plane.pid" "${control_plane_pid}"
   wait_for_backend "${control_plane_pid}"
+  control_plane_process_identity="$(
+    recorded_process_matches \
+      "${control_plane_pid}" "${DEV_DIR}/control-plane.yaml"
+  )"
   wait_for_socket "${DEV_DIR}/manager-enrollment.sock"
   control_plane_socket_identity="$(
     capture_socket_identity "${DEV_DIR}/manager-enrollment.sock"
