@@ -50,6 +50,42 @@ def receive_until(
 
 
 @pytest.mark.contract
+def test_terminal_websocket_output_pump_stops_when_session_disappears_during_read(
+    monkeypatch,
+):
+    manager = TerminalManager(shell="/bin/sh", exited_retention_minutes=0)
+    session = manager.create_terminal(title="read-teardown-race")
+
+    def purge_during_read(terminal_id, _timeout):
+        manager.close(terminal_id)
+        manager.get(terminal_id)
+
+    monkeypatch.setattr(manager, "read_available", purge_during_read)
+
+    asyncio.run(_pump_terminal_output(object(), manager, session.id))
+
+    assert session.id not in manager.sessions
+
+
+@pytest.mark.contract
+def test_terminal_websocket_output_pump_propagates_unrelated_key_error(monkeypatch):
+    manager = TerminalManager(shell="/bin/sh")
+    session = manager.create_terminal(title="replay-buffer-error")
+
+    def raise_replay_buffer_error(_terminal_id, _timeout):
+        raise KeyError("replay-buffer-missing")
+
+    monkeypatch.setattr(manager, "read_available", raise_replay_buffer_error)
+
+    try:
+        with pytest.raises(KeyError, match="replay-buffer-missing"):
+            asyncio.run(_pump_terminal_output(object(), manager, session.id))
+        assert session.id in manager.sessions
+    finally:
+        manager.close(session.id)
+
+
+@pytest.mark.contract
 def test_terminal_websocket_output_pump_stops_when_closed_session_is_purged(
     monkeypatch,
 ):

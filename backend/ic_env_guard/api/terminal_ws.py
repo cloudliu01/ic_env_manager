@@ -26,7 +26,11 @@ async def _pump_terminal_output(
                 POLL_INTERVAL_SECONDS,
             )
         except KeyError:
-            return
+            try:
+                manager.get(terminal_id)
+            except KeyError:
+                return
+            raise
         if output:
             await websocket.send_text(output)
         try:
